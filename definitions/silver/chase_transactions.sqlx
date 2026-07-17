@@ -1,8 +1,8 @@
 config {
-  type: "table",
-  schema: "silver_clean_data",
-  name: "chase_transactions",
-  description: "Cleaned and standardized Chase credit card transaction data"
+    type: "table",
+    schema: "silver_clean_data",
+    name: "chase_transactions",
+    description: "Cleaned and standardized Chase credit card transaction data"
 }
 
 SELECT
@@ -14,7 +14,7 @@ SELECT
   SAFE_CAST(Amount AS NUMERIC) AS amount,
   TRIM(Memo) AS memo,
   CURRENT_TIMESTAMP() AS processed_at
-FROM 
-  `belperfi.bronze_raw_data.raw_chase_c_trans`
-WHERE 
+FROM
+  ${ref("raw_chase_c_trans")}
+WHERE
   Transaction_Date IS NOT NULL

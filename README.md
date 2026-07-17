@@ -18,9 +18,10 @@ This pipeline implements a multi-layer Lakehouse medallion architecture designed
 ## 📂 Project Structure
 ```text
 ├── definitions/
-│   ├── staging/      # Raw bronze tables and schema configurations
+│   ├── bronze/       # Raw landing dependency declaration
 │   ├── silver/       # Cleaned SQLX models (e.g., chase_transactions.sqlx)
 │   └── gold/         # Curated analytical views
 ├── includes/         # Reusable javascript macros and constants
 ├── .gitignore        # Git exclusion rules
 └── workflow_settings.yaml # Dataform project configurations
+```
