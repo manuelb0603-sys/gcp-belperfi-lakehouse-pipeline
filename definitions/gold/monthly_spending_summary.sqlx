@@ -1,0 +1,17 @@
+config {
+  type: "view",
+  schema: "gold",
+  description: "Aggregated monthly financial metrics for budget tracking and dashboarding.",
+  tags: ["gold", "analytics"]
+}
+
+SELECT
+  FORMAT_DATE('%Y-%m', transaction_date) AS transaction_month,
+  raw_category AS category, 
+  SUM(amount) AS total_spent,
+  COUNT(transaction_date) AS total_transaction_count,
+  ROUND(AVG(amount), 2) AS average_transaction_amount
+FROM ${ref("chase_transactions")}
+WHERE transaction_type IN ('Return', 'Sale')
+GROUP BY 1, 2
+ORDER BY transaction_month DESC, total_spent ASC
