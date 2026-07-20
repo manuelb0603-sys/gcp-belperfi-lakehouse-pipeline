@@ -6,12 +6,19 @@ config {
 }
 
 SELECT
-  FORMAT_DATE('%Y-%m', transaction_date) AS transaction_month,
+  LAST_DAY(transaction_date, MONTH) AS transaction_month,
   raw_category AS category, 
-  SUM(amount) AS total_spent,
+  -- 1. Gross Purchase Volume (Only the pure spending)
+  SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END) AS gross_spending,
+
+  -- 2. Total Inflows (Refunds & Credit Benefits combined)
+  SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) AS total_refunds_and_credits,
+
+  -- 3. Net Real Expense (The absolute true cost after offsets)
+  SUM(-amount) AS net_real_expense,
   COUNT(transaction_date) AS total_transaction_count,
-  ROUND(AVG(amount), 2) AS average_transaction_amount
+  ROUND(AVG(-amount), 2) AS average_transaction_amount
 FROM ${ref("chase_transactions")}
-WHERE transaction_type IN ('Return', 'Sale')
+WHERE transaction_type IN ('Return', 'Sale', 'Adjustment')
 GROUP BY 1, 2
-ORDER BY transaction_month DESC, total_spent ASC
+ORDER BY transaction_month DESC, gross_spending ASC

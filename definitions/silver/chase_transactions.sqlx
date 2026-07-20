@@ -18,3 +18,7 @@ FROM
   ${ref("raw_chase_c_trans")}
 WHERE
   Transaction_Date IS NOT NULL
+  QUALIFY ROW_NUMBER() OVER(
+  PARTITION BY Transaction_Date, TRIM(Description), SAFE_CAST(Amount AS NUMERIC)
+  ORDER BY Post_Date DESC
+) = 1
