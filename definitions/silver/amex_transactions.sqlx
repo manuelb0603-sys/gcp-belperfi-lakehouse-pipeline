@@ -10,11 +10,17 @@ SELECT
   TRIM(Description) AS description,
   -- Invert amount signage to align with Chase standard
   SAFE_CAST(Amount AS NUMERIC) * -1 AS amount,
-  TRIM(Category) AS raw_category,CASE
+  CASE
+    WHEN Category IS NULL THEN 'Payment'
+    ELSE TRIM(Category)
+END
+  AS raw_category,
+  CASE
     WHEN Category IS NULL THEN 'Payment'
     WHEN Category LIKE 'Fees & Adjustments%' THEN 'Return'
     ELSE 'Sale'
-  END AS transaction_type,
+END
+  AS transaction_type,
   CURRENT_TIMESTAMP() AS processed_at
 FROM
   ${ref("raw_amex_c_trans")}
