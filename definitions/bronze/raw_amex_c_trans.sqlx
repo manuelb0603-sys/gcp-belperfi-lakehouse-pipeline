@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  database: "belperfi",
+  schema: "bronze_raw_data",
+  name: "raw_amex_c_trans"
+}
