@@ -1,8 +1,9 @@
 config {
-  type: "view",
-  schema: "gold",
-  description: "Aggregated monthly financial metrics for budget tracking and dashboarding.",
-  tags: ["gold", "analytics"]
+    type: "table",
+    schema: "gold",
+    name: "fact_monthly_spending",
+    description: "Aggregated monthly financial metrics for budget tracking and dashboarding.",
+    tags: ["gold", "analytics"]
 }
 
 SELECT
@@ -10,16 +11,31 @@ SELECT
   category,
   parent_group,
   -- 1. Gross Purchase Volume (Only the pure spending)
-  SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END) AS gross_spending,
-
+  SUM(CASE
+    WHEN amount < 0 THEN -amount
+    ELSE 0
+END
+  ) AS gross_spending,
   -- 2. Total Inflows (Refunds & Credit Benefits combined)
-  SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) AS total_refunds_and_credits,
-
+  SUM(CASE
+    WHEN amount > 0 THEN amount
+    ELSE 0
+END
+  ) AS total_refunds_and_credits,
   -- 3. Net Real Expense (The absolute true cost after offsets)
   SUM(-amount) AS net_real_expense,
   COUNT(transaction_date) AS total_transaction_count,
   ROUND(AVG(-amount), 2) AS average_transaction_amount
-FROM ${ref("fact_transactions")}
-WHERE transaction_type IN ('Return', 'Sale', 'Adjustment')
-GROUP BY 1, 2, 3
-ORDER BY transaction_month DESC, gross_spending ASC
+FROM
+  ${ref("fact_transactions")}
+WHERE
+  transaction_type IN ('Return',
+    'Sale',
+    'Adjustment')
+GROUP BY
+  1,
+  2,
+  3
+ORDER BY
+  transaction_month DESC,
+  gross_spending ASC
