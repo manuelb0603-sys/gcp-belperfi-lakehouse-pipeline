@@ -1,0 +1,62 @@
+config {
+  type: "table",
+  schema: "gold",
+  name: "dim_category",
+  description: "Dimension table dynamically extracted from all_transactions mapping raw categories to standardized categories and budget groups"
+}
+
+WITH raw_categories AS (
+  SELECT DISTINCT
+    raw_category
+  FROM
+    ${ref("all_transactions")}
+  WHERE
+    raw_category IS NOT NULL
+)
+
+SELECT
+  raw_category,
+  CASE
+    -- Groceries
+    WHEN raw_category IN ('Groceries', 'Merchandise & Supplies-Groceries', 'Merchandise & Supplies-Wholesale Stores') THEN 'Groceries'
+    
+    -- Food & Dining
+    WHEN raw_category LIKE 'Restaurant%' OR raw_category IN ('Food & Drink') THEN 'Food & Drink'
+    
+    -- Transportation / Auto
+    WHEN raw_category LIKE 'Transportation%' OR raw_category IN ('Automotive', 'Gas') THEN 'Automotive'
+    
+    -- Travel & Lodging
+    WHEN raw_category LIKE 'Travel%' THEN 'Travel'
+    
+    -- Bills, Utilities & Telecom
+    WHEN raw_category IN ('Bills & Utilities', 'Communications-Mobile Telecom', 'Business Services-Internet Services') THEN 'Bills & Utilities'
+    
+    -- Health & Personal Care
+    WHEN raw_category IN ('Health & Wellness', 'Merchandise & Supplies-Pharmacies', 'Personal') THEN 'Health & Wellness'
+    
+    -- Shopping & Retail
+    WHEN raw_category LIKE 'Merchandise & Supplies%' OR raw_category IN ('Shopping', 'Home') THEN 'Shopping'
+    
+    -- Entertainment
+    WHEN raw_category LIKE 'Entertainment%' OR raw_category IN ('Entertainment') THEN 'Entertainment'
+    
+    -- Business & Professional Services
+    WHEN raw_category LIKE 'Business Services%' OR raw_category IN ('Professional Services', 'Education') THEN 'Professional & Business Services'
+
+    -- Gifts & Charitable Giving
+    WHEN raw_category IN ('Gifts & Donations', 'Other-Charities') THEN 'Gifts & Donations'
+    
+    -- Payments & Operational Adjustments
+    WHEN raw_category IN ('Payment', 'Fees & Adjustments-Fees & Adjustments') THEN 'Payments'
+    
+    ELSE 'Other'
+  END AS category,
+
+  CASE
+    WHEN raw_category IN ('Groceries', 'Merchandise & Supplies-Groceries', 'Merchandise & Supplies-Wholesale Stores', 'Bills & Utilities', 'Communications-Mobile Telecom', 'Business Services-Internet Services', 'Automotive', 'Gas', 'Health & Wellness', 'Merchandise & Supplies-Pharmacies') OR raw_category LIKE 'Transportation%' THEN 'Needs'
+    WHEN raw_category LIKE 'Entertainment%' OR raw_category LIKE 'Merchandise & Supplies%' OR raw_category LIKE 'Restaurant%' OR raw_category LIKE 'Travel%' OR raw_category IN ('Shopping', 'Home', 'Food & Drink', 'Personal', 'Gifts & Donations', 'Other-Charities') THEN 'Wants'
+    ELSE 'Payments & Others'
+  END AS parent_group
+FROM
+  raw_categories

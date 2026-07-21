@@ -1,0 +1,28 @@
+config {
+    type: "table",
+    schema: "silver_clean_data",
+    name: "all_transactions",
+    description: "Unified and conformed transaction records across all card issuers (Amex & Chase)"
+}
+
+SELECT
+  'Amex' AS issuer,
+  transaction_date,
+  description,
+  amount,
+  raw_category,
+  transaction_type,
+  processed_at
+FROM
+  ${ref("amex_transactions")}
+UNION ALL
+SELECT
+  'Chase' AS issuer,
+  transaction_date,
+  description,
+  amount,
+  raw_category AS category,
+  transaction_type,
+  processed_at
+FROM
+  ${ref("chase_transactions")}

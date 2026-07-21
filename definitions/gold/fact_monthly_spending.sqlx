@@ -7,7 +7,8 @@ config {
 
 SELECT
   LAST_DAY(transaction_date, MONTH) AS transaction_month,
-  raw_category AS category, 
+  category,
+  parent_group,
   -- 1. Gross Purchase Volume (Only the pure spending)
   SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END) AS gross_spending,
 
@@ -18,7 +19,7 @@ SELECT
   SUM(-amount) AS net_real_expense,
   COUNT(transaction_date) AS total_transaction_count,
   ROUND(AVG(-amount), 2) AS average_transaction_amount
-FROM ${ref("chase_transactions")}
+FROM ${ref("fact_transactions")}
 WHERE transaction_type IN ('Return', 'Sale', 'Adjustment')
-GROUP BY 1, 2
+GROUP BY 1, 2, 3
 ORDER BY transaction_month DESC, gross_spending ASC

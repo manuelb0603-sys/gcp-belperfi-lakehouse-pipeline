@@ -1,0 +1,30 @@
+config {
+    type: "table",
+    schema: "silver_clean_data",
+    name: "amex_transactions",
+    description: "Cleaned and deduplicated American Express credit card transactions"
+}
+
+SELECT
+  `Date` AS transaction_date,
+  TRIM(Description) AS description,
+  -- Invert amount signage to align with Chase standard
+  SAFE_CAST(Amount AS NUMERIC) * -1 AS amount,
+  CASE
+    WHEN Category IS NULL THEN 'Payment'
+    ELSE TRIM(Category)
+END
+  AS raw_category,
+  CASE
+    WHEN Category IS NULL THEN 'Payment'
+    WHEN Category LIKE 'Fees & Adjustments%' THEN 'Return'
+    ELSE 'Sale'
+END
+  AS transaction_type,
+  CURRENT_TIMESTAMP() AS processed_at
+FROM
+  ${ref("raw_amex_c_trans")}
+WHERE
+  `Date` IS NOT NULL
+QUALIFY
+  ROW_NUMBER() OVER (PARTITION BY Date, Description, Amount, Category ORDER BY `Date` ) = 1
