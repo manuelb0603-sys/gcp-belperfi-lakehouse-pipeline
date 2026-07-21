@@ -1,0 +1,20 @@
+{
+  "issuers": {
+    "issuer_name": {
+      "local_dir": "C:\\Users\\Documents\\issuer_name_CSVs",
+      "backup_dir": "C:\\Users\\Documents\\issuer_name_CSVs\\bk",
+      "bucket_name": "ch_c_trans",
+      "gcs_prefix": "gcs_prefix",
+      "project_name": "your-gcp-project-id",
+      "pii_columns": ["pii_columns1", "pii_columns2"]
+    },
+    "issuer_name2": {
+      "local_dir": "C:\\Users\\Documents\\issuer_name2_CSVs",
+      "backup_dir": "C:\\Users\\Documents\\issuer_name2_CSVs\\bk",
+      "bucket_name": "bucket_name",
+      "gcs_prefix": "gcs_prefix",
+      "project_name": "your-gcp-project-id",
+      "pii_columns": ["pii_columns1", "pii_columns2"]
+    }
+  }
+}

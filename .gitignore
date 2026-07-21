@@ -1,1 +1,11 @@
 node_modules/
+
+# Ignore sensitive configs, PII mappings, and local environments
+config.json
+.env
+
+# Ignore raw CSV files
+*.csv
+
+# Ignore VS Code settings and launch profiles
+.vscode/
