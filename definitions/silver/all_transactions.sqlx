@@ -10,12 +10,11 @@ SELECT
   transaction_date,
   description,
   amount,
-  raw_category AS category,
-  transaction_type
+  raw_category,
+  transaction_type,
+  processed_at
 FROM
   ${ref("amex_transactions")}
-WHERE
-  raw_category IS NULL
 UNION ALL
 SELECT
   'Chase' AS issuer,
@@ -23,8 +22,7 @@ SELECT
   description,
   amount,
   raw_category AS category,
-  transaction_type
+  transaction_type,
+  processed_at
 FROM
   ${ref("chase_transactions")}
-WHERE
-  raw_category IS NULL

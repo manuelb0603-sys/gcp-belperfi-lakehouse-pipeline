@@ -1,0 +1,24 @@
+config {
+    type: "table",
+    schema: "gold",
+    name: "fact_transactions",
+    description: "Primary transaction fact table joined with gold dim_category details"
+}
+
+SELECT
+  TO_HEX(MD5(CONCAT(t.issuer, '_', CAST(t.transaction_date AS STRING), '_', COALESCE(t.description, ''), '_', CAST(t.amount AS STRING)))) AS transaction_id,
+  t.issuer,
+  t.transaction_date,
+  t.description,
+  t.amount,
+  t.transaction_type,
+  t.raw_category,
+  COALESCE(c.category, 'Other') AS category,
+  COALESCE(c.parent_group, 'Payments & Others') AS parent_group,
+  t.processed_at
+FROM
+  ${ref("all_transactions")} t
+LEFT JOIN
+  ${ref("dim_category")} c
+ON
+  t.raw_category = c.raw_category
