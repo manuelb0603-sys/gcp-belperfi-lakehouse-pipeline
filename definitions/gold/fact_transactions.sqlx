@@ -9,6 +9,7 @@ SELECT
   TO_HEX(MD5(CONCAT(t.issuer, '_', CAST(t.transaction_date AS STRING), '_', COALESCE(t.description, ''), '_', CAST(t.amount AS STRING)))) AS transaction_id,
   t.issuer,
   t.transaction_date,
+  LAST_DAY(t.transaction_date, MONTH) AS transaction_month,
   t.description,
   t.amount,
   t.transaction_type,
