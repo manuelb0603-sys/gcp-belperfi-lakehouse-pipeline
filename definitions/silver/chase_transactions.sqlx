@@ -5,25 +5,36 @@ config {
     description: "Cleaned and standardized Chase credit card transaction data"
 }
 
+WITH
+  staged AS (
+  SELECT
+    *,
+    _FILE_NAME AS file_source,
+    ROW_NUMBER() OVER (PARTITION BY _FILE_NAME, Transaction_Date, UPPER(TRIM(`Description`)),
+      SAFE_CAST(Amount AS NUMERIC) ) AS intra_file_occurrence
+  FROM
+    ${ref("raw_chase_c_trans")} )
 SELECT
   Transaction_Date AS transaction_date,
   Post_Date AS post_date,
-  TRIM(Description) AS description,
+  TRIM(`Description`) AS description,
   CASE
     WHEN Category IS NULL THEN 'Payment'
     ELSE TRIM(Category)
 END
   AS raw_category,
-  TRIM(Type) AS transaction_type,
+  TRIM(`Type`) AS transaction_type,
   SAFE_CAST(Amount AS NUMERIC) AS amount,
   TRIM(Memo) AS memo,
+  file_source,
   CURRENT_TIMESTAMP() AS processed_at
 FROM
-  ${ref("raw_chase_c_trans")}
+  staged
 WHERE
   Transaction_Date IS NOT NULL
 QUALIFY
-  ROW_NUMBER() OVER(PARTITION BY Transaction_Date, TRIM(Description),
-    SAFE_CAST(Amount AS NUMERIC)
+  ROW_NUMBER() OVER(PARTITION BY Transaction_Date, TRIM(`Description`),
+    SAFE_CAST(Amount AS NUMERIC),
+    intra_file_occurrence
   ORDER BY
-    Post_Date DESC ) = 1
+    file_source DESC ) = 1
