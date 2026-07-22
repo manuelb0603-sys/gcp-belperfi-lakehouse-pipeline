@@ -5,9 +5,18 @@ config {
     description: "Cleaned and deduplicated American Express credit card transactions"
 }
 
+WITH
+  staged AS (
+  SELECT
+    *,
+    _FILE_NAME AS file_source,
+    ROW_NUMBER() OVER (PARTITION BY _FILE_NAME, `Date`, `Description`, SAFE_CAST(Amount AS NUMERIC),
+      _FILE_NAME ) AS intra_file_occurrence
+  FROM
+    ${ref("raw_amex_c_trans")} )
 SELECT
   `Date` AS transaction_date,
-  TRIM(Description) AS description,
+  TRIM(`Description`) AS description,
   -- Invert amount signage to align with Chase standard
   SAFE_CAST(Amount AS NUMERIC) * -1 AS amount,
   CASE
@@ -21,10 +30,11 @@ END
     ELSE 'Sale'
 END
   AS transaction_type,
+  file_source,
   CURRENT_TIMESTAMP() AS processed_at
 FROM
-  ${ref("raw_amex_c_trans")}
+  staged
 WHERE
   `Date` IS NOT NULL
 QUALIFY
-  ROW_NUMBER() OVER (PARTITION BY Date, Description, Amount, Category ORDER BY `Date` ) = 1
+  ROW_NUMBER() OVER (PARTITION BY `Date`, `Description`, Amount, intra_file_occurrence ORDER BY file_source DESC ) = 1
