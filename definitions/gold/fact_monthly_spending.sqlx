@@ -7,7 +7,7 @@ config {
 }
 
 SELECT
-  LAST_DAY(transaction_date, MONTH) AS transaction_month,
+  transaction_month,
   category,
   parent_group,
   -- 1. Gross Purchase Volume (Only the pure spending)
