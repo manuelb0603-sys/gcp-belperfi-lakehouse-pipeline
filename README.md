@@ -20,7 +20,8 @@ This pipeline implements a multi-layer Lakehouse medallion architecture designed
 ```text
 ├── Scripts/
 │   ├── upload_csv.py          # Uploads issuer-specific CSV files to GCS and archives them
-│   └── run_all_issuers.py     # Runs the uploader for every issuer in config.json
+│   ├── run_all_issuers.py     # Runs the uploader for every issuer in config.json
+│   └── email_weekly_report.py # Generates weekly financial insights via BigQuery + Ollama LLM, emails HTML report
 ├── definitions/
 │   ├── bronze/                # Raw landing dependency declarations
 │   ├── silver/                # Cleaned SQLX models (e.g., chase_transactions.sqlx)
@@ -67,3 +68,53 @@ The upload script reads the configured issuer, removes any listed PII columns, u
    ```
 
 This workflow is useful for automating local CSV ingestion into GCS while keeping a backup copy of each processed file.
+
+## 📧 Weekly Financial Report Automation
+
+The `email_weekly_report.py` script generates an intelligent weekly financial insights email that:
+* Queries your **BigQuery Gold Layer** (`fact_monthly_spending`) to extract spending trends, category analysis, and key metrics  
+* Processes data through a local **Ollama LLM** (configurable via `model_server_url` & `model_name` in config) to generate contextual insights with playful Japanese food puns from your assistant Mogumogu-chan 🍣🍤
+* Outputs an attractive HTML report styled for email readability
+
+### Setup Instructions
+
+1. **Configure additional settings in `config.json`:**
+   ```json  
+   {
+     "model_server_url": "http://localhost:11434",  // URL of your Ollama server
+     "model_name": "mistral",                       // Model name to use for report generation (e.g., mistral, llama2)
+     "Monthly_budget": 5000,                        // Your monthly deposit amount  
+     "Fixed_costs": 1500,                           // Total fixed expenses per month
+     "Vehicle_Info": "Sedan - Gas & Insurance included", 
+     "Savings_goal": 1000
+   }
+   ```
+
+2. **Ensure Ollama is running locally** (or configure a remote server URL):
+   * Download from [ollama.com](https://ollama.com) if not installed  
+   * Install your preferred model: `ollama pull mistral` (or another supported LLM)
+
+3. **Set up Gmail App Password:** 
+   * Generate an app-specific password for your sending email in Google Account settings (2FA required on sender account). Do NOT use your main password!  
+
+4. **Configure recipients** via the `email_listings` array:
+   ```json  
+   {
+     "email_sender": "sender@gmail.com",  // Your Gmail address with app password set
+     "Gmail_app_credentials": "your_16_char_password_here", 
+     "email_listings": ["subscriber1@gmail.com", "subscriber2@gmail.com"] 
+   }
+   ```
+
+5. **Schedule automatic weekly runs:**
+   
+   On Windows: Open Task Scheduler → Create Basic Task (trigger = Weekly) → Action = Start Program with your Python executable and script path
+   
+   On Linux/macOS: Add crontab entry for automated execution (e.g., `0 9 * * 1 /usr/bin/python3 email_weekly_report.py`)
+
+### Report Features
+* ✅ Monthly snapshot with spending trends & category analysis  
+* ✅ KPI cards showing total net expense, Mom % change, and disposable cash calculation  
+* ✅ Top discretionary categories with goal suggestions based on your budget allocation  
+* ✅ Personalized character tips for fun financial habits advice
+* ✅ Interactive HTML formatting designed to look beautiful in email clients
