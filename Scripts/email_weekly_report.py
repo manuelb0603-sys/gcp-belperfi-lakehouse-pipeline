@@ -6,6 +6,9 @@ from google.cloud import bigquery
 import requests
 from pathlib import Path
 import json
+import importlib.util
+import re
+from typing import Any, Dict
 
 
 def load_config(config_path: Path) -> dict:
@@ -143,6 +146,90 @@ def send_email(sender: str, receivers: list[str], password: str, msg_root: MIMEM
         server.sendmail(sender, receivers, msg_root.as_string())
 
 
+def _init_memory_module():
+    """Load the local SQLite memory module if available. Best-effort only."""
+    try:
+        memory_path = Path(__file__).with_name("memory.py")
+        spec = importlib.util.spec_from_file_location("memory_module", str(memory_path))
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.init_db()
+        return module
+    except Exception as exc:
+        print(f"Memory initialization failed: {exc}")
+        return None
+
+
+def _extract_json_payload(payload: str) -> list[dict[str, Any]]:
+    """Attempt to parse a JSON list from Ollama responses that may include extra text."""
+    try:
+        data = json.loads(payload)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+
+    match = re.search(r"\[\s*\{.*?\}\s*\]", payload, re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+
+    return []
+
+
+def _remember_report(memory_module: Any, sender: str, receivers: list[str], receiver_header: str, prompt: str, report_text: str, model_name: str, ollama_url: str, config: dict) -> None:
+    """Save report prompt/response and extract upsertable facts. Never blocks email sends."""
+    if memory_module is None:
+        return
+
+    try:
+        thread_id = memory_module.get_or_create_thread("email", receiver_header or sender or "email:unknown")
+        plain_text = "\n".join([
+            f"Weekly Financial Progress — {date.today().strftime('%B %d, %Y')}",
+            "",
+            *([report_text.split('\n\n')[0]] if report_text else []),
+            "",
+        ])
+
+        st_id = memory_module.save_short_term(
+            thread_internal_id=thread_id,
+            subject=f"Weekly Financial Progress Report Card {date.today().strftime('%Y-%m-%d')}",
+            sender=sender,
+            prompt=prompt,
+            response_html=report_text,
+            response_text=plain_text,
+            tags=["weekly_report"],
+            meta={"recipients": receivers},
+        )
+
+        fact_model = config.get("fact_model_name", model_name)
+        fact_prompt = (
+            "Extract a JSON array of concise facts from the following HTML report. "
+            "Each item must be an object with keys 'fact_key', 'fact_text', and optional 'weight'.\n\n"
+            f"Report:\n{report_text}\n\nReturn ONLY valid JSON."
+        )
+        fact_res = query_ollama(fact_prompt, ollama_url, fact_model, stream=False)
+        facts = _extract_json_payload(fact_res)
+        for fact in facts:
+            try:
+                fk = str(fact.get("fact_key") or fact.get("key") or "").strip()
+                ft = str(fact.get("fact_text") or fact.get("text") or "").strip()
+                if not fk or not ft:
+                    continue
+                w = float(fact.get("weight", 1.0)) if fact.get("weight") is not None else 1.0
+                memory_module.upsert_long_fact(fk, ft, source_short_term_id=st_id, weight=w)
+            except Exception:
+                continue
+    except Exception as exc:
+        print(f"Memory logging failed: {exc}")
+
+
 def run_weekly_report(config_path: Path | None = None) -> None:
     """Orchestrate the weekly report generation and email send."""
     if config_path is None:
@@ -153,6 +240,9 @@ def run_weekly_report(config_path: Path | None = None) -> None:
     except Exception as exc:
         print(f"Failed to load config: {exc}")
         return
+
+    # Memory module is optional; initialize lazily if present
+    memory = None
 
     receivers = config.get("email_listings", [])
     sender = config.get("email_sender")
@@ -209,6 +299,11 @@ def run_weekly_report(config_path: Path | None = None) -> None:
         return
 
     print("Report sent successfully!")
+
+    memory_module = _init_memory_module()
+    if memory_module is not None:
+        _remember_report(memory_module, sender, receivers, receiver_header, prompt, report_text, model_name, ollama_url, config)
+
 
 
 if __name__ == "__main__":
