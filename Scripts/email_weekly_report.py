@@ -1,5 +1,5 @@
 import smtplib
-from datetime import date
+from datetime import date, datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from google.cloud import bigquery
@@ -8,7 +8,17 @@ from pathlib import Path
 import json
 import importlib.util
 import re
+import time
 from typing import Any, Dict
+
+
+def log_status(message: str, start_time: float | None = None) -> None:
+    """Print a timestamped status message with elapsed time for debugging."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    suffix = ""
+    if start_time is not None:
+        suffix = f" | elapsed={time.perf_counter() - start_time:.1f}s"
+    print(f"[{timestamp}] {message}{suffix}")
 
 
 def load_config(config_path: Path) -> dict:
@@ -63,8 +73,48 @@ def format_data_payload(results: list) -> str:
     return data_payload
 
 
-def build_ollama_prompt(config: dict, data_payload: str) -> str:
-    """Build the full prompt for Ollama from config and payload."""
+def _memory_context_to_prompt(memory_module: Any, receiver_header: str, sender: str, limit: int = 20, recent_limit: int = 5) -> str:
+    """Return compact long-term facts plus recent thread history formatted for prompt context."""
+    if memory_module is None:
+        return ""
+
+    lines: list[str] = []
+
+    try:
+        facts = memory_module.get_long_facts(limit=limit)
+        if facts:
+            lines.append("Relevant prior memory/context:")
+            for fact in facts:
+                key = fact.get("fact_key") or fact.get("key") or "memory"
+                text = fact.get("fact_text") or fact.get("text") or ""
+                if text:
+                    lines.append(f"- {key}: {text}")
+    except Exception as exc:
+        print(f"Long-term memory context lookup failed: {exc}")
+
+    try:
+        thread_key = receiver_header or sender or "email:unknown"
+        thread_id = memory_module.get_or_create_thread("email", thread_key)
+        recent_entries = memory_module.get_short_term(thread_id, limit=recent_limit)
+        if recent_entries:
+            if not lines:
+                lines.append("Relevant prior memory/context:")
+            lines.append("Recent weekly thread history:")
+            for entry in recent_entries:
+                subject = entry.get("subject") or "Weekly report"
+                text = entry.get("response_text") or ""
+                if text:
+                    summary = text.strip().replace("\n", " ")
+                    lines.append(f"- {subject}: {summary[:300]}")
+    except Exception as exc:
+        print(f"Recent-thread memory context lookup failed: {exc}")
+
+    return "\n".join(lines)
+
+
+def build_ollama_prompt(config: dict, data_payload: str, memory_context: str | None = None) -> str:
+    """Build the full prompt for Ollama from config, payload, and prior memory facts."""
+    memory_context = memory_context or ""
     return f"""System: You are a friendly financial assistant hungry for insights named Mogumogu-chan, writing a short, clear email. Mogumogu is the Japanese onomatopoeia for a cute, playful eating. You consumed the latest financial digest to share. Some of your playful puns are related to japanese foods. This is an automated insights weekly script about this month's expenses progress. Output a nice trendy graphical representation in HTML for the email.
 Use a soft pink page background for the whole email body.
 Place the content inside a centered white/light-pink panel with rounded corners and a thin light pink border.
@@ -78,6 +128,7 @@ Instructions:
 - Give a comparison of the current month to the previous month, highlighting any significant changes in spending patterns.
 - Give a brief overview of the financial health, focusing on net expenses and budget adherence.
 - Use a warm, encouraging tone, and provide actionable insights or tips for better financial management.
+- Consider the relevant prior memory/context below when interpreting the current data and writing the email.
 - Do not include markdown or code blocks in the output. The output should be a polished HTML email body with clear sections and a warm, encouraging tone.
 
 Context:
@@ -86,6 +137,7 @@ Context:
 - Vehicles: {config.get('Vehicle_Info')}.
 - Savings goal: {config.get('Savings_goal')}.
 - This is a follow-up report; the recipient already knows the recurring details.
+{memory_context}
 Include In Order: 
 - Fun greeting
 - Monthly Snapshot including and the Month for that data and KPI Card of comparison of lifestyle net expenses accross the categories including the number (horizontal pink color  bars).
@@ -109,12 +161,33 @@ Please write a polished HTML email body with clear sections and a warm, encourag
 
 def query_ollama(prompt: str, ollama_url: str, model_name: str, stream: bool = False) -> str:
     """Query local Ollama server and return the generated report text."""
-    response = requests.post(ollama_url, json={
-        "model": model_name,
-        "prompt": prompt,
-        "stream": stream
-    })
-    return response.json().get("response", "Failed to generate report.")
+    request_started = time.perf_counter()
+    log_status(f"Querying Ollama model '{model_name}' at {ollama_url} (stream={stream})")
+    try:
+        response = requests.post(ollama_url, json={
+            "model": model_name,
+            "prompt": prompt,
+            "stream": stream
+        }, timeout=600)
+        elapsed = time.perf_counter() - request_started
+        log_status(
+            f"Ollama response received: status={response.status_code}, bytes={len(response.text or '')}, elapsed={elapsed:.1f}s"
+        )
+        if response.status_code != 200:
+            print(f"Ollama request failed with HTTP {response.status_code}: {response.text[:500]}")
+            return "Failed to generate report."
+        try:
+            payload = response.json()
+        except ValueError:
+            print(f"Ollama returned invalid JSON: {response.text[:500]}")
+            return "Failed to generate report."
+        return payload.get("response", "Failed to generate report.")
+    except requests.exceptions.Timeout:
+        log_status(f"Ollama request timed out after {time.perf_counter() - request_started:.1f}s")
+        return "Failed to generate report."
+    except Exception as exc:
+        log_status(f"Ollama request failed with exception: {exc}")
+        return "Failed to generate report."
 
 
 def build_email_message(sender: str, receiver_header: str, report_text: str) -> MIMEMultipart:
@@ -189,6 +262,7 @@ def _remember_report(memory_module: Any, sender: str, receivers: list[str], rece
         return
 
     try:
+        log_status("Starting memory persistence for this report")
         thread_id = memory_module.get_or_create_thread("email", receiver_header or sender or "email:unknown")
         plain_text = "\n".join([
             f"Weekly Financial Progress — {date.today().strftime('%B %d, %Y')}",
@@ -207,6 +281,7 @@ def _remember_report(memory_module: Any, sender: str, receivers: list[str], rece
             tags=["weekly_report"],
             meta={"recipients": receivers},
         )
+        log_status(f"Saved short-term memory row with thread id={thread_id}, short_term id={st_id}")
 
         fact_model = config.get("fact_model_name", model_name)
         fact_prompt = (
@@ -214,8 +289,10 @@ def _remember_report(memory_module: Any, sender: str, receivers: list[str], rece
             "Each item must be an object with keys 'fact_key', 'fact_text', and optional 'weight'.\n\n"
             f"Report:\n{report_text}\n\nReturn ONLY valid JSON."
         )
+        log_status(f"Extracting facts from completed report using model '{fact_model}'")
         fact_res = query_ollama(fact_prompt, ollama_url, fact_model, stream=False)
         facts = _extract_json_payload(fact_res)
+        log_status(f"Fact extraction returned {len(facts)} candidate fact(s)")
         for fact in facts:
             try:
                 fk = str(fact.get("fact_key") or fact.get("key") or "").strip()
@@ -226,17 +303,22 @@ def _remember_report(memory_module: Any, sender: str, receivers: list[str], rece
                 memory_module.upsert_long_fact(fk, ft, source_short_term_id=st_id, weight=w)
             except Exception:
                 continue
+        log_status("Completed memory persistence and fact extraction")
     except Exception as exc:
         print(f"Memory logging failed: {exc}")
 
 
 def run_weekly_report(config_path: Path | None = None) -> None:
     """Orchestrate the weekly report generation and email send."""
+    start_time = time.perf_counter()
+    log_status("Starting weekly report run", start_time)
+
     if config_path is None:
         config_path = Path(__file__).resolve().parent.parent / "config.json"
 
     try:
         config = load_config(config_path)
+        log_status(f"Loaded config from {config_path}")
     except Exception as exc:
         print(f"Failed to load config: {exc}")
         return
@@ -268,7 +350,9 @@ def run_weekly_report(config_path: Path | None = None) -> None:
         return
 
     try:
+        log_status(f"Fetching BigQuery summary for project '{project_name}' over last {days_back} days")
         results = fetch_bigquery_summary(project_name, days_back=days_back)
+        log_status(f"BigQuery fetch complete: {len(results)} rows returned")
     except Exception as exc:
         print(f"Failed to fetch BigQuery summary: {exc}")
         return
@@ -277,10 +361,15 @@ def run_weekly_report(config_path: Path | None = None) -> None:
         print("BigQuery returned no results. Aborting report generation.")
         return
 
+    log_status("Initializing memory module")
+    memory_module = _init_memory_module()
+    log_status("Building memory context and prompt")
+    memory_context = _memory_context_to_prompt(memory_module, receiver_header, sender)
     data_payload = format_data_payload(results)
-    prompt = build_ollama_prompt(config, data_payload)
+    prompt = build_ollama_prompt(config, data_payload, memory_context=memory_context)
 
     try:
+        log_status(f"Generating report with Ollama model '{model_name}'")
         report_text = query_ollama(prompt, ollama_url, model_name, stream=ollama_stream)
     except Exception as exc:
         print(f"Failed to query Ollama: {exc}")
@@ -290,19 +379,25 @@ def run_weekly_report(config_path: Path | None = None) -> None:
         print("Ollama returned an empty or failed report. Aborting.")
         return
 
+    log_status(f"Received report from Ollama: {len(report_text)} characters")
     msg_root = build_email_message(sender, receiver_header, report_text)
 
     try:
+        log_status(f"Sending email to {len(receivers)} recipients")
         send_email(sender, receivers, password, msg_root)
+        log_status("Email sent successfully")
     except Exception as exc:
         print(f"Failed to send email: {exc}")
         return
 
-    print("Report sent successfully!")
-
     memory_module = _init_memory_module()
     if memory_module is not None:
+        log_status("Saving report to long/short-term memory")
         _remember_report(memory_module, sender, receivers, receiver_header, prompt, report_text, model_name, ollama_url, config)
+        log_status("Memory persistence complete")
+
+    total_elapsed = time.perf_counter() - start_time
+    log_status(f"Weekly report run complete: total elapsed={total_elapsed:.1f}s", start_time)
 
 
 

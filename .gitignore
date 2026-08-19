@@ -7,5 +7,9 @@ config.json
 # Ignore raw CSV files
 *.csv
 
+# Ignore local SQLite memory databases
+agent/memory/*.sqlite3
+agent/memory/*.sql
+
 # Ignore VS Code settings and launch profiles
 .vscode/

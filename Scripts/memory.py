@@ -20,7 +20,13 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 
-DEFAULT_DB_PATH = os.environ.get("MEMORY_DB_PATH") or os.path.join("agent", "memory", "memory.sqlite3")
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_DB_PATH = os.environ.get("MEMORY_DB_PATH") or os.path.join(
+    _PROJECT_ROOT,
+    "agent",
+    "memory",
+    "memory.sqlite3",
+)
 _DB_PATH: Optional[str] = None
 
 

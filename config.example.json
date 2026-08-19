@@ -1,4 +1,11 @@
 {
+  "model_server_url": "http://your-host-address:11434/api/generate",
+  "model_name": "your-model-name",
+  "Monthly_budget": "your-monthly-budget",
+  "Fixed_costs": "Ex. Rent: $2000, Car Loan: $500",
+  "Vehicle_Info": "2017 Honda Civic LX, 2022 Honda Accord",
+  "Savings_goal": "ideally 2k per month",
+  "project_name": "your-gcp-project-id",
   "issuers": {
     "issuer_name": {
       "local_dir": "C:\\Users\\Documents\\issuer_name_CSVs",
