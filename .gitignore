@@ -7,6 +7,10 @@ config.json
 # Ignore raw CSV files
 *.csv
 
+# Ignore Python bytecode caches
+__pycache__/
+*.pyc
+
 # Ignore local SQLite memory databases
 agent/memory/*.sqlite3
 agent/memory/*.sql

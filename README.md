@@ -21,7 +21,11 @@ This pipeline implements a multi-layer Lakehouse medallion architecture designed
 ├── Scripts/
 │   ├── upload_csv.py          # Uploads issuer-specific CSV files to GCS and archives them
 │   ├── run_all_issuers.py     # Runs the uploader for every issuer in config.json
+│   ├── memory.py              # SQLite-backed short-term and long-term memory helpers
 │   └── email_weekly_report.py # Generates weekly financial insights via BigQuery + Ollama LLM, emails HTML report
+├── agent/
+│   └── memory/
+│       └── memory.sqlite3     # Local runtime database for report memory (ignored by Git)
 ├── definitions/
 │   ├── bronze/                # Raw landing dependency declarations
 │   ├── silver/                # Cleaned SQLX models (e.g., chase_transactions.sqlx)
@@ -74,7 +78,20 @@ This workflow is useful for automating local CSV ingestion into GCS while keepin
 The `email_weekly_report.py` script generates an intelligent weekly financial insights email that:
 * Queries your **BigQuery Gold Layer** (`fact_monthly_spending`) to extract spending trends, category analysis, and key metrics  
 * Processes data through a local **Ollama LLM** (configurable via `model_server_url` & `model_name` in config) to generate contextual insights with playful Japanese food puns from your assistant Mogumogu-chan 🍣🍤
+* Uses local SQLite memory to include relevant long-term facts and recent report history in each prompt
+* Saves each completed report and extracts reusable financial facts for future reports
 * Outputs an attractive HTML report styled for email readability
+
+### Report Memory
+
+The `Scripts/memory.py` module manages the report's local SQLite memory database. The database is created automatically at `agent/memory/memory.sqlite3` when the weekly report runs. Set the `MEMORY_DB_PATH` environment variable to use a different location.
+
+Memory is organized into three tables:
+* `threads` stores stable internal identifiers for report conversations. External keys are hashed before storage.
+* `short_term` stores recent prompts and report responses for conversational context. Entries are trimmed to the newest 12 per thread by default.
+* `long_facts` stores reusable facts extracted from completed reports, such as spending trends or financial goals.
+
+The SQLite database and SQL scratch files are excluded from Git. Delete the local database only if you want to reset the report's memory.
 
 ### Setup Instructions
 

@@ -1,0 +1,12 @@
+{
+  "name": "gcp-belperfi-lakehouse-pipeline",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "compile": "dataform compile"
+  },
+  "devDependencies": {
+    "@dataform/cli": "3.0.52",
+    "@dataform/core": "3.0.52"
+  }
+}
