@@ -5,8 +5,7 @@
   "scripts": {
     "compile": "dataform compile"
   },
-  "devDependencies": {
-    "@dataform/cli": "3.0.52",
+  "dependencies": {
     "@dataform/core": "3.0.52"
   }
 }
