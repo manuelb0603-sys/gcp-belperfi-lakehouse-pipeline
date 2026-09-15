@@ -22,10 +22,22 @@ This pipeline implements a multi-layer Lakehouse medallion architecture designed
 │   ├── upload_csv.py          # Uploads issuer-specific CSV files to GCS and archives them
 │   ├── run_all_issuers.py     # Runs the uploader for every issuer in config.json
 │   ├── memory.py              # SQLite-backed short-term and long-term memory helpers
-│   └── email_weekly_report.py # Generates weekly financial insights via BigQuery + Ollama LLM, emails HTML report
+│   ├── email_weekly_report.py # Orchestrates data retrieval, agent mode, validation, and email delivery
+│   ├── agent_harness.py       # Bounded author/validator loop with allowlisted tool calls
+│   ├── bigquery_tools.py      # Read-only tools for gold-layer spending and transaction evidence
+│   ├── report_metrics.py      # Deterministic financial snapshot and KPI calculations
+│   ├── report_models.py       # Typed snapshot, validation, and finding models
+│   ├── run_archive.py         # Persists reports, traces, manifests, and run metrics
+│   ├── generate_mock_cd.py    # Generates mock Chase and Amex CSV data
+│   └── test_agent_harness.py  # Harness, parser, sanitization, and failure-path tests
 ├── agent/
-│   └── memory/
-│       └── memory.sqlite3     # Local runtime database for report memory (ignored by Git)
+│   ├── prompts/
+│   │   ├── personality.system.md     # Author persona and grounding instructions
+│   │   ├── ui.system.md              # HTML email and presentation constraints
+│   │   ├── financial-settings.md     # Financial policy and configuration context
+│   │   └── validator.system.md       # Validator-only output and review contract
+│   ├── memory/                       # Local SQLite memory files (ignored by Git)
+│   └── runs/                         # Generated reports, traces, manifests, and metrics (ignored by Git)
 ├── definitions/
 │   ├── bronze/                # Raw landing dependency declarations
 │   ├── silver/                # Cleaned SQLX models (e.g., chase_transactions.sqlx)
