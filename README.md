@@ -75,6 +75,32 @@ This workflow is useful for automating local CSV ingestion into GCS while keepin
 
 ## 📧 Weekly Financial Report Automation
 
+### Agent harness mode
+
+The report can run in two modes. `report_mode: "legacy"` preserves the original single-prompt flow. `report_mode: "agent"` uses bounded tools, an author model, and an independent validator model. The author can create a different seasonal HTML layout on each run. The validator checks current financial values, evidence, history labels, policy, required content, and HTML safety. Failed validation feeds structured feedback back to the author for a limited number of revisions. Email is sent only after validation passes.
+
+Set `dry_run` to `true` to execute the BigQuery, memory, author, validator, and rendering flow without sending email. Each run is saved under `agent/runs/<run_id>/` with its HTML report, plain text, trace, manifest, and metrics. Open `agent/runs/index.html` in a browser to view reports and compare objective metrics across models and runs. The index is regenerated automatically after each run.
+
+#### Runtime config knobs
+
+The live project configuration is read from `config.json` (not `config.example.json`). The agent mode adds a few important runtime controls that keep the report process bounded, inspectable, and safe:
+
+* `report_mode`: set to `"agent"` to use the structured author/validator flow. `"legacy"` keeps the original one-shot report generation flow.
+* `dry_run`: when `true`, the project runs the full BigQuery + prompt + validation + archive flow without sending email. This is recommended while tuning the model or validating report quality.
+* `validator_model_name`: the model used to validate the authored report. Keeping this separate from the author model helps prevent the same model from approving its own weak output.
+* `max_agent_rounds`: how many author iterations are allowed before the harness stops.
+* `max_tool_calls`: total number of tool calls permitted across the run.
+* `max_calls_per_tool`: per-tool call ceiling to prevent one tool from being overused.
+* `max_validation_cycles`: number of validation-revision loops before the report is rejected.
+* `max_report_bytes`: maximum generated HTML size allowed before the report is rejected as too large.
+* `days_back`: how many days of BigQuery history the summary query looks back over.
+* `ollama_stream`: set to `false` for the structured agent workflow so the model returns a complete response for parsing and validation.
+* `ollama_timeout`: the request timeout for Ollama calls in seconds. Increase this for larger or slower models that need more time to reason. A typical starting point is `1800` (30 minutes), with larger models sometimes needing more.
+
+These values are intentionally conservative for a demo or controlled deployment: they keep the model bounded, prevent runaway tool use, and make each run easy to review in the generated archive.
+
+The agent's transaction-detail tool reads only from the gold `fact_transactions` table and is bounded by month, category, and row count. Semantic memory, episodic memory, and report history are separate read-only tools. Previous reports are explicitly labeled as historical and cannot replace current gold-layer values.
+
 The `email_weekly_report.py` script generates an intelligent weekly financial insights email that:
 * Queries your **BigQuery Gold Layer** (`fact_monthly_spending`) to extract spending trends, category analysis, and key metrics  
 * Processes data through a local **Ollama LLM** (configurable via `model_server_url` & `model_name` in config) to generate contextual insights with playful Japanese food puns from your assistant Mogumogu-chan 🍣🍤

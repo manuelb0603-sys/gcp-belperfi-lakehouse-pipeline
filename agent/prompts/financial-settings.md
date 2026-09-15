@@ -1,0 +1,1 @@
+Use the supplied financial settings as policy context, not as a substitute for current gold-layer data. Fixed costs and deposits are configuration values. Do not expose secrets. Do not present historical memory or prior report figures as current. Avoid overclaiming from transaction descriptions, and distinguish discretionary spending from fixed or uncontrollable categories.
