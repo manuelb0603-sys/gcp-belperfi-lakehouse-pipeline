@@ -5,6 +5,7 @@ from email.mime.text import MIMEText
 from pathlib import Path
 import json
 import importlib.util
+import math
 import re
 import time
 from typing import Any, Dict
@@ -122,26 +123,11 @@ def format_data_payload(results: list) -> str:
 
 
 def _memory_context_to_prompt(memory_module: Any, receiver_header: str, sender: str, limit: int = 20, recent_limit: int = 1) -> str:
-    """Pull remembered facts and prior report history into the prompt without treating them as new truth."""
+    """Pull recent thread history only; long-term facts are retrieved on demand by agent tools."""
     if memory_module is None:
         return ""
 
     lines: list[str] = []
-
-    try:
-        facts = memory_module.get_long_facts(limit=limit)
-        if facts:
-            lines.append("Relevant prior memory/context:")
-            # Long-term facts are used as background context, not as the current financial
-            # truth source. They help preserve the user's habits and goals while the gold
-            # data stays authoritative.
-            for fact in facts:
-                key = fact.get("fact_key") or fact.get("key") or "memory"
-                text = fact.get("fact_text") or fact.get("text") or ""
-                if text:
-                    lines.append(f"- {key}: {text}")
-    except Exception as exc:
-        print(f"Long-term memory context lookup failed: {exc}")
 
     try:
         thread_key = receiver_header or sender or "email:unknown"
@@ -318,6 +304,45 @@ def _extract_json_payload(payload: str) -> list[dict[str, Any]]:
     return []
 
 
+def _ollama_embedding(text: str, ollama_url: str, model_name: str, timeout: int = 600) -> list[float]:
+    """Request one vector from Ollama's /api/embed endpoint."""
+    from urllib.parse import urlsplit, urlunsplit
+    import requests
+
+    parts = urlsplit(ollama_url)
+    path = parts.path.rstrip("/")
+    if path.endswith("/api/generate"):
+        path = path[:-len("generate")] + "embed"
+    elif path.endswith("/api/embed"):
+        pass
+    elif path.endswith("/api/embeddings"):
+        path = path[:-len("embeddings")] + "embed"
+    elif path.endswith("/api"):
+        path += "/embed"
+    else:
+        path = path + "/api/embed"
+    embedding_url = urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+    response = requests.post(
+        embedding_url,
+        json={"model": model_name, "input": text},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    embeddings = payload.get("embeddings")
+    if isinstance(embeddings, list) and embeddings and isinstance(embeddings[0], list):
+        vector = embeddings[0]
+    else:
+        # Support Ollama versions returning the singular legacy response field.
+        vector = payload.get("embedding")
+    if not isinstance(vector, list) or not vector:
+        raise ValueError("Ollama embedding response did not contain a vector")
+    values = [float(value) for value in vector]
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Ollama embedding response contained non-finite values")
+    return values
+
+
 def _remember_report(memory_module: Any, sender: str, receivers: list[str], receiver_header: str, prompt: str, report_text: str, model_name: str, ollama_url: str, config: dict) -> None:
     """Persist the report in short-term memory and extract reusable long facts for future runs."""
     if memory_module is None:
@@ -342,6 +367,8 @@ def _remember_report(memory_module: Any, sender: str, receivers: list[str], rece
         log_status(f"Saved short-term memory row with thread id={thread_id}, short_term id={st_id}")
 
         fact_model = config.get("fact_model_name", model_name)
+        embedding_model = config.get("embedding_model_name", "nomic-embed-text")
+        embedding_timeout = int(config.get("ollama_timeout", 600))
         fact_prompt = (
             "Extract a JSON array of concise facts from the following HTML report. "
             "Each item must be an object with keys 'fact_key', 'fact_text', and optional 'weight'.\n\n"
@@ -360,8 +387,16 @@ def _remember_report(memory_module: Any, sender: str, receivers: list[str], rece
                 if not fk or not ft:
                     continue
                 w = float(fact.get("weight", 1.0)) if fact.get("weight") is not None else 1.0
-                memory_module.upsert_long_fact(fk, ft, source_short_term_id=st_id, weight=w)
-            except Exception:
+                try:
+                    embedding = _ollama_embedding(ft, ollama_url, embedding_model, embedding_timeout)
+                except Exception as embedding_exc:
+                    log_status(f"Could not embed long fact '{fk}'; it will be backfilled on retrieval: {embedding_exc}")
+                    embedding = None
+                memory_module.upsert_long_fact(
+                    fk, ft, source_short_term_id=st_id, weight=w, embedding=embedding
+                )
+            except Exception as fact_exc:
+                log_status(f"Could not persist long fact: {fact_exc}")
                 continue
         log_status("Completed memory persistence and fact extraction")
     except Exception as exc:
@@ -399,11 +434,32 @@ def run_agent_weekly_report(
     )
     thread_key = receiver_header or sender or "email:unknown"
 
-    def semantic_memory(_: dict) -> dict:
-        """Return durable memory facts as tool evidence for the author model."""
+    def semantic_memory(arguments: dict) -> dict:
+        """Vector-search long-term facts using the query selected by the author model."""
         if memory_module is None:
             return {"facts": []}
-        return {"facts": memory_module.get_long_facts(limit=10)}
+        query_text = str(arguments.get("query", "")).strip()
+        if not query_text:
+            raise ValueError("get_semantic_memory requires a non-empty query")
+        if len(query_text) > 2000:
+            raise ValueError("Semantic memory query must be 2000 characters or fewer")
+
+        embedding_model = config.get("embedding_model_name", "nomic-embed-text")
+        timeout = int(config.get("ollama_timeout", 600))
+        # Backfill facts from databases created before the embedding column existed.
+        # This runs only on retrieval and writes each generated vector once.
+        for fact in memory_module.get_long_facts_needing_embedding():
+            try:
+                fact_vector = _ollama_embedding(
+                    fact["fact_text"], ollama_url, embedding_model, timeout
+                )
+                memory_module.set_long_fact_embedding(fact["fact_key"], fact_vector)
+            except Exception as exc:
+                log_status(f"Could not backfill embedding for long fact '{fact['fact_key']}': {exc}")
+
+        query_vector = _ollama_embedding(query_text, ollama_url, embedding_model, timeout)
+        limit = min(10, max(1, int(arguments.get("limit", 5))))
+        return {"query": query_text, "facts": memory_module.search_long_facts(query_vector, limit=limit)}
 
     def episodic_memory(_: dict) -> dict:
         """Return recent report thread context so the author can keep style and tone continuity."""
@@ -436,7 +492,13 @@ def run_agent_weekly_report(
         "get_spending_summary": ToolSpec("get_spending_summary", "Get authoritative monthly category spending.", lambda args: get_spending_summary(project_name, int(args.get("days_back", config.get("days_back", 90))))),
         "get_category_detail": ToolSpec("get_category_detail", "Get summary evidence for one category and two months.", lambda args: get_category_detail(project_name, str(args["category"]), str(args["month"]), args.get("previous_month"))),
         "get_transaction_detail": ToolSpec("get_transaction_detail", "Get bounded transaction rows from gold.fact_transactions.", lambda args: get_transaction_detail(project_name, str(args["month"]), args.get("category"), int(args.get("limit", 25)))),
-        "get_semantic_memory": ToolSpec("get_semantic_memory", "Get durable weighted financial facts.", semantic_memory),
+        "get_semantic_memory": ToolSpec(
+            "get_semantic_memory",
+            "Vector-search historical long-term facts relevant to a specific natural-language query. "
+            "Arguments: {\"query\": \"what user habits or goals are relevant to this analysis?\", \"limit\": 5}. "
+            "Choose a focused query; results are historical context, never current financial truth.",
+            semantic_memory,
+        ),
         "get_episodic_memory": ToolSpec("get_episodic_memory", "Get recent report thread context.", episodic_memory),
         "get_report_history": ToolSpec("get_report_history", "Get explicitly labeled historical report excerpts.", report_history),
     }

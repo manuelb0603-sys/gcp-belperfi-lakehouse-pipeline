@@ -108,15 +108,16 @@ The live project configuration is read from `config.json` (not `config.example.j
 * `days_back`: how many days of BigQuery history the summary query looks back over.
 * `ollama_stream`: set to `false` for the structured agent workflow so the model returns a complete response for parsing and validation.
 * `ollama_timeout`: the request timeout for Ollama calls in seconds. Increase this for larger or slower models that need more time to reason. A typical starting point is `1800` (30 minutes), with larger models sometimes needing more.
+* `embedding_model_name`: Ollama model for long-term fact and query embeddings. Default: `nomic-embed-text`; pull it on the Ollama server before using semantic memory.
 
 These values are intentionally conservative for a demo or controlled deployment: they keep the model bounded, prevent runaway tool use, and make each run easy to review in the generated archive.
 
-The agent's transaction-detail tool reads only from the gold `fact_transactions` table and is bounded by month, category, and row count. Semantic memory, episodic memory, and report history are separate read-only tools. Previous reports are explicitly labeled as historical and cannot replace current gold-layer values.
+The agent's transaction-detail tool reads only from the gold `fact_transactions` table and is bounded by month, category, and row count. `get_semantic_memory` embeds a focused natural-language query chosen by the agent, then returns the closest long-term facts by cosine similarity instead of loading every fact into the prompt. Episodic memory and report history remain separate read-only tools. Previous reports and semantic facts are historical and cannot replace current gold-layer values. Existing SQLite databases are migrated in place; missing vectors are embedded lazily during the first semantic search.
 
 The `email_weekly_report.py` script generates an intelligent weekly financial insights email that:
-* Queries your **BigQuery Gold Layer** (`fact_monthly_spending`) to extract spending trends, category analysis, and key metrics  
+* Queries your **BigQuery Gold Layer** (`fact_monthly_spending`) to extract spending trends, category analysis, and key metrics
 * Processes data through a local **Ollama LLM** (configurable via `model_server_url` & `model_name` in config) to generate contextual insights with playful Japanese food puns from your assistant Mogumogu-chan 🍣🍤
-* Uses local SQLite memory to include relevant long-term facts and recent report history in each prompt
+* Uses local SQLite memory and Ollama embeddings to retrieve relevant long-term facts on demand, alongside recent report history
 * Saves each completed report and extracts reusable financial facts for future reports
 * Outputs an attractive HTML report styled for email readability
 
@@ -127,7 +128,7 @@ The `Scripts/memory.py` module manages the report's local SQLite memory database
 Memory is organized into three tables:
 * `threads` stores stable internal identifiers for report conversations. External keys are hashed before storage.
 * `short_term` stores recent prompts and report responses for conversational context. Entries are trimmed to the newest 12 per thread by default.
-* `long_facts` stores reusable facts extracted from completed reports, such as spending trends or financial goals.
+* `long_facts` stores reusable report facts, such as spending trends or financial goals, with a serialized embedding vector for similarity search.
 
 The SQLite database and SQL scratch files are excluded from Git. Delete the local database only if you want to reset the report's memory.
 

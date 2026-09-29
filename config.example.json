@@ -12,6 +12,7 @@
   "days_back": 60,
   "ollama_stream": false,
   "ollama_timeout": 1800,
+  "embedding_model_name": "nomic-embed-text",
   "memory_schema": "memory",
   "Monthly_budget": "your-monthly-budget",
   "Fixed_costs": "Ex. Rent: $2000, Car Loan: $500",

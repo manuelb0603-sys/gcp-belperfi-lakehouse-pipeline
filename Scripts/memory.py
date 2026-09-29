@@ -16,6 +16,7 @@ import os
 import sqlite3
 import hashlib
 import json
+import math
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
@@ -89,6 +90,12 @@ def init_db(db_path: Optional[str] = None) -> str:
             )
             """
         )
+
+        # Existing memory databases predate vector retrieval. Add the nullable JSON
+        # embedding column in place so they remain usable without a destructive reset.
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(long_facts)")}
+        if "embedding" not in columns:
+            conn.execute("ALTER TABLE long_facts ADD COLUMN embedding TEXT")
 
         conn.commit()
     finally:
@@ -217,21 +224,39 @@ def trim_short_term(thread_internal_id: str, max_entries: int = 12) -> None:
         conn.close()
 
 
-def upsert_long_fact(fact_key: str, fact_text: str, source_short_term_id: Optional[int] = None, weight: float = 1.0) -> int:
+def _serialize_embedding(embedding: Optional[List[float]]) -> Optional[str]:
+    if embedding is None:
+        return None
+    values = [float(value) for value in embedding]
+    if not values or not all(math.isfinite(value) for value in values):
+        raise ValueError("Embedding must contain finite numeric values")
+    return json.dumps(values, separators=(",", ":"))
+
+
+def upsert_long_fact(
+    fact_key: str,
+    fact_text: str,
+    source_short_term_id: Optional[int] = None,
+    weight: float = 1.0,
+    embedding: Optional[List[float]] = None,
+) -> int:
+    """Insert or update a durable fact and its optional vector embedding."""
     conn = _get_conn()
     try:
         now = _now_iso()
+        embedding_json = _serialize_embedding(embedding)
         conn.execute(
             """
-            INSERT INTO long_facts (fact_key, fact_text, source_short_term_id, weight, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO long_facts (fact_key, fact_text, source_short_term_id, weight, updated_at, embedding)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(fact_key) DO UPDATE SET
                 fact_text = excluded.fact_text,
                 source_short_term_id = excluded.source_short_term_id,
                 weight = excluded.weight,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                embedding = excluded.embedding
             """,
-            (fact_key, fact_text, source_short_term_id, weight, now),
+            (fact_key, fact_text, source_short_term_id, weight, now, embedding_json),
         )
         conn.commit()
         cur = conn.execute("SELECT id FROM long_facts WHERE fact_key = ?", (fact_key,))
@@ -242,12 +267,85 @@ def upsert_long_fact(fact_key: str, fact_text: str, source_short_term_id: Option
 
 
 def get_long_facts(limit: int = 20) -> List[Dict[str, Any]]:
+    """Return facts without their potentially large embedding vectors."""
     conn = _get_conn()
     try:
         cur = conn.execute(
-            "SELECT * FROM long_facts ORDER BY weight DESC, updated_at DESC LIMIT ?",
+            "SELECT id, fact_key, fact_text, source_short_term_id, weight, updated_at "
+            "FROM long_facts ORDER BY weight DESC, updated_at DESC LIMIT ?",
             (limit,),
         )
         return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
+
+
+def get_long_facts_needing_embedding(limit: int = 1000) -> List[Dict[str, Any]]:
+    """List legacy or not-yet-embedded facts for lazy migration/backfill."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT fact_key, fact_text FROM long_facts "
+            "WHERE embedding IS NULL ORDER BY updated_at DESC LIMIT ?",
+            (max(0, int(limit)),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def set_long_fact_embedding(fact_key: str, embedding: List[float]) -> None:
+    """Store or refresh one fact's embedding."""
+    embedding_json = _serialize_embedding(embedding)
+    conn = _get_conn()
+    try:
+        conn.execute(
+            "UPDATE long_facts SET embedding = ? WHERE fact_key = ?",
+            (embedding_json, fact_key),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def search_long_facts(query_embedding: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+    """Rank facts by cosine similarity to a query vector; embeddings stay internal."""
+    query = [float(value) for value in query_embedding]
+    if not query or not all(math.isfinite(value) for value in query):
+        raise ValueError("Query embedding must contain finite numeric values")
+    query_norm = math.sqrt(sum(value * value for value in query))
+    if query_norm == 0:
+        raise ValueError("Query embedding must not be a zero vector")
+
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, fact_key, fact_text, source_short_term_id, weight, updated_at, embedding "
+            "FROM long_facts WHERE embedding IS NOT NULL"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    ranked = []
+    for row in rows:
+        try:
+            vector = json.loads(row["embedding"])
+            if not isinstance(vector, list) or len(vector) != len(query):
+                continue
+            vector = [float(value) for value in vector]
+            if not all(math.isfinite(value) for value in vector):
+                continue
+            vector_norm = math.sqrt(sum(value * value for value in vector))
+            if vector_norm == 0:
+                continue
+            score = sum(a * b for a, b in zip(query, vector)) / (query_norm * vector_norm)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        item = {key: row[key] for key in (
+            "id", "fact_key", "fact_text", "source_short_term_id", "weight", "updated_at"
+        )}
+        item["similarity"] = score
+        ranked.append(item)
+
+    ranked.sort(key=lambda item: (item["similarity"], item["weight"] or 0), reverse=True)
+    return ranked[:max(0, int(limit))]
