@@ -112,7 +112,7 @@ The live project configuration is read from `config.json` (not `config.example.j
 
 These values are intentionally conservative for a demo or controlled deployment: they keep the model bounded, prevent runaway tool use, and make each run easy to review in the generated archive.
 
-The agent's transaction-detail tool reads only from the gold `fact_transactions` table and is bounded by month, category, and row count. `get_semantic_memory` embeds a focused natural-language query chosen by the agent, then returns the closest long-term facts by cosine similarity instead of loading every fact into the prompt. Episodic memory and report history remain separate read-only tools. Previous reports and semantic facts are historical and cannot replace current gold-layer values. Existing SQLite databases are migrated in place; missing vectors are embedded lazily during the first semantic search.
+The agent's transaction-detail tool reads only from the gold `fact_transactions` table and is bounded by month, category, and row count. `get_semantic_memory` ranks a focused agent-written query with embedding cosine similarity and BM25 keyword relevance, then combines rankings with reciprocal-rank fusion and deduplicates facts. Semantic matching can catch paraphrases while BM25 matches exact terms and accounts for term frequency and document length. BM25 remains available if Ollama embeddings are unavailable. Both rankers scan the existing SQLite fact set directly; no separate search service or index is needed. Episodic memory and report history remain separate read-only tools. Previous reports and semantic facts are historical and cannot replace current gold-layer values. Existing SQLite databases are migrated in place; missing vectors are embedded lazily during semantic search.
 
 The `email_weekly_report.py` script generates an intelligent weekly financial insights email that:
 * Queries your **BigQuery Gold Layer** (`fact_monthly_spending`) to extract spending trends, category analysis, and key metrics
@@ -128,7 +128,9 @@ The `Scripts/memory.py` module manages the report's local SQLite memory database
 Memory is organized into three tables:
 * `threads` stores stable internal identifiers for report conversations. External keys are hashed before storage.
 * `short_term` stores recent prompts and report responses for conversational context. Entries are trimmed to the newest 12 per thread by default.
-* `long_facts` stores reusable report facts, such as spending trends or financial goals, with a serialized embedding vector for similarity search.
+* `long_facts` stores reusable report facts, such as spending trends or financial goals,
+  with a serialized embedding vector and the model name that generated it. Similarity
+  search compares vectors only within the same embedding model.
 
 The SQLite database and SQL scratch files are excluded from Git. Delete the local database only if you want to reset the report's memory.
 

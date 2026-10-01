@@ -18,3 +18,6 @@ agent/runs/
 
 # Ignore VS Code settings and launch profiles
 .vscode/
+
+# Ignore local-only experiments and standalone apps
+/Scripts/local_experiments/

@@ -393,7 +393,12 @@ def _remember_report(memory_module: Any, sender: str, receivers: list[str], rece
                     log_status(f"Could not embed long fact '{fk}'; it will be backfilled on retrieval: {embedding_exc}")
                     embedding = None
                 memory_module.upsert_long_fact(
-                    fk, ft, source_short_term_id=st_id, weight=w, embedding=embedding
+                    fk,
+                    ft,
+                    source_short_term_id=st_id,
+                    weight=w,
+                    embedding=embedding,
+                    embedding_model=embedding_model if embedding is not None else None,
                 )
             except Exception as fact_exc:
                 log_status(f"Could not persist long fact: {fact_exc}")
@@ -435,7 +440,7 @@ def run_agent_weekly_report(
     thread_key = receiver_header or sender or "email:unknown"
 
     def semantic_memory(arguments: dict) -> dict:
-        """Vector-search long-term facts using the query selected by the author model."""
+        """Hybrid-search long-term facts using the query selected by the author model."""
         if memory_module is None:
             return {"facts": []}
         query_text = str(arguments.get("query", "")).strip()
@@ -446,20 +451,42 @@ def run_agent_weekly_report(
 
         embedding_model = config.get("embedding_model_name", "nomic-embed-text")
         timeout = int(config.get("ollama_timeout", 600))
-        # Backfill facts from databases created before the embedding column existed.
-        # This runs only on retrieval and writes each generated vector once.
-        for fact in memory_module.get_long_facts_needing_embedding():
-            try:
-                fact_vector = _ollama_embedding(
-                    fact["fact_text"], ollama_url, embedding_model, timeout
-                )
-                memory_module.set_long_fact_embedding(fact["fact_key"], fact_vector)
-            except Exception as exc:
-                log_status(f"Could not backfill embedding for long fact '{fact['fact_key']}': {exc}")
-
-        query_vector = _ollama_embedding(query_text, ollama_url, embedding_model, timeout)
         limit = min(10, max(1, int(arguments.get("limit", 5))))
-        return {"query": query_text, "facts": memory_module.search_long_facts(query_vector, limit=limit)}
+        candidate_limit = min(50, max(20, limit * 4))
+        vector_results = []
+        try:
+            query_vector = _ollama_embedding(query_text, ollama_url, embedding_model, timeout)
+            # Backfill legacy facts and re-embed facts made by another model so all
+            # dense comparisons are within the same vector space.
+            for fact in memory_module.get_long_facts_needing_embedding(embedding_model):
+                try:
+                    fact_vector = _ollama_embedding(
+                        fact["fact_text"], ollama_url, embedding_model, timeout
+                    )
+                    memory_module.set_long_fact_embedding(
+                        fact["fact_key"], fact_vector, embedding_model
+                    )
+                except Exception as exc:
+                    log_status(f"Could not backfill embedding for long fact '{fact['fact_key']}': {exc}")
+            vector_results = memory_module.search_long_facts(
+                query_vector, embedding_model, limit=candidate_limit
+            )
+        except Exception as exc:
+            # Keyword retrieval remains useful if Ollama's embedding endpoint is
+            # unavailable; this keeps memory lookup from failing entirely.
+            log_status(f"Vector memory search unavailable; using keyword results: {exc}")
+
+        bm25_results = memory_module.search_long_facts_bm25(
+            query_text, limit=candidate_limit
+        )
+        facts = memory_module.combine_fact_search_results(
+            vector_results, bm25_results, limit=limit
+        )
+        return {
+            "query": query_text,
+            "retrieval": "vector+bm25_rrf" if vector_results else "bm25_fallback",
+            "facts": facts,
+        }
 
     def episodic_memory(_: dict) -> dict:
         """Return recent report thread context so the author can keep style and tone continuity."""
@@ -494,7 +521,8 @@ def run_agent_weekly_report(
         "get_transaction_detail": ToolSpec("get_transaction_detail", "Get bounded transaction rows from gold.fact_transactions.", lambda args: get_transaction_detail(project_name, str(args["month"]), args.get("category"), int(args.get("limit", 25)))),
         "get_semantic_memory": ToolSpec(
             "get_semantic_memory",
-            "Vector-search historical long-term facts relevant to a specific natural-language query. "
+            "Hybrid-search historical long-term facts with vector similarity and BM25 keyword relevance, "
+            "then combine rankings. "
             "Arguments: {\"query\": \"what user habits or goals are relevant to this analysis?\", \"limit\": 5}. "
             "Choose a focused query; results are historical context, never current financial truth.",
             semantic_memory,

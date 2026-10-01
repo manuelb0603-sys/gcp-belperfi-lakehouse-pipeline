@@ -17,6 +17,7 @@ import sqlite3
 import hashlib
 import json
 import math
+import re
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
@@ -96,6 +97,8 @@ def init_db(db_path: Optional[str] = None) -> str:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(long_facts)")}
         if "embedding" not in columns:
             conn.execute("ALTER TABLE long_facts ADD COLUMN embedding TEXT")
+        if "embedding_model" not in columns:
+            conn.execute("ALTER TABLE long_facts ADD COLUMN embedding_model TEXT")
 
         conn.commit()
     finally:
@@ -239,24 +242,28 @@ def upsert_long_fact(
     source_short_term_id: Optional[int] = None,
     weight: float = 1.0,
     embedding: Optional[List[float]] = None,
+    embedding_model: Optional[str] = None,
 ) -> int:
     """Insert or update a durable fact and its optional vector embedding."""
     conn = _get_conn()
     try:
         now = _now_iso()
         embedding_json = _serialize_embedding(embedding)
+        if embedding_json is not None and not (embedding_model and embedding_model.strip()):
+            raise ValueError("embedding_model is required when storing an embedding")
         conn.execute(
             """
-            INSERT INTO long_facts (fact_key, fact_text, source_short_term_id, weight, updated_at, embedding)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO long_facts (fact_key, fact_text, source_short_term_id, weight, updated_at, embedding, embedding_model)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(fact_key) DO UPDATE SET
                 fact_text = excluded.fact_text,
                 source_short_term_id = excluded.source_short_term_id,
                 weight = excluded.weight,
                 updated_at = excluded.updated_at,
-                embedding = excluded.embedding
+                embedding = excluded.embedding,
+                embedding_model = excluded.embedding_model
             """,
-            (fact_key, fact_text, source_short_term_id, weight, now, embedding_json),
+            (fact_key, fact_text, source_short_term_id, weight, now, embedding_json, embedding_model),
         )
         conn.commit()
         cur = conn.execute("SELECT id FROM long_facts WHERE fact_key = ?", (fact_key,))
@@ -280,36 +287,45 @@ def get_long_facts(limit: int = 20) -> List[Dict[str, Any]]:
         conn.close()
 
 
-def get_long_facts_needing_embedding(limit: int = 1000) -> List[Dict[str, Any]]:
-    """List legacy or not-yet-embedded facts for lazy migration/backfill."""
+def get_long_facts_needing_embedding(embedding_model: str, limit: int = 1000) -> List[Dict[str, Any]]:
+    """List facts without vectors from the requested model for lazy backfill/re-embedding."""
+    if not embedding_model or not embedding_model.strip():
+        raise ValueError("embedding_model must be provided")
     conn = _get_conn()
     try:
         rows = conn.execute(
             "SELECT fact_key, fact_text FROM long_facts "
-            "WHERE embedding IS NULL ORDER BY updated_at DESC LIMIT ?",
-            (max(0, int(limit)),),
+            "WHERE embedding IS NULL OR embedding_model IS NOT ? "
+            "ORDER BY updated_at DESC LIMIT ?",
+            (embedding_model, max(0, int(limit))),
         ).fetchall()
         return [dict(row) for row in rows]
     finally:
         conn.close()
 
 
-def set_long_fact_embedding(fact_key: str, embedding: List[float]) -> None:
-    """Store or refresh one fact's embedding."""
+def set_long_fact_embedding(fact_key: str, embedding: List[float], embedding_model: str) -> None:
+    """Store or refresh one fact's embedding and its producing model name."""
+    if not embedding_model or not embedding_model.strip():
+        raise ValueError("embedding_model must be provided")
     embedding_json = _serialize_embedding(embedding)
     conn = _get_conn()
     try:
         conn.execute(
-            "UPDATE long_facts SET embedding = ? WHERE fact_key = ?",
-            (embedding_json, fact_key),
+            "UPDATE long_facts SET embedding = ?, embedding_model = ? WHERE fact_key = ?",
+            (embedding_json, embedding_model, fact_key),
         )
         conn.commit()
     finally:
         conn.close()
 
 
-def search_long_facts(query_embedding: List[float], limit: int = 5) -> List[Dict[str, Any]]:
-    """Rank facts by cosine similarity to a query vector; embeddings stay internal."""
+def search_long_facts(
+    query_embedding: List[float], embedding_model: str, limit: int = 5
+) -> List[Dict[str, Any]]:
+    """Rank same-model vectors by cosine similarity; vector values stay internal."""
+    if not embedding_model or not embedding_model.strip():
+        raise ValueError("embedding_model must be provided")
     query = [float(value) for value in query_embedding]
     if not query or not all(math.isfinite(value) for value in query):
         raise ValueError("Query embedding must contain finite numeric values")
@@ -320,8 +336,9 @@ def search_long_facts(query_embedding: List[float], limit: int = 5) -> List[Dict
     conn = _get_conn()
     try:
         rows = conn.execute(
-            "SELECT id, fact_key, fact_text, source_short_term_id, weight, updated_at, embedding "
-            "FROM long_facts WHERE embedding IS NOT NULL"
+            "SELECT id, fact_key, fact_text, source_short_term_id, weight, updated_at, embedding, embedding_model "
+            "FROM long_facts WHERE embedding IS NOT NULL AND embedding_model = ?",
+            (embedding_model,),
         ).fetchall()
     finally:
         conn.close()
@@ -342,10 +359,129 @@ def search_long_facts(query_embedding: List[float], limit: int = 5) -> List[Dict
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
         item = {key: row[key] for key in (
-            "id", "fact_key", "fact_text", "source_short_term_id", "weight", "updated_at"
+            "id", "fact_key", "fact_text", "source_short_term_id", "weight", "updated_at", "embedding_model"
         )}
         item["similarity"] = score
         ranked.append(item)
 
     ranked.sort(key=lambda item: (item["similarity"], item["weight"] or 0), reverse=True)
+    return ranked[:max(0, int(limit))]
+
+
+_FACT_QUERY_STOPWORDS = {
+    "a", "about", "an", "and", "are", "as", "at", "be", "by", "for", "from",
+    "how", "in", "is", "it", "of", "on", "or", "that", "the", "this", "to",
+    "was", "what", "when", "where", "which", "with", "would", "user",
+}
+
+
+def _fact_search_tokens(text: str) -> List[str]:
+    return [
+        token for token in re.findall(r"[^\W_]+", text.casefold())
+        if len(token) > 1 and token not in _FACT_QUERY_STOPWORDS
+    ]
+
+
+def search_long_facts_bm25(
+    query_text: str,
+    limit: int = 20,
+    k1: float = 1.5,
+    b: float = 0.75,
+) -> List[Dict[str, Any]]:
+    """Rank fact keys and text with BM25 using an exact scan of the small fact set."""
+    query_tokens = set(_fact_search_tokens(query_text))
+    if not query_tokens or limit <= 0:
+        return []
+    if k1 < 0 or not 0 <= b <= 1:
+        raise ValueError("BM25 parameters require k1 >= 0 and 0 <= b <= 1")
+
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, fact_key, fact_text, source_short_term_id, weight, updated_at "
+            "FROM long_facts"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    documents = []
+    document_frequency = {token: 0 for token in query_tokens}
+    total_length = 0
+    for row in rows:
+        # Include the key as searchable text, so concise labels such as
+        # "travel_goal" work just like their spaced natural-language form.
+        tokens = _fact_search_tokens(f'{row["fact_key"] or ""} {row["fact_text"] or ""}')
+        frequencies: Dict[str, int] = {}
+        for token in tokens:
+            frequencies[token] = frequencies.get(token, 0) + 1
+        documents.append((row, tokens, frequencies))
+        total_length += len(tokens)
+        for token in query_tokens & frequencies.keys():
+            document_frequency[token] += 1
+
+    document_count = len(documents)
+    if not document_count:
+        return []
+    average_length = total_length / document_count
+    ranked = []
+    for row, tokens, frequencies in documents:
+        matched_tokens = query_tokens & frequencies.keys()
+        if not matched_tokens:
+            continue
+        score = 0.0
+        for token in matched_tokens:
+            term_frequency = frequencies[token]
+            inverse_document_frequency = math.log(
+                1 + (document_count - document_frequency[token] + 0.5)
+                / (document_frequency[token] + 0.5)
+            )
+            length_normalizer = k1 * (
+                1 - b + b * len(tokens) / average_length
+            ) if average_length else 0.0
+            score += inverse_document_frequency * (
+                term_frequency * (k1 + 1) / (term_frequency + length_normalizer)
+            )
+        item = {key: row[key] for key in (
+            "id", "fact_key", "fact_text", "source_short_term_id", "weight", "updated_at"
+        )}
+        item["bm25_score"] = score
+        item["matched_terms"] = sorted(matched_tokens)
+        ranked.append(item)
+
+    ranked.sort(
+        key=lambda item: (item["bm25_score"], item["weight"] or 0, item["updated_at"]),
+        reverse=True,
+    )
+    return ranked[:limit]
+
+
+def combine_fact_search_results(
+    vector_results: List[Dict[str, Any]],
+    lexical_results: List[Dict[str, Any]],
+    limit: int = 5,
+    rrf_k: int = 60,
+) -> List[Dict[str, Any]]:
+    """Merge dense and lexical rankings with reciprocal rank fusion (RRF)."""
+    combined: Dict[Any, Dict[str, Any]] = {}
+    for source, results in (("vector", vector_results), ("bm25", lexical_results)):
+        for rank, result in enumerate(results, start=1):
+            identity = result.get("id", result.get("fact_key"))
+            if identity is None:
+                continue
+            item = combined.setdefault(identity, dict(result))
+            item["retrieval_score"] = item.get("retrieval_score", 0.0) + 1.0 / (rrf_k + rank)
+            sources = item.setdefault("retrieval_sources", [])
+            if source not in sources:
+                sources.append(source)
+            for key, value in result.items():
+                if key not in item or key in {"similarity", "lexical_score", "matched_terms"}:
+                    item[key] = value
+
+    ranked = sorted(
+        combined.values(),
+        key=lambda item: (
+            item["retrieval_score"], item.get("weight") or 0, item.get("updated_at") or ""
+        ),
+        reverse=True,
+    )
     return ranked[:max(0, int(limit))]
