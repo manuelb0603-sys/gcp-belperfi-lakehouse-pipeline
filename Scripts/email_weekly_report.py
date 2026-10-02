@@ -5,43 +5,18 @@ from email.mime.text import MIMEText
 from pathlib import Path
 import json
 import importlib.util
-import math
 import re
 import time
-from typing import Any, Dict
+from typing import Any
+
+from finance.ollama import embed_text, generate_text
+from finance.settings import load_config as _shared_load_config
+from finance.settings import parse_money
 
 
 def _parse_money(value: Any) -> float:
     """Normalize a config value into a float so the deterministic financial snapshot is safe."""
-    # Keep this logic deterministic and local. The model should not be the source of
-    # truth for the financial snapshot; we normalize user config values before they are
-    # used in the authoritative calculations.
-    if isinstance(value, (int, float)):
-        return float(value)
-    matches = re.findall(r"-?\d+(?:\.\d+)?\s*[kKmM]?", str(value or ""))
-    if not matches:
-        raise ValueError(f"Could not parse a financial amount from: {value!r}")
-    total = 0.0
-    for match in matches:
-        normalized = match.replace(" ", "")
-        multiplier = 1
-        if normalized[-1:].lower() == "k":
-            multiplier = 1_000
-            normalized = normalized[:-1]
-        elif normalized[-1:].lower() == "m":
-            multiplier = 1_000_000
-            normalized = normalized[:-1]
-        total += float(normalized) * multiplier
-    return total
-
-
-def _load_prompt_files() -> tuple[str, str]:
-    """Load author context separately from the validator-only system prompt."""
-    prompt_dir = Path(__file__).resolve().parent.parent / "agent" / "prompts"
-    author_names = ["personality.system.md", "ui.system.md", "financial-settings.md"]
-    author_context = "\n\n".join((prompt_dir / name).read_text(encoding="utf-8") for name in author_names)
-    validator_context = (prompt_dir / "validator.system.md").read_text(encoding="utf-8")
-    return author_context, validator_context
+    return parse_money(value)
 
 
 def log_status(message: str, start_time: float | None = None) -> None:
@@ -55,8 +30,7 @@ def log_status(message: str, start_time: float | None = None) -> None:
 
 def load_config(config_path: Path) -> dict:
     """Read the active runtime config from disk so the script can run in the right mode."""
-    with open(config_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return _shared_load_config(config_path)
 
 
 def fetch_bigquery_summary(
@@ -202,32 +176,13 @@ Please write a polished HTML email body with clear sections and a warm, encourag
 
 def query_ollama(prompt: str, ollama_url: str, model_name: str, stream: bool = False, timeout: int = 600) -> str:
     """Send a prompt to Ollama and return the generated text, including a timeout for slow models."""
-    import requests
-
     request_started = time.perf_counter()
     log_status(f"Querying Ollama model '{model_name}' at {ollama_url} (stream={stream}, timeout={timeout}s)")
     try:
-        response = requests.post(ollama_url, json={
-            "model": model_name,
-            "prompt": prompt,
-            "stream": stream
-        }, timeout=timeout)
+        result = generate_text(prompt, ollama_url, model_name, timeout=timeout, stream=stream)
         elapsed = time.perf_counter() - request_started
-        log_status(
-            f"Ollama response received: status={response.status_code}, bytes={len(response.text or '')}, elapsed={elapsed:.1f}s"
-        )
-        if response.status_code != 200:
-            print(f"Ollama request failed with HTTP {response.status_code}: {response.text[:500]}")
-            return "Failed to generate report."
-        try:
-            payload = response.json()
-        except ValueError:
-            print(f"Ollama returned invalid JSON: {response.text[:500]}")
-            return "Failed to generate report."
-        return payload.get("response", "Failed to generate report.")
-    except requests.exceptions.Timeout:
-        log_status(f"Ollama request timed out after {time.perf_counter() - request_started:.1f}s")
-        return "Failed to generate report."
+        log_status(f"Ollama response received: bytes={len(result)}, elapsed={elapsed:.1f}s")
+        return result
     except Exception as exc:
         log_status(f"Ollama request failed with exception: {exc}")
         return "Failed to generate report."
@@ -306,41 +261,7 @@ def _extract_json_payload(payload: str) -> list[dict[str, Any]]:
 
 def _ollama_embedding(text: str, ollama_url: str, model_name: str, timeout: int = 600) -> list[float]:
     """Request one vector from Ollama's /api/embed endpoint."""
-    from urllib.parse import urlsplit, urlunsplit
-    import requests
-
-    parts = urlsplit(ollama_url)
-    path = parts.path.rstrip("/")
-    if path.endswith("/api/generate"):
-        path = path[:-len("generate")] + "embed"
-    elif path.endswith("/api/embed"):
-        pass
-    elif path.endswith("/api/embeddings"):
-        path = path[:-len("embeddings")] + "embed"
-    elif path.endswith("/api"):
-        path += "/embed"
-    else:
-        path = path + "/api/embed"
-    embedding_url = urlunsplit((parts.scheme, parts.netloc, path, "", ""))
-    response = requests.post(
-        embedding_url,
-        json={"model": model_name, "input": text},
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    embeddings = payload.get("embeddings")
-    if isinstance(embeddings, list) and embeddings and isinstance(embeddings[0], list):
-        vector = embeddings[0]
-    else:
-        # Support Ollama versions returning the singular legacy response field.
-        vector = payload.get("embedding")
-    if not isinstance(vector, list) or not vector:
-        raise ValueError("Ollama embedding response did not contain a vector")
-    values = [float(value) for value in vector]
-    if not all(math.isfinite(value) for value in values):
-        raise ValueError("Ollama embedding response contained non-finite values")
-    return values
+    return embed_text(text, ollama_url, model_name, timeout)
 
 
 def _remember_report(memory_module: Any, sender: str, receivers: list[str], receiver_header: str, prompt: str, report_text: str, model_name: str, ollama_url: str, config: dict) -> None:
@@ -421,181 +342,64 @@ def run_agent_weekly_report(
     model_name: str,
     memory_schema: str,
 ) -> None:
-    """Run the bounded author/validator flow and only send when the report passes validation."""
-    from agent_harness import HarnessLimits, ReportHarness, ToolSpec
-    from bigquery_tools import get_category_detail, get_spending_summary, get_transaction_detail
-    from report_metrics import calculate_report_snapshot
+    """Generate the latest-month agent report, archive it, and handle email delivery."""
+    from finance.reporting import generate_finance_report
     from run_archive import save_run
 
-    monthly_deposit = _parse_money(config.get("Monthly_budget"))
-    fixed_costs = _parse_money(config.get("Fixed_costs"))
-    savings_goal = _parse_money(config.get("Savings_goal")) if config.get("Savings_goal") else None
-    snapshot = calculate_report_snapshot(
-        results,
-        monthly_deposit=monthly_deposit,
-        fixed_costs=fixed_costs,
-        savings_goal=savings_goal,
-        category_goals=config.get("category_goals", {}),
-    )
-    thread_key = receiver_header or sender or "email:unknown"
-
-    def semantic_memory(arguments: dict) -> dict:
-        """Hybrid-search long-term facts using the query selected by the author model."""
-        if memory_module is None:
-            return {"facts": []}
-        query_text = str(arguments.get("query", "")).strip()
-        if not query_text:
-            raise ValueError("get_semantic_memory requires a non-empty query")
-        if len(query_text) > 2000:
-            raise ValueError("Semantic memory query must be 2000 characters or fewer")
-
-        embedding_model = config.get("embedding_model_name", "nomic-embed-text")
-        timeout = int(config.get("ollama_timeout", 600))
-        limit = min(10, max(1, int(arguments.get("limit", 5))))
-        candidate_limit = min(50, max(20, limit * 4))
-        vector_results = []
-        try:
-            query_vector = _ollama_embedding(query_text, ollama_url, embedding_model, timeout)
-            # Backfill legacy facts and re-embed facts made by another model so all
-            # dense comparisons are within the same vector space.
-            for fact in memory_module.get_long_facts_needing_embedding(embedding_model):
-                try:
-                    fact_vector = _ollama_embedding(
-                        fact["fact_text"], ollama_url, embedding_model, timeout
-                    )
-                    memory_module.set_long_fact_embedding(
-                        fact["fact_key"], fact_vector, embedding_model
-                    )
-                except Exception as exc:
-                    log_status(f"Could not backfill embedding for long fact '{fact['fact_key']}': {exc}")
-            vector_results = memory_module.search_long_facts(
-                query_vector, embedding_model, limit=candidate_limit
-            )
-        except Exception as exc:
-            # Keyword retrieval remains useful if Ollama's embedding endpoint is
-            # unavailable; this keeps memory lookup from failing entirely.
-            log_status(f"Vector memory search unavailable; using keyword results: {exc}")
-
-        bm25_results = memory_module.search_long_facts_bm25(
-            query_text, limit=candidate_limit
-        )
-        facts = memory_module.combine_fact_search_results(
-            vector_results, bm25_results, limit=limit
-        )
-        return {
-            "query": query_text,
-            "retrieval": "vector+bm25_rrf" if vector_results else "bm25_fallback",
-            "facts": facts,
-        }
-
-    def episodic_memory(_: dict) -> dict:
-        """Return recent report thread context so the author can keep style and tone continuity."""
-        if memory_module is None:
-            return {"entries": []}
-        thread_id = memory_module.get_or_create_thread("email", thread_key)
-        return {"entries": memory_module.get_short_term(thread_id, limit=3)}
-
-    def report_history(_: dict) -> dict:
-        """Return explicit historical excerpts labeled as non-authoritative reference material."""
-        entries = episodic_memory({}).get("entries", [])
-        excerpts = []
-        for entry in entries:
-            text = entry.get("response_text") or entry.get("response_html") or ""
-            if text:
-                excerpts.append({
-                    "subject": entry.get("subject") or "Weekly report",
-                    "excerpt": f'Previous report for reference: "{text[:1000]}" (historical; not authoritative)',
-                })
-        return {"reports": excerpts}
-
-    limits = HarnessLimits(
-        max_agent_rounds=int(config.get("max_agent_rounds", 6)),
-        max_tool_calls=int(config.get("max_tool_calls", 12)),
-        max_calls_per_tool=int(config.get("max_calls_per_tool", 3)),
-        max_validation_cycles=int(config.get("max_validation_cycles", 2)),
-        max_report_bytes=int(config.get("max_report_bytes", 250000)),
-    )
-    tools = {
-        "get_spending_summary": ToolSpec("get_spending_summary", "Get authoritative monthly category spending.", lambda args: get_spending_summary(project_name, int(args.get("days_back", config.get("days_back", 90))))),
-        "get_category_detail": ToolSpec("get_category_detail", "Get summary evidence for one category and two months.", lambda args: get_category_detail(project_name, str(args["category"]), str(args["month"]), args.get("previous_month"))),
-        "get_transaction_detail": ToolSpec("get_transaction_detail", "Get bounded transaction rows from gold.fact_transactions.", lambda args: get_transaction_detail(project_name, str(args["month"]), args.get("category"), int(args.get("limit", 25)))),
-        "get_semantic_memory": ToolSpec(
-            "get_semantic_memory",
-            "Hybrid-search historical long-term facts with vector similarity and BM25 keyword relevance, "
-            "then combine rankings. "
-            "Arguments: {\"query\": \"what user habits or goals are relevant to this analysis?\", \"limit\": 5}. "
-            "Choose a focused query; results are historical context, never current financial truth.",
-            semantic_memory,
-        ),
-        "get_episodic_memory": ToolSpec("get_episodic_memory", "Get recent report thread context.", episodic_memory),
-        "get_report_history": ToolSpec("get_report_history", "Get explicitly labeled historical report excerpts.", report_history),
-    }
-    harness = ReportHarness(
-        ollama_url=ollama_url,
-        author_model=model_name,
-        validator_model=config.get("validator_model_name", model_name),
-        limits=limits,
-        timeout=int(config.get("ollama_timeout", 600)),
-    )
-    prompt_context, validator_context = _load_prompt_files()
     started = time.perf_counter()
-    run_id = datetime.now().strftime("%Y%m%dT%H%M%S") + f"_{model_name.replace(':', '_')}"
-    report = {}
-    decision = None
+    thread_key = receiver_header or sender or "email:unknown"
     try:
-        report, decision, trace = harness.run(
-            objective="Create the weekly financial progress email using current evidence and clearly labeled history.",
-            snapshot=snapshot,
-            prompt_context=prompt_context,
-            validator_context=validator_context,
-            tools=tools,
+        result = generate_finance_report(
+            config=config,
+            project_name=project_name,
+            ollama_url=ollama_url,
+            model_name=model_name,
+            memory_module=memory_module,
+            thread_key=thread_key,
         )
-        status = "validated" if decision.passed else "validation_failed"
     except Exception as exc:
-        print(f"Agent harness failed: {exc}")
-        trace = harness.trace
-        trace.add(
-            "exception",
-            phase="agent_orchestration",
-            exception_type=type(exc).__name__,
-            error=str(exc),
-        )
-        status = "failed"
+        print(f"Shared finance report generation failed: {exc}")
+        return
 
-    report_html = str(report.get("report_html", ""))
-    report_text = str(report.get("plain_text", ""))
-    metrics = {
-        "model": model_name,
-        "validator_model": config.get("validator_model_name", model_name),
-        "mode": "agent",
-        "status": status,
-        "validation": decision.decision if decision else "error",
-        "runtime_seconds": round(time.perf_counter() - started, 3),
-        "agent_rounds": sum(event.get("event") == "agent_round" for event in trace.events),
-        "tool_calls": sum(event.get("event") == "tool_call" for event in trace.events),
-        "report_bytes": len(report_html.encode("utf-8")),
-    }
+    run_id = datetime.now().strftime("%Y%m%dT%H%M%S") + f"_{model_name.replace(':', '_')}"
     archive_root = Path(__file__).resolve().parent.parent / "agent" / "runs"
     save_run(
         archive_root,
         run_id,
-        {"run_id": run_id, "mode": "agent", "status": status, "snapshot": snapshot.to_dict()},
-        trace.events,
-        report_html,
-        report_text,
-        metrics,
+        {
+            "run_id": run_id,
+            "mode": "agent",
+            "status": result.metrics["status"],
+            "snapshot": result.snapshot.to_dict(),
+        },
+        result.trace.events,
+        result.report_html,
+        result.plain_text,
+        result.metrics,
     )
     print(f"Agent run archived at {archive_root / run_id}")
-    if not decision or not decision.passed:
-        print("Report was not sent because validator did not pass.")
+    if not result.passed:
+        print("Report was not sent because validation did not pass.")
         return
     if config.get("dry_run", False):
         print("Dry run enabled; report was rendered and archived but not sent.")
         return
-    msg_root = build_email_message(sender, receiver_header, report_html)
+
+    msg_root = build_email_message(sender, receiver_header, result.report_html)
     send_email(sender, receivers, password, msg_root)
     memory_module = _init_memory_module(memory_schema)
-    _remember_report(memory_module, sender, receivers, receiver_header, prompt_context, report_html, model_name, ollama_url, config)
+    _remember_report(
+        memory_module,
+        sender,
+        receivers,
+        receiver_header,
+        "Create the validated weekly finance report.",
+        result.report_html,
+        model_name,
+        ollama_url,
+        config,
+    )
+    log_status(f"Shared finance report and email workflow complete in {time.perf_counter() - started:.1f}s")
 
 
 def run_weekly_report(config_path: Path | None = None) -> None:
@@ -642,6 +446,17 @@ def run_weekly_report(config_path: Path | None = None) -> None:
         print("Ollama endpoint or model_name is missing from config.")
         return
 
+    log_status("Initializing memory module")
+    memory_module = _init_memory_module(memory_schema)
+    if report_mode == "agent":
+        # The shared report service resolves the latest month directly; do not constrain
+        # the email run to the legacy rolling days_back window.
+        run_agent_weekly_report(
+            config, [], memory_module, sender, receivers, receiver_header,
+            password, project_name, ollama_url, model_name, memory_schema,
+        )
+        return
+
     try:
         log_status(f"Fetching BigQuery summary for project '{project_name}' over last {days_back} days")
         results = fetch_bigquery_summary(project_name, days_back=days_back)
@@ -654,17 +469,6 @@ def run_weekly_report(config_path: Path | None = None) -> None:
         print("BigQuery returned no results. Aborting report generation.")
         return
 
-    # The agent mode is intentionally different from the legacy path: Python computes the
-    # financial snapshot and the agent is only allowed to gather evidence and write the
-    # narrative after the deterministic facts are established.
-    log_status("Initializing memory module")
-    memory_module = _init_memory_module(memory_schema)
-    if report_mode == "agent":
-        run_agent_weekly_report(
-            config, results, memory_module, sender, receivers, receiver_header,
-            password, project_name, ollama_url, model_name, memory_schema,
-        )
-        return
     log_status("Building memory context and prompt")
     memory_context = _memory_context_to_prompt(memory_module, receiver_header, sender)
     data_payload = format_data_payload(results)
