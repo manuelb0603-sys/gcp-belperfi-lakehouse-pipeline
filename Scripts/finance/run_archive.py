@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,16 +24,189 @@ def save_run(root: Path, run_id: str, manifest: dict[str, Any], trace: list[dict
     return run_dir
 
 
+COMPARISONS_DIR = "comparisons"
+TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+_TIMESTAMP_PATTERN = re.compile(rb'"timestamp":\s*"?(-?[0-9]+(?:\.[0-9]+)?)')
+_LINE_HEAD_BYTES = 4096
+_BACKSCAN_LIMIT_BYTES = 8 * 1024 * 1024
+
+
+def _line_timestamp(head: bytes) -> float | None:
+    """Epoch seconds from the start of a trace line (json.dumps writes "timestamp" second)."""
+    match = _TIMESTAMP_PATTERN.search(head)
+    return float(match.group(1)) if match else None
+
+
+def trace_first_last_timestamps(trace_path: Path) -> tuple[float | None, float | None]:
+    """Timestamps of the first and last trace.jsonl lines, reading only the heads of those lines."""
+    try:
+        with Path(trace_path).open("rb") as handle:
+            first = _line_timestamp(handle.readline(_LINE_HEAD_BYTES))
+            size = handle.seek(0, os.SEEK_END)
+            # Skip trailing newlines, then scan backwards for the newline before the last line.
+            end = size
+            while end > 0:
+                handle.seek(end - 1)
+                if handle.read(1) not in (b"\n", b"\r"):
+                    break
+                end -= 1
+            position = end
+            line_start = 0
+            while position > 0 and end - position <= _BACKSCAN_LIMIT_BYTES:
+                read_from = max(0, position - 65536)
+                handle.seek(read_from)
+                newline = handle.read(position - read_from).rfind(b"\n")
+                if newline >= 0:
+                    line_start = read_from + newline + 1
+                    break
+                position = read_from
+            handle.seek(line_start)
+            last = _line_timestamp(handle.read(min(_LINE_HEAD_BYTES, max(0, end - line_start))))
+    except OSError:
+        return None, None
+    return first, last
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _from_epoch(value: float | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def run_times(run_dir: Path, progress: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Start/end of a run (aware datetimes), whether it is still running, and its duration.
+
+    progress.json supplies started_at, and updated_at once the status is final. Older runs
+    without progress.json use the first and last trace.jsonl timestamps (epoch seconds).
+    """
+    run_dir = Path(run_dir)
+    if progress is None and (run_dir / "progress.json").exists():
+        try:
+            progress = json.loads((run_dir / "progress.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            progress = None
+    start = end = None
+    running = False
+    if isinstance(progress, dict):
+        start = _parse_iso(progress.get("started_at"))
+        if progress.get("status") != "running":
+            end = _parse_iso(progress.get("updated_at"))
+        elif not (run_dir / "metrics.json").exists():
+            running = True
+    if start is None or (end is None and not running):
+        first, last = trace_first_last_timestamps(run_dir / "trace.jsonl")
+        start = start or _from_epoch(first)
+        if end is None and not running:
+            end = _from_epoch(last)
+    duration = round((end - start).total_seconds(), 1) if start and end else None
+    return {"start": start, "end": end, "running": running, "duration_seconds": duration}
+
+
+def format_local(value: datetime | None) -> str:
+    """Local-time display string (YYYY-MM-DD HH:MM:SS), or "" when unknown."""
+    return value.astimezone().strftime(TIME_FORMAT) if value else ""
+
+
+def list_comparisons(root: Path) -> list[dict[str, Any]]:
+    """Comparison metadata from <root>/comparisons/*.json, newest first (adds _html and _sort)."""
+    items: list[dict[str, Any]] = []
+    folder = Path(root) / COMPARISONS_DIR
+    if not folder.is_dir():
+        return items
+    for path in folder.glob("*.json"):
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(meta, dict):
+            continue
+        meta["_html"] = Path(str(meta.get("html_file") or path.with_suffix(".html").name)).name
+        meta["_sort"] = str(meta.get("created_at") or path.stem)
+        items.append(meta)
+    items.sort(key=lambda item: item["_sort"], reverse=True)
+    return items
+
+
+INDEX_STYLE = (
+    "body{font:14px system-ui,sans-serif;margin:2rem;background:#fff8fb;color:#33252b}"
+    " table{border-collapse:collapse;width:100%;background:white}"
+    " th,td{border:1px solid #e8ccd8;padding:.55rem;text-align:left;vertical-align:top}"
+    " th{background:#f7dce8} a{color:#8d315b} button{margin:1rem 0;padding:.5rem .8rem}"
+    " .panel{background:white;border:1px solid #e8ccd8;padding:1rem;margin-bottom:1rem}"
+    " .muted{color:#7a6570} .nowrap{white-space:nowrap} tr.diff td{background:#fff1f5}"
+    " #compare-command{width:100%;font:13px ui-monospace,Consolas,monospace;padding:.4rem;box-sizing:border-box}"
+)
+
+INDEX_SCRIPT = r"""
+const keys = ['start','end','model','author_provider','validator_model','validator_provider','mode','status','validation','runtime_seconds','agent_rounds','tool_calls','validation_cycles','validator_calls','author_format_retries','validator_format_retries','initial_validation_errors','final_validation_errors','validation_error_reduction','validation_cycles_improved','validation_cycles_regressed','report_bytes'];
+function cell(tag, text) { const el = document.createElement(tag); el.textContent = text; return el; }
+function quoteArg(id) { return /^[A-Za-z0-9_.\-]+$/.test(id) ? id : '"' + id.replace(/"/g, '') + '"'; }
+function compareSelected() {
+    const target = document.getElementById('comparison');
+    const panel = document.getElementById('command-panel');
+    const ids = [...document.querySelectorAll('.run-select:checked')].map(item => item.value);
+    target.replaceChildren();
+    if (ids.length < 2) { target.textContent = 'Select at least two runs.'; panel.hidden = true; return; }
+    const table = document.createElement('table');
+    const head = document.createElement('tr');
+    head.appendChild(cell('th', 'metric'));
+    ids.forEach(id => head.appendChild(cell('th', id)));
+    table.appendChild(document.createElement('thead')).appendChild(head);
+    const body = table.appendChild(document.createElement('tbody'));
+    keys.forEach(key => {
+        const values = ids.map(id => { const value = (metrics[id] || {})[key]; return value === null || value === undefined ? '' : String(value); });
+        if (values.every(value => value === '')) return;
+        const row = document.createElement('tr');
+        if (key !== 'start' && key !== 'end' && new Set(values).size > 1) row.className = 'diff';
+        row.appendChild(cell('th', key));
+        values.forEach(value => row.appendChild(cell('td', value)));
+        body.appendChild(row);
+    });
+    target.appendChild(table);
+    target.appendChild(cell('p', 'Shaded rows differ between the selected runs.')).className = 'muted';
+    document.getElementById('compare-command').value = '..\\.venv\\Scripts\\python.exe Scripts\\compare_runs.py ' + ids.map(quoteArg).join(' ');
+    document.getElementById('copy-status').textContent = '';
+    panel.hidden = false;
+}
+function copyCommand() {
+    const input = document.getElementById('compare-command');
+    const status = document.getElementById('copy-status');
+    const fallback = () => { input.focus(); input.select(); status.textContent = 'Copy is unavailable here; the command is selected, press Ctrl+C.'; };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(input.value).then(() => { status.textContent = 'Copied.'; }, fallback);
+    } else {
+        fallback();
+    }
+}
+"""
+
+
 def update_index(root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
-    for run_dir in sorted((path for path in root.iterdir() if path.is_dir()), reverse=True):
+    run_dirs = (path for path in root.iterdir() if path.is_dir() and path.name != COMPARISONS_DIR)
+    for run_dir in sorted(run_dirs, reverse=True):
         # Finished runs have metrics.json; in-progress runs only have progress.json.
         try:
+            progress = None
+            if (run_dir / "progress.json").exists():
+                progress = json.loads((run_dir / "progress.json").read_text(encoding="utf-8"))
             if (run_dir / "metrics.json").exists():
                 item = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
-            elif (run_dir / "progress.json").exists():
-                progress = json.loads((run_dir / "progress.json").read_text(encoding="utf-8"))
+            elif isinstance(progress, dict):
                 item = {
                     "model": progress.get("model"),
                     "mode": "agent",
@@ -42,43 +216,70 @@ def update_index(root: Path) -> Path:
                 }
             else:
                 continue
+            times = run_times(run_dir, progress if isinstance(progress, dict) else None)
+            item["start"] = format_local(times["start"])
+            item["end"] = "running" if times["running"] else format_local(times["end"])
             item["run_id"] = run_dir.name
             rows.append(item)
         except (OSError, json.JSONDecodeError):
             continue
-    headers = ["run_id", "model", "mode", "status", "validation", "runtime_seconds", "agent_rounds", "tool_calls", "validation_cycles", "validator_calls", "author_format_retries", "validator_format_retries", "initial_validation_errors", "final_validation_errors", "validation_error_reduction", "validation_cycles_improved", "validation_cycles_regressed", "report_bytes"]
+    headers = ["run_id", "start", "end", "model", "mode", "status", "validation", "runtime_seconds", "agent_rounds", "tool_calls", "validation_cycles", "validator_calls", "author_format_retries", "validator_format_retries", "initial_validation_errors", "final_validation_errors", "validation_error_reduction", "validation_cycles_improved", "validation_cycles_regressed", "report_bytes"]
     table_rows = []
-    for item in rows:
+    for number, item in enumerate(rows, start=1):
         run_id = html.escape(str(item.get("run_id", "")))
-        cells = []
-        cells.append(f'<td><input type="checkbox" class="run-select" value="{run_id}"></td>')
+        cells = [f"<td>{number}</td>", f'<td><input type="checkbox" class="run-select" value="{run_id}"></td>']
         for header in headers:
-            value = html.escape(str(item.get(header, "")))
+            raw = item.get(header)
+            value = html.escape("" if raw is None else str(raw))
             if header == "run_id":
                 value = f'<a href="{run_id}/final_report.html">{value}</a>'
-            cells.append(f"<td>{value}</td>")
+            css = ' class="nowrap"' if header in {"start", "end"} else ""
+            cells.append(f"<td{css}>{value}</td>")
         cells.append(f'<td><a href="{run_id}/trace.jsonl">trace</a></td>')
         table_rows.append("<tr>" + "".join(cells) + "</tr>")
+    comparison_rows = []
+    for meta in list_comparisons(root):
+        created = format_local(_parse_iso(meta.get("created_at"))) or meta["_sort"]
+        run_ids = ", ".join(str(run_id) for run_id in meta.get("run_ids") or [])
+        model = ":".join(str(part) for part in (meta.get("eval_provider"), meta.get("eval_model")) if part)
+        link = html.escape(f"{COMPARISONS_DIR}/{meta['_html']}", quote=True)
+        comparison_rows.append(
+            f'<tr><td class="nowrap">{html.escape(created)}</td><td>{html.escape(run_ids)}</td>'
+            f'<td>{html.escape(model)}</td><td><a href="{link}">open</a></td></tr>'
+        )
+    if comparison_rows:
+        comparisons_html = (
+            "<table><thead><tr><th>date</th><th>runs</th><th>eval model</th><th>page</th></tr></thead>"
+            f"<tbody>{''.join(comparison_rows)}</tbody></table>"
+        )
+    else:
+        comparisons_html = '<p class="muted">No comparisons yet. Select runs above and run the command shown under Comparison.</p>'
     generated = datetime.now(timezone.utc).isoformat()
+    # "</" is escaped so run data can never close the script element.
+    metrics_json = json.dumps({item.get("run_id"): item for item in rows}, default=str).replace("</", "<\\/")
     page = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Finance Agent Runs</title>
-<style>body{{font:14px system-ui,sans-serif;margin:2rem;background:#fff8fb;color:#33252b}} table{{border-collapse:collapse;width:100%;background:white}} th,td{{border:1px solid #e8ccd8;padding:.55rem;text-align:left}} th{{background:#f7dce8}} a{{color:#8d315b}} button{{margin:1rem 0;padding:.5rem .8rem}} #comparison{{background:white;border:1px solid #e8ccd8;padding:1rem;white-space:pre-wrap}}</style></head>
-<body><h1>Finance Agent Runs</h1><p>Generated {html.escape(generated)}. Select reports to inspect or compare objective run metrics.</p>
+<style>{INDEX_STYLE}</style></head>
+<body><h1>Finance Agent Runs</h1><p>Generated {html.escape(generated)}. Start and end are local times. Select reports to inspect or compare objective run metrics.</p>
 <button onclick="compareSelected()">Compare selected runs</button>
-<table><thead><tr><th>compare</th>{''.join(f'<th>{html.escape(header)}</th>' for header in headers)}<th>trace</th></tr></thead><tbody>{''.join(table_rows)}</tbody></table>
-<h2>Comparison</h2><div id="comparison">Select two or more runs and choose Compare selected runs.</div>
+<table><thead><tr><th>No.</th><th>compare</th>{''.join(f'<th>{html.escape(header)}</th>' for header in headers)}<th>trace</th></tr></thead><tbody>{''.join(table_rows)}</tbody></table>
+<h2>Comparison</h2>
+<div id="comparison" class="panel">Select two or more runs and choose Compare selected runs.</div>
+<div id="command-panel" class="panel" hidden>
+<p>For an LLM-written comparison of these runs (eval model role), run this from the project root. Add <code>--dry-run-prompt</code> to inspect the prompt without calling the model.</p>
+<input id="compare-command" type="text" readonly onclick="this.select()" aria-label="compare_runs command">
+<button onclick="copyCommand()">Copy</button> <span id="copy-status" class="muted"></span>
+</div>
+<h2>Comparisons</h2>
+{comparisons_html}
 <script>
-const metrics = {json.dumps({item.get("run_id"): item for item in rows}, default=str)};
-function compareSelected() {{
-    const ids = [...document.querySelectorAll('.run-select:checked')].map(item => item.value);
-    if (ids.length < 2) {{ document.getElementById('comparison').textContent = 'Select at least two runs.'; return; }}
-    const keys = ['model','author_provider','validator_model','validator_provider','mode','status','validation','runtime_seconds','agent_rounds','tool_calls','validation_cycles','validator_calls','author_format_retries','validator_format_retries','initial_validation_errors','final_validation_errors','validation_error_reduction','validation_cycles_improved','validation_cycles_regressed','report_bytes'];
-    document.getElementById('comparison').textContent = keys.map(key => key + ': ' + ids.map(id => id + '=' + (metrics[id][key] ?? '')).join(' | ')).join('\\n');
-}}
+const metrics = {metrics_json};
+{INDEX_SCRIPT}
 </script></body></html>"""
     index = root / "index.html"
     index.write_text(page, encoding="utf-8")
     return index
+
 
 class ProgressRecorder:
     """Stream run trace events into the run directory so an in-progress run can be watched.
