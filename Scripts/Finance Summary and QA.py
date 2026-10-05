@@ -9,6 +9,7 @@ from typing import Any
 import gradio as gr
 
 from finance.bigquery_tools import get_report_period_spending, get_spending_years
+from finance.budget import BudgetExceededError
 from finance.memory import open_memory
 from finance.qa import answer_finance_question as shared_answer_finance_question
 from finance.reporting import generate_finance_report
@@ -107,11 +108,17 @@ def load_finance_summary(year: int | str | None, month: int) -> tuple[str, dict[
             "plain_text": result.plain_text,
             "report_html": result.report_html,
         }
+        budget_message = result.metrics.get("budget_exceeded")
+        if budget_message:
+            # A Claude spend cap stopped the report: say so plainly instead of a validation failure.
+            return "<div class='empty-state'><h3>Claude budget reached</h3></div>", report_context, budget_message
         if not result.report_html:
             message = result.decision.summary if result.decision else "The report generator did not return validated HTML."
             return "<div class='empty-state'><h3>Finance report generation failed</h3></div>", report_context, message
         status = "Validated finance report ready." if result.passed else "Report generated but did not pass validation. Review before relying on it."
         return f"<div class='finance-scroll'>{result.report_html}</div>", report_context, status
+    except BudgetExceededError as exc:
+        return "<div class='empty-state'><h3>Claude budget reached</h3></div>", None, str(exc)
     except Exception as exc:
         return "<div class='empty-state'><h3>Could not generate the finance summary</h3><p>Check the status message below.</p></div>", None, f"Finance report request failed: {exc}"
 

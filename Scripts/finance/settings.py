@@ -38,6 +38,12 @@ DEFAULTS: dict[str, Any] = {
     "email_listings": [],
     "qa_report_context_chunks": 5,
     "qa_long_fact_limit": 5,
+    "chat_data_cache_seconds": 900,
+    "merchant_aliases": {},
+    # Claude spend backstop (finance/budget.py): 0 or null disables a cap.
+    "anthropic_daily_budget_usd": 15.0,
+    "anthropic_run_budget_usd": 5.0,
+    "anthropic_cost_ledger_path": "agent/runs/cost_ledger.jsonl",
 }
 
 REPORT_MODES = ("legacy", "agent")
@@ -46,7 +52,9 @@ LIMIT_KEYS = ("max_agent_rounds", "max_tool_calls", "max_calls_per_tool", "max_v
 APP_FALLBACK_MODEL_SERVER_URL = "http://localhost:11434/api/generate"
 APP_FALLBACK_MODEL_NAME = "gemma4:e4b"
 # Role fields that are safe to record in run metadata (no URLs or credentials).
-PUBLIC_ROLE_KEYS = ("role", "provider", "model", "options", "think", "timeout", "max_tokens", "effort", "cache_system")
+PUBLIC_ROLE_KEYS = (
+    "role", "provider", "model", "options", "think", "timeout", "max_tokens", "effort", "cache_system", "stream", "thinking",
+)
 
 _SCHEMA_PATTERN = re.compile(r"[A-Za-z0-9_]+")
 
@@ -139,6 +147,36 @@ def _optional_text(value: Any) -> str | None:
     return None if value is None else str(value)
 
 
+def _budget_cap(key: str, value: Any) -> float | None:
+    """A USD cap: a non-negative number; 0 or null disables it (returns None)."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise SettingsError(f"{key} must be a dollar amount, 0, or null, got {value!r}")
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        raise SettingsError(f"{key} must be a dollar amount, 0, or null, got {value!r}") from None
+    if amount != amount or amount < 0:
+        raise SettingsError(f"{key} must be 0 or more (0 or null disables it), got {value!r}")
+    return amount if amount > 0 else None
+
+
+def budget_settings(config: "Mapping[str, Any] | ReportSettings | None") -> tuple[float | None, float | None, str]:
+    """(daily cap, run cap, ledger path) for a ReportSettings or a raw config mapping.
+
+    Omitted keys use DEFAULTS (caps ON); only an explicit 0 or null disables a cap.
+    """
+    if isinstance(config, ReportSettings):
+        return config.anthropic_daily_budget_usd, config.anthropic_run_budget_usd, config.anthropic_cost_ledger_path
+    config = dict(config or {})
+    return (
+        _budget_cap("anthropic_daily_budget_usd", _get(config, "anthropic_daily_budget_usd")),
+        _budget_cap("anthropic_run_budget_usd", _get(config, "anthropic_run_budget_usd")),
+        str(_get(config, "anthropic_cost_ledger_path") or DEFAULTS["anthropic_cost_ledger_path"]),
+    )
+
+
 @dataclass(frozen=True)
 class ReportSettings:
     """Validated, typed view of config.json for the report, email, app, Q&A, and compare tools."""
@@ -186,6 +224,13 @@ class ReportSettings:
     # Finance Summary and QA app
     qa_report_context_chunks: int
     qa_long_fact_limit: int
+    # Finance chat (Scripts/finance/chat/)
+    chat_data_cache_seconds: int
+    merchant_aliases: dict[str, str]
+    # Claude spend backstop (None = cap disabled); see finance/budget.py
+    anthropic_daily_budget_usd: float | None
+    anthropic_run_budget_usd: float | None
+    anthropic_cost_ledger_path: str
     # The source mapping (for role re-resolution with caller overrides); never shown in repr.
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
@@ -233,6 +278,13 @@ class ReportSettings:
         if not isinstance(category_goals, dict):
             raise SettingsError("category_goals must be an object mapping category names to amounts")
 
+        merchant_aliases = _get(config, "merchant_aliases")
+        if merchant_aliases is None:
+            merchant_aliases = {}
+        if not isinstance(merchant_aliases, dict):
+            raise SettingsError("merchant_aliases must be an object mapping merchant names to display names")
+        merchant_aliases = {str(key): str(value) for key, value in merchant_aliases.items()}
+
         listings = _get(config, "email_listings") or []
         if isinstance(listings, str) or not isinstance(listings, (list, tuple)):
             raise SettingsError("email_listings must be a list of email addresses")
@@ -277,6 +329,12 @@ class ReportSettings:
             gmail_app_credentials=_optional_text(config.get("Gmail_app_credentials")),
             qa_report_context_chunks=_int("qa_report_context_chunks", _get(config, "qa_report_context_chunks"), minimum=1),
             qa_long_fact_limit=_int("qa_long_fact_limit", _get(config, "qa_long_fact_limit"), minimum=1),
+            chat_data_cache_seconds=_int("chat_data_cache_seconds", _get(config, "chat_data_cache_seconds"), minimum=0),
+            merchant_aliases=merchant_aliases,
+            **dict(zip(
+                ("anthropic_daily_budget_usd", "anthropic_run_budget_usd", "anthropic_cost_ledger_path"),
+                budget_settings(config),
+            )),
             raw=config,
             **limits,
         )

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from .budget import COST_EVENTS, status_line as budget_status_line
 from .settings import PROJECT_ROOT
 
 
@@ -66,6 +67,10 @@ def save_run(root: Path, run_id: str, manifest: dict[str, Any], trace: list[dict
 
 
 COMPARISONS_DIR = "comparisons"
+# Validator replays (finance/replay.py) save one JSON result per call here.
+REPLAYS_DIR = "replays"
+# Folders under agent/runs that hold tool output rather than runs.
+NON_RUN_DIRS = frozenset({COMPARISONS_DIR, REPLAYS_DIR})
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 _TIMESTAMP_PATTERN = re.compile(rb'"timestamp":\s*"?(-?[0-9]+(?:\.[0-9]+)?)')
 _LINE_HEAD_BYTES = 4096
@@ -181,6 +186,23 @@ def list_comparisons(root: Path) -> list[dict[str, Any]]:
     return items
 
 
+def list_replays(root: Path, limit: int = 50) -> list[dict[str, Any]]:
+    """Validator replay results from <root>/replays/*.json, newest first (at most limit; adds _file)."""
+    folder = Path(root) / REPLAYS_DIR
+    if not folder.is_dir():
+        return []
+    items: list[dict[str, Any]] = []
+    for path in sorted(folder.glob("*.json"), reverse=True)[:limit]:
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(meta, dict):
+            meta["_file"] = path.name
+            items.append(meta)
+    return items
+
+
 INDEX_STYLE = (
     "body{font:14px system-ui,sans-serif;margin:2rem;background:#fff8fb;color:#33252b}"
     " table{border-collapse:collapse;width:100%;background:white}"
@@ -192,7 +214,7 @@ INDEX_STYLE = (
 )
 
 INDEX_SCRIPT = r"""
-const keys = ['start','end','model','author_provider','validator_model','validator_provider','mode','status','validation','runtime_seconds','agent_rounds','tool_calls','validation_cycles','validator_calls','author_format_retries','validator_format_retries','initial_validation_errors','final_validation_errors','validation_error_reduction','validation_cycles_improved','validation_cycles_regressed','report_bytes'];
+const keys = ['start','end','model','author_provider','validator_model','validator_provider','mode','status','validation','cost','runtime_seconds','agent_rounds','tool_calls','validation_cycles','validator_calls','author_format_retries','validator_format_retries','initial_validation_errors','final_validation_errors','validation_error_reduction','validation_cycles_improved','validation_cycles_regressed','report_bytes'];
 function cell(tag, text) { const el = document.createElement(tag); el.textContent = text; return el; }
 function quoteArg(id) { return /^[A-Za-z0-9_.\-]+$/.test(id) ? id : '"' + id.replace(/"/g, '') + '"'; }
 function compareSelected() {
@@ -238,7 +260,7 @@ function copyCommand() {
 def update_index(root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
-    run_dirs = (path for path in root.iterdir() if path.is_dir() and path.name != COMPARISONS_DIR)
+    run_dirs = (path for path in root.iterdir() if path.is_dir() and path.name not in NON_RUN_DIRS)
     for run_dir in sorted(run_dirs, reverse=True):
         # Finished runs have metrics.json; in-progress runs only have progress.json.
         try:
@@ -254,6 +276,7 @@ def update_index(root: Path) -> Path:
                     "status": progress.get("status"),
                     "runtime_seconds": progress.get("elapsed_seconds"),
                     "tool_calls": progress.get("tool_calls"),
+                    "anthropic_cost_usd": progress.get("anthropic_cost_usd"),
                 }
             else:
                 continue
@@ -261,10 +284,15 @@ def update_index(root: Path) -> Path:
             item["start"] = format_local(times["start"])
             item["end"] = "running" if times["running"] else format_local(times["end"])
             item["run_id"] = run_dir.name
+            cost = item.get("anthropic_cost_usd")
+            if not isinstance(cost, (int, float)) and isinstance(progress, dict):
+                cost = progress.get("anthropic_cost_usd")
+            # Blank for runs without Claude calls.
+            item["cost"] = f"${cost:.4f}" if isinstance(cost, (int, float)) else None
             rows.append(item)
         except (OSError, json.JSONDecodeError):
             continue
-    headers = ["run_id", "start", "end", "model", "mode", "status", "validation", "runtime_seconds", "agent_rounds", "tool_calls", "validation_cycles", "validator_calls", "author_format_retries", "validator_format_retries", "initial_validation_errors", "final_validation_errors", "validation_error_reduction", "validation_cycles_improved", "validation_cycles_regressed", "report_bytes"]
+    headers = ["run_id", "start", "end", "model", "mode", "status", "validation", "cost", "runtime_seconds", "agent_rounds", "tool_calls", "validation_cycles", "validator_calls", "author_format_retries", "validator_format_retries", "initial_validation_errors", "final_validation_errors", "validation_error_reduction", "validation_cycles_improved", "validation_cycles_regressed", "report_bytes"]
     table_rows = []
     for number, item in enumerate(rows, start=1):
         run_id = html.escape(str(item.get("run_id", "")))
@@ -295,6 +323,26 @@ def update_index(root: Path) -> Path:
         )
     else:
         comparisons_html = '<p class="muted">No comparisons yet. Select runs above and run the command shown under Comparison.</p>'
+    replay_rows = []
+    for meta in list_replays(root):
+        created = format_local(_parse_iso(meta.get("created_at"))) or meta["_file"]
+        model = ":".join(str(part) for part in (meta.get("provider"), meta.get("model")) if part)
+        cost = meta.get("estimated_cost_usd")
+        cells = [
+            created, str(meta.get("run_id") or ""), str(meta.get("cycle") or ""), model,
+            str(meta.get("decision") or meta.get("status") or ""), "" if cost is None else f"${cost:.4f}",
+        ]
+        link = html.escape(f"{REPLAYS_DIR}/{meta['_file']}", quote=True)
+        replay_rows.append(
+            "<tr>" + "".join(f"<td>{html.escape(cell)}</td>" for cell in cells) + f'<td><a href="{link}">json</a></td></tr>'
+        )
+    if replay_rows:
+        replays_html = (
+            "<table><thead><tr><th>date</th><th>run</th><th>cycle</th><th>validator model</th><th>decision</th>"
+            f"<th>est. cost</th><th>result</th></tr></thead><tbody>{''.join(replay_rows)}</tbody></table>"
+        )
+    else:
+        replays_html = '<p class="muted">No validator replays yet (Scripts/replay_validator.py).</p>'
     generated = datetime.now(timezone.utc).isoformat()
     # "</" is escaped so run data can never close the script element.
     metrics_json = json.dumps({item.get("run_id"): item for item in rows}, default=str).replace("</", "<\\/")
@@ -313,6 +361,8 @@ def update_index(root: Path) -> Path:
 </div>
 <h2>Comparisons</h2>
 {comparisons_html}
+<h2>Validator replays</h2>
+{replays_html}
 <script>
 const metrics = {metrics_json};
 {INDEX_SCRIPT}
@@ -443,6 +493,11 @@ class ProgressRecorder:
             self.state["stalled_validation_cycles"] += 1
         elif name == "author_rebuttals":
             self.state["author_rebuttals"] += event.get("rebuttal_count") or 0
+        elif name == "budget_exceeded":
+            self.state["budget_exceeded"] = event.get("error")
+        if name in COST_EVENTS and isinstance(event.get("cost_usd"), (int, float)):
+            total = (self.state.get("anthropic_cost_usd") or 0) + event["cost_usd"]
+            self.state["anthropic_cost_usd"] = round(total, 6)
         elif name == "run_completed":
             self.state["phase"] = "completed"
         elif name == "run_aborted":
@@ -485,10 +540,17 @@ def _describe_event(event: dict[str, Any]) -> str | None:
         if event.get("eval_count") is not None or event.get("prompt_eval_count") is not None:
             tokens = f", tokens in/out {event.get('prompt_eval_count', '?')}/{event.get('eval_count', '?')}"
         stop = f", stopped: {event.get('done_reason')}" if event.get("done_reason") not in (None, "stop") else ""
+        cost = f", cost ${event['cost_usd']:.4f}" if isinstance(event.get("cost_usd"), (int, float)) else ""
         return (
             f"{event.get('role')} response: parse {event.get('parse_status')}, "
-            f"{event.get('response_chars', 0):,} chars in {event.get('elapsed_seconds', '?')}s{tokens}{stop}"
+            f"{event.get('response_chars', 0):,} chars in {event.get('elapsed_seconds', '?')}s{tokens}{cost}{stop}"
         )
+    if name == "anthropic_budget":
+        if event.get("ledger_error"):
+            return f"Claude budget: cost ledger unavailable, so Claude calls will be refused ({event.get('ledger_error')})"
+        return budget_status_line(event)
+    if name == "budget_exceeded":
+        return f"Claude budget guard refused the {event.get('role')} call: {event.get('error')}; stopping with a fail decision"
     if name == "model_call_failed":
         return (
             f"{event.get('role')} model call failed (attempt {event.get('attempt')}, "

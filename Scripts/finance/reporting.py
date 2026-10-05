@@ -19,6 +19,7 @@ from .report_metrics import calculate_report_snapshot
 from .report_requirements import build_report_requirements
 from .html_text import html_to_text
 from .memory_search import search_long_facts
+from .budget import LedgerUnavailableError, anthropic_cost_from_events
 from .model_clients import build_model_client
 from .settings import PROJECT_ROOT, ReportSettings
 
@@ -194,6 +195,21 @@ def role_config_for(config: dict[str, Any] | ReportSettings, ollama_url: str | N
     return ReportSettings.coerce(config).with_model_overrides(ollama_url, model_name)
 
 
+def _record_budget_status(trace: Any, clients: tuple[Any, ...]) -> None:
+    """Trace the Claude spend so far against the caps at run start (one event when any role is Claude)."""
+    guard = next((getattr(client, "budget_guard", None) for client in clients if getattr(client, "budget_guard", None)), None)
+    if guard is None:
+        return
+    try:
+        status = guard.status()
+    except LedgerUnavailableError as exc:
+        # Every Claude call will be refused by the guard; record why up front.
+        trace.add("anthropic_budget", run_id=guard.run_id, ledger_error=str(exc),
+                  daily_budget_usd=guard.daily_budget_usd, run_budget_usd=guard.run_budget_usd)
+        return
+    trace.add("anthropic_budget", **status)
+
+
 def _required_amount(value: float | None, raw: Any, key: str) -> float:
     if value is None:
         raise ValueError(f"{key} is required for agent reports and must be an amount; got {raw!r}")
@@ -212,12 +228,17 @@ def generate_finance_report(
     rows: list[Any] | None = None,
     selected_report_month: date | None = None,
     trace_listeners: list[Callable[[dict[str, Any]], None]] | None = None,
+    run_id: str | None = None,
+    anthropic_client: Any = None,
 ) -> FinanceReportResult:
     """Build and validate an HTML report for latest or explicitly selected finance month.
 
     config is a config dict or ReportSettings; memory_module is a MemoryStore (or None).
     trace_listeners receive each harness trace event as it happens (for live progress).
+    run_id names this run in the Claude cost ledger (the run cap is per run id); without one an
+    "app_<timestamp>" id is used. anthropic_client injects a fake SDK client (tests only).
     """
+    run_id = run_id or f"app_{datetime.now().strftime('%Y%m%dT%H%M%S')}"
     # The caller's model_name and ollama_url stand in for the legacy keys; model_roles (or
     # model_name/validator_model_name/ollama_options) then pick each role's provider.
     settings = role_config_for(config, ollama_url, model_name)
@@ -236,8 +257,8 @@ def generate_finance_report(
         raise ValueError("Selected report month is missing from the fetched spending rows")
 
     limits = HarnessLimits(**settings.limits())
-    author_client = build_model_client(settings, "author")
-    validator_client = build_model_client(settings, "validator")
+    author_client = build_model_client(settings, "author", run_id=run_id, anthropic_client=anthropic_client)
+    validator_client = build_model_client(settings, "validator", run_id=run_id, anthropic_client=anthropic_client)
     harness = ReportHarness(
         ollama_url=ollama_url,
         author_model=author_client.model,
@@ -249,6 +270,7 @@ def generate_finance_report(
     )
     if trace_listeners:
         harness.trace.listeners.extend(trace_listeners)
+    _record_budget_status(harness.trace, (author_client, validator_client))
     prompt_dir = PROJECT_ROOT / "agent" / "prompts"
     author_files = ["personality.system.md", "ui.system.md", "financial-settings.md"]
     prompt_context = "\n\n".join((prompt_dir / filename).read_text(encoding="utf-8") for filename in author_files)
@@ -315,5 +337,11 @@ def generate_finance_report(
             (event.get("error_count_delta") or 0) < 0 for event in progress_events
         ),
         "report_bytes": len(report_html.encode("utf-8")),
+        "anthropic_cost_usd": anthropic_cost_from_events(trace.events),
     }
+    budget_events = [event for event in trace.events if event.get("event") == "budget_exceeded"]
+    if budget_events:
+        # A spend cap stopped the run: the decision is fail (never sent); say why plainly.
+        metrics["status"] = "budget_exceeded"
+        metrics["budget_exceeded"] = str(budget_events[-1].get("error") or "Claude spend cap reached")
     return FinanceReportResult(report_html, plain_text, snapshot, decision, trace, metrics, rows)

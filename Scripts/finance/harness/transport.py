@@ -79,7 +79,10 @@ def _response_meta(response: str) -> dict[str, Any]:
     usage = getattr(response, "usage", None)
     if usage:
         meta["usage"] = usage
-    stop_details = (getattr(response, "metadata", None) or {}).get("stop_details")
+    metadata = getattr(response, "metadata", None) or {}
+    stop_details = metadata.get("stop_details")
     if stop_details is not None:
         meta["stop_details"] = stop_details
+    if metadata.get("cost_usd") is not None:
+        meta["cost_usd"] = metadata["cost_usd"]  # Claude calls: USD recorded in the cost ledger
     return meta

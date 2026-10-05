@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ..budget import BudgetExceededError, LedgerUnavailableError  # noqa: F401
 from ..model_clients import EmptyModelResponse, is_anthropic_timeout, is_anthropic_transient  # noqa: F401
 
 
@@ -18,7 +19,8 @@ class RunDeadlineExceededError(RuntimeError):
 
 
 # Errors that end a run early with a fail decision (fallback or last sanitized report, never sent).
-RUN_STOP_ERRORS = (ModelUnavailableError, AgentRoundsExhaustedError, RunDeadlineExceededError)
+# BudgetExceededError (a Claude spend cap or an unavailable cost ledger) is never retried.
+RUN_STOP_ERRORS = (ModelUnavailableError, AgentRoundsExhaustedError, RunDeadlineExceededError, BudgetExceededError)
 
 
 def _is_timeout(exc: Exception) -> bool:

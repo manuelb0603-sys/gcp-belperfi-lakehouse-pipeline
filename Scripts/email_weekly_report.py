@@ -368,6 +368,7 @@ def run_agent_weekly_report(
     memory_schema: str,
 ) -> None:
     """Generate the latest-month agent report, archive it, and handle email delivery."""
+    from finance.budget import anthropic_cost_from_events
     from finance.reporting import generate_finance_report, role_config_for
     from run_archive import collect_run_metadata, save_run
 
@@ -398,6 +399,7 @@ def run_agent_weekly_report(
             memory_module=memory_module,
             thread_key=thread_key,
             trace_listeners=[progress] if progress is not None else None,
+            run_id=run_id,  # the Claude run cap (anthropic_run_budget_usd) is counted per run id
         )
     except Exception as exc:
         print(f"Shared finance report generation failed: {exc}", flush=True)
@@ -433,6 +435,7 @@ def run_agent_weekly_report(
             "validation_cycles": sum(event.get("event") == "validation_cycle_result" for event in events),
             "validator_calls": sum(event.get("event") == "model_call" and event.get("role") == "validator" for event in events),
             "report_bytes": 0,
+            "anthropic_cost_usd": anthropic_cost_from_events(events),
         }
         if progress is not None:
             progress.finish("exception", error=f"{type(exc).__name__}: {exc}")
@@ -473,9 +476,17 @@ def run_agent_weekly_report(
     )
     print(f"Agent run archived at {archive_root / run_id}")
     if not result.passed:
-        print("Report was not sent because validation did not pass.")
+        budget_message = result.metrics.get("budget_exceeded")
+        if budget_message:
+            # A Claude spend cap stopped the run: fail decision, nothing is sent.
+            print(f"Report was not sent: {budget_message}")
+        else:
+            print("Report was not sent because validation did not pass.")
         if progress is not None:
-            progress.finish(result.metrics["status"], delivery="not_sent")
+            details = {"delivery": "not_sent"}
+            if budget_message:
+                details["budget"] = budget_message
+            progress.finish(result.metrics["status"], **details)
         return
     if settings.dry_run:
         print("Dry run enabled; report was rendered and archived but not sent.")

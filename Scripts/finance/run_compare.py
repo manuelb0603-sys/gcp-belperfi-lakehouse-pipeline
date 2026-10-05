@@ -19,8 +19,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from .budget import BudgetExceededError
 from .model_clients import ModelClient, ModelReply, build_model_client
-from .run_archive import COMPARISONS_DIR, INDEX_STYLE, format_local, run_times, update_index
+from .pricing import price_for
+from .run_archive import COMPARISONS_DIR, INDEX_STYLE, NON_RUN_DIRS, format_local, run_times, update_index
 from .settings import PROJECT_ROOT, ReportSettings, load_config
 
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "agent" / "runs"
@@ -30,13 +32,6 @@ MAX_RUNS = 10
 DATA_BUDGET_CHARS = 54000
 MAX_RUN_CHARS = 24000
 REPORT_EXCERPT_CHARS = 1500
-
-# USD per million tokens (input, output), from README "Model providers".
-ANTHROPIC_PRICES = {
-    "claude-opus-5-5": (4.0, 20.0),
-    "claude-sonnet-5-5": (2.0, 10.0),
-    "claude-haiku-4-5": (1.0, 5.0),
-}
 
 NOTABLE_EVENTS = {
     "validation_stalled",
@@ -393,7 +388,7 @@ def resolve_runs(run_ids: list[str], runs_root: Path) -> list[Path]:
     for run_id in run_ids:
         name = Path(run_id.strip().rstrip("\\/")).name
         folder = Path(runs_root) / name
-        if not name or name == COMPARISONS_DIR or not folder.is_dir():
+        if not name or name in NON_RUN_DIRS or not folder.is_dir():
             unknown.append(run_id)
         elif folder not in folders:
             folders.append(folder)
@@ -578,20 +573,12 @@ def markdown_to_html(markdown: str) -> str:
 # ----- cost, pages, metadata -----
 
 
-def anthropic_price(model: str | None) -> tuple[float, float] | None:
-    name = str(model or "")
-    for key, price in ANTHROPIC_PRICES.items():
-        if name == key or name.startswith(key):
-            return price
-    return None
-
-
 def estimate_cost(provider: str | None, model: str | None, input_tokens: int | None, output_tokens: int | None) -> float | None:
-    """USD estimate for an Anthropic call (all input tokens at the base input price)."""
+    """USD estimate for an Anthropic call (all input tokens at the base input price; finance.pricing table)."""
     if provider != "anthropic":
         return None
-    price = anthropic_price(model)
-    if price is None or input_tokens is None or output_tokens is None:
+    price = price_for(model)
+    if input_tokens is None or output_tokens is None:
         return None
     return round(input_tokens / 1_000_000 * price[0] + output_tokens / 1_000_000 * price[1], 4)
 
@@ -661,13 +648,15 @@ def compare_runs(
     runs = gather_runs(folders)
     system, user = build_prompt(runs)
     if client is None:
-        client = build_model_client(settings, "eval")
+        client = build_model_client(settings, "eval", run_id="compare")
     spec = settings.role("eval")
     provider = getattr(client, "provider", spec.get("provider"))
     model = getattr(client, "model", spec.get("model"))
     echo(f"Comparing {len(folders)} runs with {provider}:{model} ({len(system) + len(user):,} prompt characters)...")
     try:
         reply = client.generate(user, system=system, timeout=spec.get("timeout"))
+    except BudgetExceededError as exc:
+        raise CompareError(f"{exc}. Nothing was saved.") from exc
     except Exception as exc:  # any provider/network failure: report it and save nothing
         raise CompareError(f"Eval model call failed ({provider}:{model}): {type(exc).__name__}: {exc}") from exc
     done_reason = getattr(reply, "done_reason", None)
@@ -699,7 +688,11 @@ def compare_runs(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "usage": usage,
-        "estimated_cost_usd": estimate_cost(provider, model, input_tokens, output_tokens),
+        # The cost the guarded Claude client recorded in the ledger, else an estimate from the token counts.
+        "estimated_cost_usd": (
+            round(recorded_cost, 4) if isinstance(recorded_cost := (getattr(reply, "metadata", None) or {}).get("cost_usd"), (int, float))
+            else estimate_cost(provider, model, input_tokens, output_tokens)
+        ),
         "html_file": html_path.name,
         "markdown": markdown,
     }

@@ -16,9 +16,12 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urlsplit, urlunsplit
 
+from .budget import BudgetGuard, guard_from_settings
+from .pricing import cost_usd, worst_case_call_usd
 from .settings import DEFAULTS
 
 
@@ -27,6 +30,13 @@ logger = logging.getLogger(__name__)
 MODEL_ROLES = ("author", "validator", "eval")
 DEFAULT_TIMEOUT = DEFAULTS["ollama_timeout"]
 DEFAULT_ANTHROPIC_MAX_TOKENS = 16000
+# Upper bound accepted for model_roles.<role>.max_tokens (thinking tokens count toward it).
+MAX_ANTHROPIC_MAX_TOKENS = 64000
+# With stream unset (auto), requests above this many max_tokens are streamed: the SDK refuses
+# non-streaming requests whose expected duration exceeds 10 minutes (about 21k max_tokens).
+ANTHROPIC_STREAM_THRESHOLD = 16000
+# The only thinking mode a role may request; current models reject "disabled" and budget_tokens.
+ANTHROPIC_THINKING_MODES = ("adaptive",)
 # Anthropic rejects an empty user message; used only when the whole prompt went to the system block.
 EMPTY_USER_MESSAGE = "Follow the instructions above."
 
@@ -263,14 +273,34 @@ def _plain(value: Any) -> Any:
     return {key: val for key, val in vars(value).items() if not key.startswith("_")}
 
 
+def _http_class_names(exc: BaseException) -> set[str]:
+    """Names of httpx/httpx2 exception classes exc is an instance of (empty for others)."""
+    return {
+        cls.__name__ for cls in type(exc).__mro__
+        if str(getattr(cls, "__module__", "")).split(".")[0] in {"httpx", "httpx2"}
+    }
+
+
 class AnthropicClient:
     """Claude Messages API client using the official ``anthropic`` SDK (imported lazily).
 
     The stable instruction text goes in a ``system`` block marked for prompt caching; the
-    per-call content is the single user message. No thinking/sampling parameters are sent
-    (current models reject ``thinking: disabled``, ``budget_tokens`` and temperature); depth
-    is controlled with ``effort`` only. The SDK is built with max_retries=1 so its own retry
-    does not stack with the harness's retry.
+    per-call content is the single user message. No sampling parameters, ``thinking:
+    disabled`` or ``budget_tokens`` are sent (current models reject them). Claude Opus 5.5
+    and Sonnet 5.5 think adaptively by default and ``effort`` controls the depth; a role may
+    set ``thinking="adaptive"`` (sent as ``{"type": "adaptive"}``) for models where thinking
+    is off by default. Thinking tokens count toward ``max_tokens``; the thinking display is
+    left at the API default.
+
+    ``stream`` None (auto) streams when max_tokens exceeds ANTHROPIC_STREAM_THRESHOLD (the SDK
+    requires streaming for long requests); the reply is built the same way either way. The SDK
+    is built with max_retries=1 so its own retry does not stack with the harness's retry.
+
+    ``budget_guard`` (finance.budget.BudgetGuard, attached by build_model_client) is asked before
+    every request and records every billed call in the cost ledger; a refused call raises
+    BudgetExceededError without contacting the API. A real SDK client is never built without a
+    guard; only an injected fake SDK client (tests) may run unguarded. Each reply carries
+    ``metadata["cost_usd"]``.
     """
 
     provider = "anthropic"
@@ -285,12 +315,22 @@ class AnthropicClient:
         client: Any = None,
         options: dict[str, Any] | None = None,
         think: bool | None = None,
+        stream: bool | None = None,
+        thinking: str | None = None,
+        budget_guard: BudgetGuard | None = None,
+        role: str | None = None,
     ) -> None:
         self.model = model
+        self.budget_guard = budget_guard
+        self.role = role
         self.max_tokens = int(max_tokens)
         self.effort = effort
         self.cache_system = cache_system
         self.default_timeout = default_timeout
+        self.stream = stream
+        if thinking is not None and thinking not in ANTHROPIC_THINKING_MODES:
+            raise ValueError(f"thinking must be 'adaptive' or omitted (Claude thinking cannot be disabled), got {thinking!r}")
+        self.thinking = thinking
         self._client = client
         ignored = sorted((options or {}).keys()) + (["think"] if think is not None else [])
         if ignored:
@@ -298,6 +338,11 @@ class AnthropicClient:
 
     def _sdk_client(self) -> Any:
         if self._client is None:
+            if self.budget_guard is None:
+                # Real API calls are always metered; build clients with build_model_client.
+                raise RuntimeError(
+                    "AnthropicClient needs a BudgetGuard before it may call the Claude API; use build_model_client"
+                )
             import anthropic
 
             # Credentials come from ANTHROPIC_API_KEY or an `ant auth login` profile.
@@ -325,7 +370,61 @@ class AnthropicClient:
             output_config["effort"] = self.effort
         if output_config:
             kwargs["output_config"] = output_config
+        if self.thinking:
+            kwargs["thinking"] = {"type": self.thinking}
         return kwargs
+
+    def uses_streaming(self) -> bool:
+        """Whether generate() streams: the explicit stream setting, else max_tokens above the threshold."""
+        return self.stream if self.stream is not None else self.max_tokens > ANTHROPIC_STREAM_THRESHOLD
+
+    @staticmethod
+    def _streamed_message(client: Any, kwargs: dict[str, Any], timeout: float) -> Any:
+        """Run one streamed request and return its final message.
+
+        The SDK timeout applies per network read, so the total call time is also checked between
+        stream events. Exceeding it, or an httpx read/transport error mid-stream (the SDK does not
+        wrap those), raises TimeoutError/ConnectionError so the harness treats it like any failed call.
+        """
+        deadline = time.monotonic() + timeout
+        try:
+            with client.messages.stream(**kwargs) as stream:
+                if hasattr(stream, "__iter__"):
+                    for _event in stream:
+                        if time.monotonic() > deadline:
+                            raise TimeoutError(f"Claude stream exceeded the {timeout:g}s call timeout")
+                return stream.get_final_message()
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            names = _http_class_names(exc)
+            if "TimeoutException" in names:
+                raise TimeoutError(f"Claude stream timed out: {exc}") from exc
+            if names & {"TransportError", "NetworkError", "RemoteProtocolError"}:
+                raise ConnectionError(f"Claude stream was interrupted: {exc}") from exc
+            raise
+
+    def _record_failed_call(self, exc: Exception, prompt_chars: int) -> None:
+        """Record a failed request that may still have been billed.
+
+        A timeout or an interrupted stream may have consumed the prompt, so its input is recorded
+        at the list price (estimated from the characters, marked estimated). Errors the API rejects
+        up front (4xx) are not billed and are not recorded.
+        """
+        if self.budget_guard is None:
+            return
+        if not (isinstance(exc, (TimeoutError, ConnectionError)) or is_anthropic_transient(exc)):
+            return
+        if "RateLimitError" in _anthropic_class_names(exc):
+            return  # rejected before any processing
+        estimate = worst_case_call_usd(self.model, prompt_chars, 0)
+        try:
+            exc.cost_usd = estimate  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
+        self.budget_guard.record(
+            self.model, None, role=self.role, outcome=f"error:{type(exc).__name__}", cost=estimate, estimated=True
+        )
 
     def generate(
         self,
@@ -335,9 +434,26 @@ class AnthropicClient:
         json_schema: dict[str, Any] | str | None = None,
         timeout: float | None = None,
     ) -> ModelReply:
-        """Call messages.create and normalize the reply (refusal -> empty text, max_tokens -> "length")."""
-        client = self._sdk_client().with_options(timeout=self.default_timeout if timeout is None else timeout)
-        message = client.messages.create(**self.request_kwargs(prompt, system, json_schema))
+        """Call the Messages API and normalize the reply (refusal -> empty text, max_tokens -> "length").
+
+        Streams (messages.stream, final message only) when uses_streaming(), else messages.create.
+        """
+        call_timeout = self.default_timeout if timeout is None else timeout
+        kwargs = self.request_kwargs(prompt, system, json_schema)
+        prompt_chars = len(system or "") + len(kwargs["messages"][0]["content"])
+        if self.budget_guard is not None:
+            # Raises BudgetExceededError (nothing is sent) when this call's worst case could pass a cap.
+            self.budget_guard.check(self.model, prompt_chars, self.max_tokens, role=self.role)
+        client = self._sdk_client().with_options(timeout=call_timeout)
+        streamed = self.uses_streaming()
+        try:
+            if streamed:
+                message = self._streamed_message(client, kwargs, call_timeout)
+            else:
+                message = client.messages.create(**kwargs)
+        except Exception as exc:
+            self._record_failed_call(exc, prompt_chars)
+            raise
         stop_reason = _field(message, "stop_reason")
         done_reason = _ANTHROPIC_STOP_REASONS.get(stop_reason, stop_reason)
         usage_obj = _field(message, "usage")
@@ -345,7 +461,8 @@ class AnthropicClient:
             key: _field(usage_obj, key)
             for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
         } if usage_obj is not None else None
-        metadata: dict[str, Any] = {"stop_reason": stop_reason}
+        call_cost = cost_usd(self.model, usage)
+        metadata: dict[str, Any] = {"stop_reason": stop_reason, "streamed": streamed, "cost_usd": call_cost}
         message_id = _field(message, "id")
         if message_id:
             metadata["message_id"] = message_id
@@ -358,8 +475,15 @@ class AnthropicClient:
                 for block in (_field(message, "content") or [])
                 if _field(block, "type") == "text"
             )
-            if not text.strip() and done_reason != "length":
-                raise EmptyModelResponse(f"Claude response did not contain text (stop_reason={stop_reason})")
+        empty = done_reason != "refusal" and not text.strip() and done_reason != "length"
+        if self.budget_guard is not None:
+            # Every billed call is recorded, including refusals and empty answers; a failed write raises.
+            outcome = "empty" if empty else (done_reason or "ok")
+            self.budget_guard.record(self.model, usage, role=self.role, outcome=outcome, cost=call_cost)
+        if empty:
+            error = EmptyModelResponse(f"Claude response did not contain text (stop_reason={stop_reason})")
+            error.cost_usd = call_cost  # type: ignore[attr-defined]
+            raise error
         return ModelReply(
             text,
             done_reason=done_reason,
@@ -425,18 +549,52 @@ def resolve_model_role(config: Any, role: str) -> dict[str, Any]:
         resolved["options"], resolved["think"] = _split_ollama_section(section)
         resolved["base_url"] = entry.get("base_url") or config.get("model_server_url")
     elif provider == "anthropic":
-        resolved["max_tokens"] = int(entry.get("max_tokens") or DEFAULT_ANTHROPIC_MAX_TOKENS)
+        raw_max = entry.get("max_tokens")
+        if raw_max is None:
+            raw_max = DEFAULT_ANTHROPIC_MAX_TOKENS
+        max_tokens: int | None = None
+        if isinstance(raw_max, int) and not isinstance(raw_max, bool):
+            max_tokens = raw_max
+        elif isinstance(raw_max, float) and raw_max.is_integer():
+            max_tokens = int(raw_max)
+        elif isinstance(raw_max, str) and raw_max.strip().isdigit():
+            max_tokens = int(raw_max)
+        if max_tokens is None or not 1 <= max_tokens <= MAX_ANTHROPIC_MAX_TOKENS:
+            raise ValueError(
+                f"model_roles.{role}.max_tokens must be an integer from 1 to {MAX_ANTHROPIC_MAX_TOKENS}, got {raw_max!r}"
+            )
+        resolved["max_tokens"] = max_tokens
         resolved["effort"] = entry.get("effort")
         resolved["cache_system"] = bool(entry.get("cache_system", True))
+        stream = entry.get("stream")
+        if stream is not None and not isinstance(stream, bool):
+            raise ValueError(f"model_roles.{role}.stream must be true, false, or omitted (auto), got {stream!r}")
+        resolved["stream"] = stream
+        thinking = entry.get("thinking")
+        if thinking is not None and thinking not in ANTHROPIC_THINKING_MODES:
+            raise ValueError(
+                f"model_roles.{role}.thinking must be 'adaptive' or omitted (Claude thinking cannot be disabled), got {thinking!r}"
+            )
+        resolved["thinking"] = thinking
     else:
         raise ValueError(f"Unsupported provider {provider!r} for model role {role!r} (use 'ollama' or 'anthropic')")
     return resolved
 
 
-def build_model_client(config: Any, role: str, *, anthropic_client: Any = None) -> ModelClient:
+def build_model_client(
+    config: Any,
+    role: str,
+    *,
+    anthropic_client: Any = None,
+    run_id: str | None = None,
+    budget_guard: BudgetGuard | None = None,
+) -> ModelClient:
     """Create the ModelClient for a role ("author", "validator", or "eval") from a config dict or ReportSettings.
 
     anthropic_client lets tests inject a fake SDK client; real runs build anthropic.Anthropic().
+    Claude clients always get a BudgetGuard: budget_guard when given, else one built from the
+    config's anthropic_* budget keys (caps ON by default) for run_id ("other" when omitted; use
+    the report run id, "replay", "compare", or "chat"). Ollama clients are never budgeted.
     """
     spec = resolve_model_role(config, role)
     if not spec.get("model"):
@@ -449,6 +607,10 @@ def build_model_client(config: Any, role: str, *, anthropic_client: Any = None) 
             cache_system=spec["cache_system"],
             default_timeout=spec["timeout"],
             client=anthropic_client,
+            stream=spec.get("stream"),
+            thinking=spec.get("thinking"),
+            budget_guard=budget_guard or guard_from_settings(config, run_id),
+            role=role,
         )
     if not spec.get("base_url"):
         raise ValueError(f"Role {role!r} uses Ollama but model_server_url is not configured")
@@ -485,5 +647,10 @@ def is_anthropic_transient(exc: BaseException) -> bool:
         return True
     if "APIStatusError" in names:
         status = getattr(exc, "status_code", None)
-        return isinstance(status, int) and (status == 429 or status >= 500)
+        if isinstance(status, int) and (status == 429 or status >= 500):
+            return True
+        # An error event inside a stream arrives on an HTTP 200 response; its body names the error type.
+        body = getattr(exc, "body", None)
+        error = body.get("error") if isinstance(body, dict) else None
+        return isinstance(error, dict) and error.get("type") in {"overloaded_error", "api_error", "rate_limit_error"}
     return False

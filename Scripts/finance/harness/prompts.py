@@ -45,6 +45,11 @@ VALIDATOR_CHECKLIST_INSTRUCTION = (
     "the report verbatim (or names the section searched when it is missing) and cites the checklist item."
 )
 
+# Opens the per-cycle (user) part of every validator prompt; finance/replay.py splits traced
+# validator prompts back into system/user parts on it.
+VALIDATOR_REPORT_MARKER = "\n\nVALIDATE THIS REPORT:\n"
+
+
 class PromptParts(NamedTuple):
     """A model prompt split for prompt caching: stable instructions (system) and per-call content (user).
 
@@ -236,7 +241,7 @@ def validator_prompt_parts(
 ) -> PromptParts:
     """Validator prompt split into the stable validator instructions (system) and this cycle's review content."""
     return PromptParts(validator_context, (
-        f"\n\nVALIDATE THIS REPORT:\n{safe_html}\n\n"
+        f"{VALIDATOR_REPORT_MARKER}{safe_html}\n\n"
         f"AUTHORITATIVE SNAPSHOT:\n{snapshot_json}\n\n"
         f"{requirements_block(requirements, for_validator=True)}"
         f"TOOL EVIDENCE:\n{json.dumps(evidence, indent=2, default=str)}\n\n"

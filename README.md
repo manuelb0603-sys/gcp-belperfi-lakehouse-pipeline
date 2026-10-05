@@ -33,15 +33,24 @@ This pipeline implements a multi-layer Lakehouse medallion architecture designed
 │   │   │   ├── transport.py       # Legacy query_ollama and the query-callable adapter used by tests
 │   │   │   └── fallback.py        # Deterministic fallback report
 │   │   ├── bigquery_tools.py      # Read-only tools for gold-layer spending and transaction evidence
+│   │   ├── chat/                  # Finance chat (in progress): deterministic data, analysis, and charts
+│   │   │   ├── data.py            # Gold transactions query, TTL cache, refresh(), and the data catalog
+│   │   │   ├── merchants.py       # normalize_merchant: descriptor cleanup, payments/credits, aliases
+│   │   │   ├── analysis_spec.py   # AnalysisSpec (pydantic), period resolution, validate_and_repair
+│   │   │   ├── executor.py        # run_analysis -> table, summary, caption; narrative number check
+│   │   │   └── charts.py          # build_figure: plotly line/bar/heatmap/pie/treemap with escaped labels
+│   │   ├── budget.py              # Claude spend backstop: cost ledger, BudgetGuard (daily/run caps)
 │   │   ├── html_text.py           # Shared html_to_text (report plain text, history excerpts, Q&A)
 │   │   ├── memory.py              # MemoryStore: SQLite short-term history and long-term facts (open_memory)
 │   │   ├── memory_search.py       # Hybrid (embedding + BM25) long-fact retrieval
 │   │   ├── model_clients.py       # ModelClient layer: OllamaClient, AnthropicClient, model_roles config
 │   │   ├── ollama.py              # Compatibility generate_text/embed_text/embed_texts over OllamaClient
+│   │   ├── pricing.py             # The one Claude price table: cost_usd, worst_case_call_usd
 │   │   ├── qa.py                  # Finance Q&A over the selected report and long-term facts
 │   │   ├── report_metrics.py      # Deterministic snapshot: totals, MoM, disposable cash, goal caps, bar widths
 │   │   ├── report_models.py       # Typed snapshot, validation, and finding models
 │   │   ├── report_requirements.py # Month-specific report requirements checklist built from the snapshot
+│   │   ├── replay.py              # Replays an archived validator call against another model (validator experiments)
 │   │   ├── reporting.py           # Builds the snapshot, tools, and harness for one report
 │   │   ├── run_archive.py         # Run archive, live progress files, run metadata (git version), and the run index
 │   │   ├── run_compare.py         # LLM comparison of archived runs (eval role) and Markdown-to-HTML
@@ -50,19 +59,24 @@ This pipeline implements a multi-layer Lakehouse medallion architecture designed
 │   │   report_metrics.py, report_models.py, run_archive.py
 │   │                              # Compatibility shims that re-export Scripts/finance/*
 │   ├── compare_runs.py            # CLI: compare selected runs with the eval model
+│   ├── replay_validator.py        # CLI: replay one run's validator call with another model
 │   ├── email_weekly_report.py     # Orchestrates the weekly run: legacy or agent mode, archive, email
 │   ├── Finance Summary and QA.py  # Gradio UI for month reports and finance Q&A
 │   ├── model benchmark.py         # Quick Ollama model speed benchmark
 │   ├── upload_csv.py              # Uploads issuer-specific CSV files to GCS and archives them
 │   ├── run_all_issuers.py         # Runs the uploader for every issuer in config.json
-│   ├── generate_mock_cd.py        # Generates mock Chase and Amex CSV data
+│   ├── generate_mock_cd.py        # Generates mock Chase and Amex CSVs with recurring merchants (--records, --seed)
+│   ├── chat_test_fixtures.py      # Hand-built transaction fixture shared by the finance chat tests
+│   ├── test_chat_*.py             # Finance chat: merchants, spec/periods, executor golden tables, charts, data/cache/catalog
 │   ├── test_agent_harness.py      # Harness protocol, parsing, sanitization, retries, and feedback tests
+│   ├── test_budget.py             # Claude pricing, cost ledger, budget guard, harness/app/CLI refusals, no unguarded calls
 │   ├── test_finance_services.py   # Shared reporting/tool wiring tests
 │   ├── test_memory.py             # SQLite memory and retrieval tests
 │   ├── test_model_clients.py      # Model clients (fake Ollama/Anthropic), model_roles, html_to_text parity
 │   ├── test_email_weekly_report.py # Email workflow, archiving, and memory persistence tests
 │   ├── test_report_metrics.py     # Snapshot goal-cap and bar-width math tests
 │   ├── test_report_requirements.py # Requirements checklist content and prompt wiring tests
+│   ├── test_replay.py             # Validator replay: prompt rebuild, role overrides, tally, saved results, cost
 │   ├── test_run_compare.py        # Run index times/comparisons, run metadata, run gathering, compare CLI, Markdown escaping
 │   ├── test_settings.py           # ReportSettings parsing/validation, README defaults table, example config
 │   └── test_run_progress.py       # Live progress files and run-index tests
@@ -76,7 +90,9 @@ This pipeline implements a multi-layer Lakehouse medallion architecture designed
 │   └── runs/                         # One folder per run plus index.html (ignored by Git):
 │                                     #   run.json, metrics.json, trace.jsonl, progress.json,
 │                                     #   progress.log, final_report.html, final_report.txt;
-│                                     #   comparisons/ holds compare_runs.py pages (.html + .json)
+│                                     #   comparisons/ holds compare_runs.py pages (.html + .json);
+│                                     #   replays/ holds replay_validator.py results (.json);
+│                                     #   cost_ledger.jsonl records every Claude call's cost
 ├── definitions/
 │   ├── bronze/                # Raw landing dependency declarations
 │   ├── silver/                # Cleaned SQLX models (e.g., chase_transactions.sqlx)
@@ -112,6 +128,10 @@ The upload script reads the configured issuer, removes any listed PII columns, u
 3. Use the workspace virtual environment one level above the project root (`..\.venv`), which already has the required packages. To install them into a fresh environment:
    ```powershell
    ..\.venv\Scripts\python.exe -m pip install pandas google-cloud-storage
+   ```
+   The finance chat layer also needs pydantic and plotly:
+   ```powershell
+   ..\.venv\Scripts\python.exe -m pip install pydantic plotly
    ```
 4. Upload files for one issuer (run from the project root; the issuer key comes from `issuers` in config.json):
    ```powershell
@@ -180,6 +200,8 @@ The live project configuration is read from `config.json` (not `config.example.j
 * `memory_schema`: name of the SQLite memory file under `agent/memory/` (see Report Memory). Letters, digits, and underscores only.
 * `Monthly_budget`, `Fixed_costs`, `Savings_goal_target`: monthly deposit, fixed costs, and the single numeric monthly savings target used by the snapshot. Amount strings such as `"5k"` or `"Rent: $2000, Car Loan: $500"` (summed) are parsed. `Savings_goal_target` must be a number when set; agent reports need parseable `Monthly_budget` and `Fixed_costs`. `Vehicle_Info` is legacy-mode context.
 * `category_goals`: optional `{"Category": amount}` monthly goals. A configured goal replaces the suggested cap for that category and is labeled as configured.
+* `chat_data_cache_seconds`: how long the finance chat keeps the loaded transactions in memory before querying BigQuery again (default `900`; `0` disables the cache).
+* `merchant_aliases`: optional `{"CLEANED NAME": "Display name"}` map applied by the finance chat after merchant normalization (keys match the cleaned upper-case name exactly or as a word prefix, for example `"WHOLEFDS MKT": "Whole Foods"`).
 * `project_name`, `email_sender`, `email_listings`, `Gmail_app_credentials`: GCP project and email delivery settings (see Setup Instructions).
 
 Optional keys not in `config.example.json`: `fact_model_name` (model for extracting long-term facts after a sent report; defaults to `model_name`), and `qa_report_context_chunks` / `qa_long_fact_limit` (context sizes for the Finance Summary and QA app; default 5 each, capped at 8 and 10). If `model_server_url` or `model_name` is missing, the Finance Summary and QA app falls back to `http://localhost:11434/api/generate` and `gemma4:e4b`.
@@ -207,6 +229,11 @@ These are the values used when a key is omitted. They are defined only in `DEFAU
 | `email_listings` | `[]` |
 | `qa_report_context_chunks` | `5` |
 | `qa_long_fact_limit` | `5` |
+| `chat_data_cache_seconds` | `900` |
+| `merchant_aliases` | `{}` |
+| `anthropic_daily_budget_usd` | `15.0` |
+| `anthropic_run_budget_usd` | `5.0` |
+| `anthropic_cost_ledger_path` | `"agent/runs/cost_ledger.jsonl"` |
 
 #### Model providers
 
@@ -226,12 +253,44 @@ For a fully local setup, use an Ollama eval model instead, for example `"eval": 
 
 * **Roles.** `author` writes the report and `validator` reviews it. `eval` writes the run comparisons from `Scripts\compare_runs.py` (see Comparing runs); it is optional and when unset it falls back to the validator's settings. `model_roles` is authoritative: a role present there ignores the legacy keys. A role missing from `model_roles` (or the whole key missing) falls back to the legacy keys: `model_name` / `validator_model_name`, `ollama_options[role]`, and `model_server_url`, so older configs keep working unchanged. Roles are resolved once when the config is loaded (`ReportSettings`), so an unknown provider is reported at startup.
 * **Ollama role fields.** `model`, optional `options` and `think` (when neither is given, `ollama_options[role]` applies), optional `base_url` (default `model_server_url`) and `timeout` (default `ollama_timeout`). Requests are identical to before: one prompt, `format` for the validator's JSON schema, `options` and `think` only when set.
-* **Claude role fields.** `model`, optional `max_tokens` (default `16000`), `effort` (`low`/`medium`/`high`/`xhigh`/`max`; omit it for `claude-haiku-4-5`, which does not support effort), and `cache_system` (default `true`). No thinking or sampling parameters (temperature etc.) are sent, because current models reject them; `ollama_options` do not apply. The validator uses structured output (`output_config.format` with the same JSON schema). A refusal is recorded with `done_reason: "refusal"` and its `stop_details`; a `max_tokens` stop is treated like Ollama's `length`. The SDK is created with `max_retries=1`, and its timeout, connection, 429, and 5xx errors count as model-call failures for the harness's single retry. A 4xx error such as a bad request (for example an invalid model ID) is not retried: it is raised, the run aborts and is archived with a `_failed` suffix, and nothing is sent.
+* **Claude role fields.** `model`, optional `max_tokens` (default `16000`, at most `64000`; thinking tokens count toward it), `effort` (`low`/`medium`/`high`/`xhigh`/`max`; omit it for `claude-haiku-4-5`, which does not support effort), `cache_system` (default `true`), `stream` (default automatic: stream when `max_tokens` is above `16000`; `true`/`false` force it), and `thinking` (only `"adaptive"`, sent as `{"type": "adaptive"}`, for models where thinking is off by default). Claude Opus 5.5 and Sonnet 5.5 think adaptively by default and `effort` controls how deeply; thinking cannot be disabled, so `thinking: {"type": "disabled"}`, `budget_tokens`, and sampling parameters (temperature etc.) are never sent, and the thinking display stays at the API default. `ollama_options`, `options`, and `think` do not apply. The validator uses structured output (`output_config.format` with the same JSON schema). A refusal is recorded with `done_reason: "refusal"` and its `stop_details`; a `max_tokens` stop is treated like Ollama's `length`. The SDK is created with `max_retries=1`, and its timeout, connection, 429, and 5xx errors count as model-call failures for the harness's single retry. A 4xx error such as a bad request (for example an invalid model ID) is not retried: it is raised, the run aborts and is archived with a `_failed` suffix, and nothing is sent.
 * **Switching a role to Claude.** Install the SDK into the workspace venv (`..\.venv\Scripts\python.exe -m pip install anthropic`; Ollama-only setups do not need it), set the role to `{"provider": "anthropic", "model": "claude-sonnet-5-5"}`, and provide credentials through the environment: the `ANTHROPIC_API_KEY` environment variable or an `ant auth login` profile. Never put an API key in `config.json`.
-* **Models and cost** (per million tokens, input / output): `claude-opus-5-5` $4 / $20, `claude-sonnet-5-5` $2 / $10, `claude-haiku-4-5` $1 / $5.
+* **Models and cost** (per million tokens, input / output): `claude-opus-5-5` $4 / $20, `claude-sonnet-5-5` $2 / $10, `claude-haiku-4-5` $1 / $5, `claude-fable-5-1` $10 / $50, `claude-opus-5` $5 / $25, `claude-sonnet-5` $2 / $10. Cache reads cost 0.1x and cache writes 1.25x the input price. The one price table is `Scripts/finance/pricing.py`; a Claude model missing from it is priced at the Fable rate for budgeting, never as free.
+* **Streaming.** The SDK refuses non-streaming requests that could run longer than 10 minutes (about 21k `max_tokens`), so roles above `16000` `max_tokens` stream automatically (`messages.stream`, final message only); the reply, `usage`, `done_reason`, and refusal handling are the same as without streaming and the trace records `streamed` in the response metadata. The role timeout still bounds the whole call: the SDK applies it per network read and the client also checks the total time between stream events, raising a timeout the harness retries once like any other. Read errors and `overloaded_error`/`api_error` events in the middle of a stream count as model-call failures too.
 * **Prompt caching.** For Claude, the stable instruction text goes in a cached system block and only the per-call content is the user message: the author's base prompt (context, objective, snapshot, checklist, tools, protocol) is the system part and the tool evidence, revision request, and retries are the user part; for the validator, `validator.system.md` is the system part and the report, snapshot, evidence, and prior review are the user part. Repeated author rounds within a run therefore read the base prompt from the cache. Ollama still receives exactly the same single concatenated prompt as before, and the trace's `prompt` field always records that full text. Trace `model_response` events from Claude include `usage` (`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`) so cache hits are visible; `run_started`, `model_call`, `progress.json`, and `metrics.json` record the provider and model per role.
 * **Privacy.** When a role uses Anthropic, its prompts leave your machine: the snapshot, report HTML, tool evidence (including transaction-level rows from `get_transaction_detail`), memory excerpts, and validator feedback are sent to the Claude API. Keep every role on Ollama if the data must stay local. Embeddings and memory fact extraction always use Ollama.
 * **Recommended setup** (from testing on a 16 GB GPU): author `gemma4:e4b`; validator `gemma4:12b` with `think: false` and `num_predict` `4000`; `num_ctx` `32768` for both; `max_validation_cycles` `5`; `max_run_seconds` `2700`; eval optional (Claude `claude-sonnet-5-5`, or local `gemma4:12b`). `qwen3.5:9b` was unreliable as a validator without thinking and ran out of tokens (thinking consumed `num_predict`) with it. Models of 26B parameters and larger did not fit a 16 GB GPU and slowed to partial CPU inference.
+
+##### Cost backstop
+
+Claude spend has three independent limits:
+
+1. **Run cap** `anthropic_run_budget_usd` (default `5.0`): Claude spend for one report run (the run id in `agent/runs`; the app's reports get an `app_<timestamp>` id). For a replay, a comparison, or a chat session it is the spend of that one invocation.
+2. **Daily cap** `anthropic_daily_budget_usd` (default `15.0`): all Claude spend recorded today (local date) by every program: the weekly email (including the scheduled task), the Finance Summary and QA app, `compare_runs.py`, `replay_validator.py`, and the finance chat.
+3. **Account spend limit** in the Claude Console under **Settings → Limits**. It is the final backstop for anything outside this project; set it as well.
+
+Both caps are on even when `config.json` omits the keys. Only an explicit `0` or `null` disables a cap, and the program prints a warning at startup when one is disabled. Before every Claude request (including the harness's retry and format retries), `AnthropicClient` asks its `BudgetGuard` (`Scripts/finance/budget.py`, attached by `build_model_client`) for the call's worst case: the prompt at the list input price (characters / 3.5 tokens) plus `max_tokens` of output. If today's spend plus that would pass the daily cap, or the run's spend plus that would pass the run cap, the call is refused without contacting the API (`BudgetExceededError`). A report run then stops like an unavailable model: fail decision, last sanitized report or fallback, never sent; the trace records a `budget_exceeded` event with the figures, `progress.log` says `Claude budget guard refused the validator call: Claude daily budget reached: $14.85 of $15.00 spent today; ...`, and the index shows status `budget_exceeded`. The app shows the same message instead of the report. `replay_validator.py` and `compare_runs.py` print it and exit `2`. Ollama calls are never budgeted.
+
+The spend ledger `agent/runs/cost_ledger.jsonl` (`anthropic_cost_ledger_path`, relative to the project root) has one JSON line per Claude call: success, refusal, an empty answer, or a timed-out or interrupted call (estimated as its input at list price, marked `"estimated": true`). Each line holds `timestamp` (UTC), `date` (local), `run_id` (or `replay`, `compare`, `chat`, `other`), `role`, `model`, `outcome`, `usage`, and `cost_usd`. Lines are appended with a single write under a lock file, so the app and the scheduled run can share it. A missing ledger means $0 spent; older runs are not backfilled. The guard fails closed: if the ledger cannot be read (or has a corrupt line) or a spend record cannot be written, Claude calls are refused until it is fixed. Each run starts with `Claude budget: $X spent today of $Y daily; run cap $Z` in `progress.log`; Claude `model_response` events carry `cost_usd` (also shown in `progress.log`), `progress.json` and `metrics.json` record `anthropic_cost_usd`, and the index has a `cost` column (blank for runs without Claude calls).
+
+##### Claude experiments
+
+`Scripts\replay_validator.py` (logic in `finance/replay.py`) replays one archived validator call against another model, to compare verdicts, consistency, tokens, and cost without rerunning the author. It reads the run's `trace.jsonl`, takes the first validator `model_call` of the chosen cycle (default the last; format retries are skipped), and splits the traced prompt on `VALIDATE THIS REPORT:` into the validator instructions (system, cached for Claude) and the cycle's report, snapshot, evidence, and prior review (user). `--current-prompt` swaps today's `agent/prompts/validator.system.md` in as the system part. The call uses the configured validator role (`model_roles.validator`) unless the flags override it for this replay only: `--role-model PROVIDER:MODEL` (for example `anthropic:claude-haiku-4-5` or `ollama:gemma4:12b`), `--effort low|medium|high` (Claude), `--think true|false` (Ollama's flag; for Claude `true` requests adaptive thinking and `false` is rejected), and `--max-tokens N` (Claude `max_tokens`, Ollama `num_predict`). From the project root:
+
+```powershell
+..\.venv\Scripts\python.exe Scripts\replay_validator.py 20261005T133631_gemma4_e4b --role-model anthropic:claude-haiku-4-5
+..\.venv\Scripts\python.exe Scripts\replay_validator.py 20261005T105834_gemma4_e4b --role-model anthropic:claude-sonnet-5-5 --effort low
+..\.venv\Scripts\python.exe Scripts\replay_validator.py 20261005T105834_gemma4_e4b --cycle 2 --role-model anthropic:claude-opus-5-5 --effort high --max-tokens 32000 --current-prompt --repeat 3
+..\.venv\Scripts\python.exe Scripts\replay_validator.py 20261005T105834_gemma4_e4b --role-model anthropic:claude-opus-5-5 --dry-run-prompt
+```
+
+Each call prints the decision (and the decision the run recorded for that cycle), every audit gate status, the error findings (category, message, truncated evidence), tokens in/out with cache reads and writes, seconds, `done_reason`, and for Claude the estimated cost (prices above; cache reads at 0.1x and cache writes at 1.25x the input price). `--repeat K` runs the same call K times and prints a pass/fail tally to check consistency. Every result, including failed calls, is saved as `agent/runs/replays/<timestamp>_<run_id>_<model>.json` (with `_r<n>` for repeats); the run index skips that folder as a run and lists the replays. `--dry-run-prompt` prints the system/user sizes and the worst-case cost (the budget guard's estimate: characters / 3.5 input tokens at the list price plus `max_tokens` of output, times K) without a call. A refusal, malformed or non-schema JSON, or a failed model call prints a clear message and exits `1`; an unknown run or cycle, or invalid flags, exit `2` without a call. With a Claude model the report, snapshot, and evidence in the prompt are sent to the Claude API.
+
+A Claude author needs room for thinking plus a ~20 KB HTML report, so give it about `32000` `max_tokens` (requests stream automatically above `16000`) and a generous timeout:
+
+```json
+"author": {"provider": "anthropic", "model": "claude-opus-5-5", "effort": "high", "max_tokens": 32000, "timeout": 1800}
+```
 
 The code defaults used when a key is omitted are listed under Code defaults above; `config.example.json` shows the recommended values. The limits are intentionally conservative for a demo or controlled deployment: they keep the model bounded, prevent runaway tool use, and make each run easy to review in the generated archive.
 
@@ -243,6 +302,18 @@ The `email_weekly_report.py` script generates an intelligent weekly financial in
 * Uses local SQLite memory and Ollama embeddings to retrieve relevant long-term facts on demand, alongside recent report history
 * Saves each completed report and extracts reusable financial facts for future reports
 * Outputs an attractive HTML report styled for email readability
+
+### Finance chat (in progress)
+
+`Scripts/finance/chat/` is the deterministic layer of a planned finance chat. The model will only fill in a declarative `AnalysisSpec` (metric, up to two dimensions, period, filters, top N, transform, comparison, chart); Python resolves the dates, repairs or rejects the spec against the data catalog, runs it with pandas, and draws the chart. The model never writes code and never sees transaction rows, only the catalog, the compact result summary (at most about 1.5 KB), and the caption.
+
+* `data.load_transactions(settings, start=None, client=None)` runs one parameterized query on `gold.fact_transactions` (default: the last 24 months) and caches the frame for `chat_data_cache_seconds`; `data.refresh()` clears it. `build_catalog(frame)` lists the date range, issuers, categories with their groups, the top 30 merchants, and the metric definitions.
+* Metrics mirror `gold.fact_monthly_spending` exactly (Sale, Return, and Adjustment rows only, so card payments are excluded): `net_spend` (net_real_expense), `gross_spend`, `refunds`, `transaction_count`, `avg_transaction`, and `share_of_total`.
+* Merchants are normalized from card descriptors (store numbers, phone numbers, states, `SQ *`/`TST*` prefixes, Amazon variants; payments become `Card Payment` and statement credits `Card Credit`) with optional `merchant_aliases`, and URL/markup characters are stripped.
+* `executor.check_narrative_numbers(text, summary)` flags dollar amounts and percentages in model text that match no summary value within rounding, for a later guard.
+* Charts use plotly (`..\.venv\Scripts\python.exe -m pip install plotly`); every label is HTML-escaped.
+
+Not built yet: the chat engine and model tool calls, and the UI. There is no entry point to run yet; the tests (`test_chat_*.py`) cover the layer with fixtures and a fake BigQuery client.
 
 ### Report Memory
 
@@ -307,7 +378,7 @@ The SQLite database and SQL scratch files are excluded from Git. Delete the loca
    ```
    Watch a live run with `Get-Content agent\runs\<run_id>\progress.log -Wait`. Keep `dry_run: true` until reports pass validation consistently.
 
-   The interactive month report and Q&A app uses the same report service (it never sends email or writes to `agent/runs`) and serves on `http://127.0.0.1:7860`:
+   The interactive month report and Q&A app uses the same report service (it never sends email or archives runs in `agent/runs`; its Claude calls, if any, are recorded in the cost ledger and count toward the daily cap) and serves on `http://127.0.0.1:7860`:
    ```powershell
    & "..\.venv\Scripts\python.exe" "Scripts\Finance Summary and QA.py"
    ```

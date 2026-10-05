@@ -5,7 +5,7 @@
     "author": {"provider": "ollama", "model": "gemma4:e4b", "options": {"temperature": 0.3, "num_predict": 12000, "repeat_penalty": 1.1, "num_ctx": 32768}},
     "validator": {"provider": "ollama", "model": "gemma4:12b", "think": false, "options": {"temperature": 0.1, "num_predict": 4000, "num_ctx": 32768}},
     "eval": {"provider": "anthropic", "model": "claude-sonnet-5-5", "effort": "medium", "max_tokens": 16000},
-    "_note": "model_roles is the primary per-role setup; any role may use provider 'ollama' or 'anthropic'. eval is optional (defaults to the validator); a local alternative is {\"provider\": \"ollama\", \"model\": \"gemma4:12b\", \"think\": false}. Anthropic roles need the anthropic package and credentials from the ANTHROPIC_API_KEY environment variable or `ant auth login`, never this file; their prompts (report data and evidence) leave this machine. model_server_url is the shared Ollama server; model_name is still used by legacy mode, fact extraction, and the Finance Summary and QA app."
+    "_note": "model_roles is the primary per-role setup; any role may use provider 'ollama' or 'anthropic'. eval is optional (defaults to the validator); a local alternative is {\"provider\": \"ollama\", \"model\": \"gemma4:12b\", \"think\": false}. Anthropic roles need the anthropic package and credentials from the ANTHROPIC_API_KEY environment variable or `ant auth login`, never this file; their prompts (report data and evidence) leave this machine. Claude roles take max_tokens (up to 64000; thinking counts toward it, so a Claude author needs about 32000), effort, optional stream (default: automatic above 16000 max_tokens) and thinking (only \"adaptive\").model_server_url is the shared Ollama server; model_name is still used by legacy mode, fact extraction, and the Finance Summary and QA app."
   },
   "report_mode": "agent",
   "dry_run": true,
@@ -15,6 +15,9 @@
   "max_validation_cycles": 5,
   "max_report_bytes": 250000,
   "max_run_seconds": 2700,
+  "anthropic_daily_budget_usd": 15.0,
+  "anthropic_run_budget_usd": 5.0,
+  "anthropic_cost_ledger_path": "agent/runs/cost_ledger.jsonl",
   "days_back": 60,
   "ollama_stream": false,
   "ollama_timeout": 1800,
@@ -25,6 +28,8 @@
   "Vehicle_Info": "2017 Honda Civic LX, 2022 Honda Accord",
   "Savings_goal_target": 2000,
   "category_goals": {},
+  "chat_data_cache_seconds": 900,
+  "merchant_aliases": {"WHOLEFDS MKT": "Whole Foods"},
   "project_name": "your-gcp-project-id",
   "Gmail_app_credentials": "your_16_char_app_password",
   "email_listings": ["you@example.com"],

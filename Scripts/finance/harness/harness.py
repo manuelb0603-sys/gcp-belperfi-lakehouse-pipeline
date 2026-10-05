@@ -12,6 +12,7 @@ from ..report_models import ReportSnapshot, ValidationDecision, ValidationFindin
 from .errors import (
     RUN_STOP_ERRORS,
     AgentRoundsExhaustedError,
+    BudgetExceededError,
     ModelUnavailableError,
     RunDeadlineExceededError,
     _is_model_call_failure,
@@ -248,6 +249,12 @@ class ReportHarness:
             try:
                 # Ollama and query fakes get system + user concatenated (the historical single prompt).
                 return client.generate(prompt.user, system=prompt.system or None, json_schema=json_schema, timeout=timeout)
+            except BudgetExceededError as exc:
+                # The Claude budget guard refused the call before it was sent: stop, never retry.
+                self.trace.add("budget_exceeded", role=role, model=model, attempt=attempt, error=str(exc), **{
+                    key: value for key, value in exc.details.items() if key not in context
+                }, **context)
+                raise
             except Exception as exc:
                 elapsed = round(time.perf_counter() - started, 3)
                 self._record_exception(f"{role}_model_call", exc, elapsed_seconds=elapsed, call_attempt=attempt, **context)
@@ -266,6 +273,8 @@ class ReportHarness:
                     error_type=type(exc).__name__,
                     error=str(exc),
                     elapsed_seconds=elapsed,
+                    # A billed Claude call that still failed (empty answer, timeout) carries its cost.
+                    **({"cost_usd": exc.cost_usd} if isinstance(getattr(exc, "cost_usd", None), (int, float)) else {}),
                     **context,
                 )
                 if attempt == 2:
@@ -853,7 +862,7 @@ class ReportHarness:
         vstate: _ValidationState | None = None,
         cycle: int | None = None,
     ) -> RunResult:
-        """End the run early with a fail decision after an unavailable model, exhausted rounds, or the deadline.
+        """End the run early with a fail decision after an unavailable model, exhausted rounds, the deadline, or a Claude spend cap.
 
         The returned report is the newest sanitized author report or the deterministic fallback; it is never sent.
         """
@@ -883,6 +892,8 @@ class ReportHarness:
                 )
             if isinstance(exc, RunDeadlineExceededError):
                 return "The run time limit was reached before the author returned a report.", f"{exc}; the fallback report was not validated."
+            if isinstance(exc, BudgetExceededError):
+                return "The Claude spend cap was reached before the author returned a report.", f"{exc}; the fallback report was not validated."
             reason = f"The author used all {rounds} agent rounds without returning a report."
             return reason, f"{reason} ({exc}); the fallback report was not validated."
         last = vstate.decision.summary
@@ -893,6 +904,8 @@ class ReportHarness:
             )
         if isinstance(exc, RunDeadlineExceededError):
             return "The run time limit was reached during revision.", f"{exc} during revision; last review: {last}"
+        if isinstance(exc, BudgetExceededError):
+            return "The Claude spend cap was reached during revision.", f"{exc} during revision; last review: {last}"
         return (
             "The author used all revision agent rounds without returning a report.",
             f"Author used all {rounds} revision agent rounds without returning a report ({exc}); last review: {last}",
@@ -901,13 +914,14 @@ class ReportHarness:
     def _stop_during_validation(
         self, exc: Exception, snapshot: ReportSnapshot, vstate: _ValidationState, cycle: int
     ) -> RunResult:
-        """Stop when the validator is unavailable or the deadline hits during a review."""
+        """Stop when the validator is unavailable, or the deadline or a Claude spend cap hits during a review."""
         unavailable = isinstance(exc, ModelUnavailableError)
+        over_budget = isinstance(exc, BudgetExceededError)
         self.trace.add(
             "validation_cycle_result",
             cycle=cycle,
             decision="fail",
-            stage="validator_unavailable" if unavailable else "run_deadline",
+            stage="validator_unavailable" if unavailable else "budget_exceeded" if over_budget else "run_deadline",
             summary=str(exc),
             findings=[],
             report_html_bytes=len(vstate.safe_html.encode("utf-8")),
@@ -918,8 +932,9 @@ class ReportHarness:
         elif unavailable:
             report = build_fallback_report(snapshot, "The validator was unavailable and the author returned no report.")
         else:
+            stop_reason = "The Claude spend cap was reached" if over_budget else "The run time limit was reached"
             report = vstate.last_safe_report or build_fallback_report(
-                snapshot, "The run time limit was reached and the author returned no report."
+                snapshot, f"{stop_reason} and the author returned no report."
             )
         if unavailable:
             # No review is possible; stop instead of revising blind.
@@ -946,7 +961,7 @@ class ReportHarness:
             prompt = self._build_validator_prompt(snapshot, state, vstate, validator_context, report_requirements)
             try:
                 decision = self._validator_call(prompt, cycle=cycle)
-            except RunDeadlineExceededError as exc:
+            except (RunDeadlineExceededError, BudgetExceededError) as exc:
                 return self._stop_with_fail(exc, "validation", snapshot, vstate, cycle)
             except Exception as exc:
                 self.trace.add(

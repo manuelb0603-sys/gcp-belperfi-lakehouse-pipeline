@@ -85,25 +85,63 @@ def _message(text="ok", stop_reason="end_turn", usage=None, stop_details=None):
     )
 
 
-class FakeAnthropic:
-    """Mimics anthropic.Anthropic: with_options(timeout=) and messages.create(**kwargs)."""
+class FakeStream:
+    """Mimics the SDK's MessageStream context manager: iterable events plus get_final_message()."""
 
-    def __init__(self, *responses):
+    def __init__(self, message, events=3, on_event=None):
+        self.message = message
+        self.events = events
+        self.on_event = on_event
+        self.exited = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.exited = True
+        return False
+
+    def __iter__(self):
+        for number in range(self.events):
+            if self.on_event:
+                self.on_event(number)
+            yield SimpleNamespace(type="content_block_delta")
+
+    def get_final_message(self):
+        return self.message
+
+
+class FakeAnthropic:
+    """Mimics anthropic.Anthropic: with_options(timeout=), messages.create(**kwargs), and messages.stream(**kwargs)."""
+
+    def __init__(self, *responses, on_event=None):
         self.responses = list(responses)
         self.calls = []
+        self.stream_calls = []
         self.timeouts = []
-        self.messages = SimpleNamespace(create=self._create)
+        self.streams = []
+        self.on_event = on_event
+        self.messages = SimpleNamespace(create=self._create, stream=self._stream)
 
     def with_options(self, timeout=None, **_):
         self.timeouts.append(timeout)
         return self
 
-    def _create(self, **kwargs):
-        self.calls.append(kwargs)
+    def _next(self):
         response = self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
         if isinstance(response, Exception):
             raise response
         return response
+
+    def _create(self, **kwargs):
+        self.calls.append(kwargs)
+        return self._next()
+
+    def _stream(self, **kwargs):
+        self.stream_calls.append(kwargs)
+        stream = FakeStream(self._next(), on_event=self.on_event)
+        self.streams.append(stream)
+        return stream
 
 
 def _sdk_error_classes():
@@ -391,6 +429,96 @@ class TestValidatorSchema(unittest.TestCase):
         self.assertGreaterEqual(len(found), 9)
         self.assertTrue(all(node.get("additionalProperties") is False for node in found))
         self.assertNotIn('"type": [', json.dumps(VALIDATOR_RESPONSE_SCHEMA))
+
+
+class TestAnthropicStreaming(unittest.TestCase):
+    USAGE = SimpleNamespace(input_tokens=70, output_tokens=25000, cache_read_input_tokens=9000, cache_creation_input_tokens=12)
+
+    def test_auto_streams_only_above_the_threshold(self):
+        fake = FakeAnthropic(_message("{}"))
+        AnthropicClient("claude-opus-5-5", max_tokens=16000, client=fake).generate("p")
+        AnthropicClient("claude-opus-5-5", max_tokens=16001, client=fake).generate("p")
+        AnthropicClient("claude-opus-5-5", max_tokens=32000, client=fake, stream=False).generate("p")
+        AnthropicClient("claude-haiku-4-5", max_tokens=4000, client=fake, stream=True).generate("p")
+        self.assertEqual([call["max_tokens"] for call in fake.calls], [16000, 32000])
+        self.assertEqual([call["max_tokens"] for call in fake.stream_calls], [16001, 4000])
+        self.assertTrue(all(stream.exited for stream in fake.streams))
+
+    def test_streamed_reply_and_request_match_the_non_streamed_path(self):
+        plain, streamed = FakeAnthropic(_message("hello", usage=self.USAGE)), FakeAnthropic(_message("hello", usage=self.USAGE))
+        kwargs = dict(max_tokens=32000, effort="high", thinking="adaptive")
+        a = AnthropicClient("claude-opus-5-5", client=plain, stream=False, **kwargs).generate(
+            "per-call", system="stable", json_schema=VALIDATOR_RESPONSE_SCHEMA)
+        b = AnthropicClient("claude-opus-5-5", client=streamed, **kwargs).generate(
+            "per-call", system="stable", json_schema=VALIDATOR_RESPONSE_SCHEMA)
+        self.assertEqual(plain.calls[0], streamed.stream_calls[0])
+        self.assertEqual(streamed.stream_calls[0]["thinking"], {"type": "adaptive"})
+        self.assertNotIn("budget_tokens", json.dumps(streamed.stream_calls[0]))
+        self.assertEqual((str(a), a.done_reason, a.usage, a.eval_count, a.prompt_eval_count),
+                         (str(b), b.done_reason, b.usage, b.eval_count, b.prompt_eval_count))
+        self.assertEqual(b.usage["cache_read_input_tokens"], 9000)
+        self.assertEqual((a.metadata["streamed"], b.metadata["streamed"]), (False, True))
+        self.assertEqual("hello", str(b))  # thinking blocks are dropped, only text blocks count
+
+    def test_streamed_refusal_and_max_tokens_mapping(self):
+        details = {"type": "refusal", "category": "cyber"}
+        refused = AnthropicClient("claude-opus-5-5", max_tokens=32000,
+                                  client=FakeAnthropic(_message("x", stop_reason="refusal", stop_details=details))).generate("p")
+        self.assertEqual((str(refused), refused.done_reason, refused.metadata["stop_details"]), ("", "refusal", details))
+        cut = AnthropicClient("claude-opus-5-5", max_tokens=32000,
+                              client=FakeAnthropic(_message("<<<REPORT_HTML>>> cut", stop_reason="max_tokens"))).generate("p")
+        self.assertEqual((str(cut), cut.done_reason), ("<<<REPORT_HTML>>> cut", "length"))
+        with self.assertRaises(EmptyModelResponse):
+            AnthropicClient("claude-opus-5-5", max_tokens=32000, client=FakeAnthropic(_message(""))).generate("p")
+
+    def test_stream_timeout_passthrough_and_total_deadline(self):
+        fake = FakeAnthropic(_message())
+        AnthropicClient("claude-opus-5-5", max_tokens=32000, client=fake, default_timeout=900).generate("p")
+        AnthropicClient("claude-opus-5-5", max_tokens=32000, client=fake).generate("p", timeout=45)
+        self.assertEqual(fake.timeouts, [900, 45])
+
+        clock = iter([0.0, 1.0, 50.0, 100.0])
+        with patch("finance.model_clients.time.monotonic", lambda: next(clock)):
+            with self.assertRaises(TimeoutError):
+                AnthropicClient("claude-opus-5-5", max_tokens=32000, client=FakeAnthropic(_message())).generate("p", timeout=30)
+
+    def test_stream_errors_are_classified_like_other_call_failures(self):
+        with self.assertRaises(SDK["APITimeoutError"]) as caught:
+            AnthropicClient("claude-opus-5-5", max_tokens=32000, client=FakeAnthropic(SDK["APITimeoutError"]("t"))).generate("p")
+        self.assertTrue(_is_timeout(caught.exception))
+        read_timeout = type("ReadTimeout", (type("TimeoutException", (Exception,), {"__module__": "httpx2"}),), {"__module__": "httpx2"})
+
+        def boom(_number):
+            raise read_timeout("read timed out")
+
+        with self.assertRaises(TimeoutError) as caught:
+            AnthropicClient("claude-opus-5-5", max_tokens=32000, client=FakeAnthropic(_message(), on_event=boom)).generate("p")
+        self.assertTrue(_is_model_call_failure(caught.exception) and _is_timeout(caught.exception))
+        overloaded = SDK["APIStatusError"]("overloaded")
+        overloaded.status_code, overloaded.body = 200, {"type": "error", "error": {"type": "overloaded_error"}}
+        self.assertTrue(_is_model_call_failure(overloaded))
+        invalid = SDK["APIStatusError"]("bad")
+        invalid.status_code, invalid.body = 200, {"type": "error", "error": {"type": "invalid_request_error"}}
+        self.assertFalse(_is_model_call_failure(invalid))
+
+    def test_role_keys_for_streaming_thinking_and_max_tokens(self):
+        config = {"model_roles": {"author": {
+            "provider": "anthropic", "model": "claude-opus-5-5", "effort": "high", "max_tokens": 32000,
+            "options": {"num_ctx": 1}, "think": False,
+        }}}
+        client = build_model_client(config, "author", anthropic_client=FakeAnthropic(_message()))
+        self.assertEqual((client.max_tokens, client.stream, client.thinking, client.uses_streaming()), (32000, None, None, True))
+        self.assertNotIn("thinking", client.request_kwargs("p", None, None))
+        entry = config["model_roles"]["author"]
+        for key, value in (("max_tokens", 64000), ("stream", False), ("thinking", "adaptive")):
+            spec = resolve_model_role({"model_roles": {"author": {**entry, key: value}}}, "author")
+            self.assertEqual(spec[key], value)
+        for key, bad in (("max_tokens", 64001), ("max_tokens", 0), ("max_tokens", "lots"), ("stream", "yes"),
+                         ("thinking", "disabled"), ("thinking", "enabled")):
+            with self.assertRaises(ValueError, msg=f"{key}={bad!r}"):
+                resolve_model_role({"model_roles": {"author": {**entry, key: bad}}}, "author")
+        with self.assertRaises(ValueError):
+            AnthropicClient("claude-opus-5-5", thinking="disabled")
 
 
 class TestModelRoles(unittest.TestCase):
