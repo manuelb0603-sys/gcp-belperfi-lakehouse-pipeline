@@ -21,7 +21,17 @@ This pipeline implements a multi-layer Lakehouse medallion architecture designed
 ├── Scripts/
 │   ├── finance/                   # Shared report package (the real implementation)
 │   │   ├── __init__.py            # Package marker
-│   │   ├── agent_harness.py       # Bounded author/validator loop, author protocol, HTML gate, retries
+│   │   ├── agent_harness.py       # Compatibility re-exports of finance/harness/
+│   │   ├── harness/               # Bounded author/validator harness
+│   │   │   ├── harness.py         # ReportHarness: author loop, validation cycles, revisions, run stops
+│   │   │   ├── protocol.py        # Report/rebuttal markers, author reply parsing, validator JSON schema
+│   │   │   ├── prompts.py         # Instruction text sent to the author and validator
+│   │   │   ├── feedback.py        # Prioritized revision feedback, resolved findings, cycle progress
+│   │   │   ├── html_safety.py     # Mechanical HTML gate and plain-text derivation
+│   │   │   ├── trace.py           # RunTrace, HarnessLimits, ToolSpec
+│   │   │   ├── errors.py          # Run-stop errors and model-call failure classification
+│   │   │   ├── transport.py       # Ollama generate call
+│   │   │   └── fallback.py        # Deterministic fallback report
 │   │   ├── bigquery_tools.py      # Read-only tools for gold-layer spending and transaction evidence
 │   │   ├── memory.py              # SQLite-backed short-term and long-term memory store
 │   │   ├── memory_search.py       # Hybrid (embedding + BM25) long-fact retrieval

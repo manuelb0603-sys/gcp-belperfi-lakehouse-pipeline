@@ -10,7 +10,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable
 
-from .agent_harness import HarnessLimits, ReportHarness, ToolSpec
+from .harness import HarnessLimits, ReportHarness, ToolSpec
 from .bigquery_tools import (
     get_category_detail,
     get_report_period_spending,
