@@ -209,7 +209,9 @@ def _describe_event(event: dict[str, Any]) -> str | None:
     """Turn a trace event into a short progress.log line, or None for low-signal events."""
     name = event.get("event")
     if name == "run_started":
-        return f"Harness started; tools: {', '.join(event.get('tool_names') or []) or 'none'}"
+        deadline = event.get("deadline_seconds")
+        limit = f"; time limit {deadline:g}s" if deadline else "; no time limit"
+        return f"Harness started; tools: {', '.join(event.get('tool_names') or []) or 'none'}{limit}"
     if name == "agent_round":
         return f"Author round {event.get('round')}"
     if name == "model_call":
@@ -235,6 +237,11 @@ def _describe_event(event: dict[str, Any]) -> str | None:
         return f"Retrying {event.get('role')} model call (attempt {event.get('attempt')})"
     if name == "model_unavailable":
         return f"{event.get('role')} model unavailable during {event.get('phase')}; stopping with a fail decision"
+    if name == "run_deadline_exceeded":
+        return (
+            f"Run time limit reached ({event.get('elapsed_seconds')}s elapsed of {event.get('limit_seconds')}s) "
+            f"at a {event.get('role')} model call; stopping with a fail decision"
+        )
     if name == "agent_rounds_exhausted":
         return (
             f"Author used all {event.get('max_agent_rounds')} rounds in {event.get('phase')} without a report; "
@@ -257,6 +264,10 @@ def _describe_event(event: dict[str, Any]) -> str | None:
             + (
                 f", {event.get('repeated_error_count')} repeated from the previous cycle"
                 if event.get("repeated_error_count") else ""
+            )
+            + (
+                f", {event.get('resolved_finding_count')} earlier finding(s) resolved"
+                if event.get("resolved_finding_count") else ""
             )
         )
     if name == "author_rebuttals":

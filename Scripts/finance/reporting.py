@@ -201,6 +201,20 @@ def _build_tools(
     }
 
 
+DEFAULT_MAX_RUN_SECONDS = 2700
+
+
+def _max_run_seconds(config: dict[str, Any]) -> float | None:
+    """Run time limit in seconds from config: default 2700 (45 minutes); 0 or null disables it."""
+    if "max_run_seconds" not in config:
+        return DEFAULT_MAX_RUN_SECONDS
+    value = config.get("max_run_seconds")
+    if value is None:
+        return None
+    seconds = float(value)
+    return seconds if seconds > 0 else None
+
+
 def generate_finance_report(
     config: dict[str, Any],
     project_name: str,
@@ -240,8 +254,9 @@ def generate_finance_report(
         max_agent_rounds=int(config.get("max_agent_rounds", 6)),
         max_tool_calls=int(config.get("max_tool_calls", 12)),
         max_calls_per_tool=int(config.get("max_calls_per_tool", 3)),
-        max_validation_cycles=int(config.get("max_validation_cycles", 2)),
+        max_validation_cycles=int(config.get("max_validation_cycles", 3)),
         max_report_bytes=int(config.get("max_report_bytes", 250000)),
+        max_run_seconds=_max_run_seconds(config),
     )
     harness = ReportHarness(
         ollama_url=ollama_url,

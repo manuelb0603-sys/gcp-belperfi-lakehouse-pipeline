@@ -135,6 +135,21 @@ class TestProgressRecorder(unittest.TestCase):
             self.assertIn("Validation stalled: cycle 2 repeated 2 error finding(s)", log)
             self.assertIn("fail, 2 errors, 0 warnings, 2 repeated from the previous cycle", log)
 
+    def test_deadline_and_resolved_findings_are_logged(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir) / "run1"
+            recorder = ProgressRecorder(run_dir, "run1", "author-model", "validator-model", echo=False)
+            trace = RunTrace(listeners=[recorder])
+            trace.add("run_started", tool_names=["get_spending_summary"], deadline_seconds=2700.0)
+            trace.add("validation_cycle_result", cycle=2, decision="fail", stage="validator",
+                      error_count=1, warning_count=0, repeated_error_count=0, resolved_finding_count=2)
+            trace.add("run_deadline_exceeded", role="author", elapsed_seconds=2712.5, limit_seconds=2700.0)
+
+            log = (run_dir / "progress.log").read_text(encoding="utf-8")
+            self.assertIn("Harness started; tools: get_spending_summary; time limit 2700s", log)
+            self.assertIn("fail, 1 errors, 0 warnings, 2 earlier finding(s) resolved", log)
+            self.assertIn("Run time limit reached (2712.5s elapsed of 2700.0s) at a author model call", log)
+
     def test_index_lists_running_run_from_progress(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             ProgressRecorder(Path(temp_dir) / "20260101T000000_live", "20260101T000000_live", "m", "v", echo=False)

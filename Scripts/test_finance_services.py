@@ -192,6 +192,36 @@ class TestSharedFinanceReportService(unittest.TestCase):
         self.assertEqual(events[-1], "exception")
         self.assertEqual(raised.exception.report_snapshot.latest_month, "2026-02-01")
 
+    def test_generator_passes_cycle_and_run_time_limits_to_the_harness(self):
+        rows = [
+            {"transaction_month": date(2026, 2, 1), "category": "Groceries", "parent_group": "Needs", "net_real_expense": 450},
+            {"transaction_month": date(2026, 1, 1), "category": "Groceries", "parent_group": "Needs", "net_real_expense": 400},
+        ]
+        captured = []
+
+        class CapturingHarness:
+            def __init__(self, **kwargs):
+                captured.append(kwargs["limits"])
+                self.trace = RunTrace()
+
+            def run(self, **kwargs):
+                return {"report_html": "<p>ok</p>", "plain_text": "ok"}, ValidationDecision("pass", [], "ok"), self.trace
+
+        base = {"Monthly_budget": 8500, "Fixed_costs": 1000}
+        cases = [({}, 2700, 3), ({"max_run_seconds": 0}, None, 3), ({"max_run_seconds": None}, None, 3),
+                 ({"max_run_seconds": 600, "max_validation_cycles": 4}, 600, 4)]
+        with patch.object(reporting, "ReportHarness", CapturingHarness):
+            for extra, _, _ in cases:
+                reporting.generate_finance_report(
+                    config={**base, **extra}, project_name="project", ollama_url="http://ollama/api/generate",
+                    model_name="model", rows=rows, selected_report_month=date(2026, 2, 1),
+                )
+
+        self.assertEqual(
+            [(limits.max_run_seconds, limits.max_validation_cycles) for limits in captured],
+            [(seconds, cycles) for _, seconds, cycles in cases],
+        )
+
     def test_tool_specs_use_their_registered_names(self):
         snapshot = SimpleNamespace(latest_month="2026-02-01", previous_month="2026-01-01")
         tools = reporting._build_tools({}, "project", snapshot, [], None, "finance:test", "url", "model")

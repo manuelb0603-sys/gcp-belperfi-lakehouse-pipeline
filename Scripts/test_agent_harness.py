@@ -172,7 +172,7 @@ class TestAgentHarness(unittest.TestCase):
         harness = ReportHarness(
             "http://ollama",
             "test-model",
-            limits=HarnessLimits(max_validation_cycles=0),
+            limits=HarnessLimits(max_validation_cycles=0),  # values < 1 mean a single review
             query=fake_query,
         )
 
@@ -425,7 +425,7 @@ class TestAgentHarness(unittest.TestCase):
         harness = ReportHarness(
             "http://ollama",
             "test-model",
-            limits=HarnessLimits(max_agent_rounds=2, max_tool_calls=2, max_calls_per_tool=2, max_validation_cycles=1),
+            limits=HarnessLimits(max_agent_rounds=2, max_tool_calls=2, max_calls_per_tool=2, max_validation_cycles=2),
             query=fake_query,
         )
 
@@ -514,7 +514,7 @@ class TestAgentHarness(unittest.TestCase):
             '{"report_html":"%s","plain_text":"Big"}' % oversize,
             '{"report_html":"%s","plain_text":"Still big"}' % oversize,
         ]
-        harness, prompts = self._scripted_harness(responses, HarnessLimits(max_report_bytes=200, max_validation_cycles=1))
+        harness, prompts = self._scripted_harness(responses, HarnessLimits(max_report_bytes=200, max_validation_cycles=2))
 
         report, decision, trace = harness.run("objective", self._snapshot(), "author context", {})
 
@@ -589,7 +589,7 @@ class TestAgentHarness(unittest.TestCase):
             '{"report_html":"<html><body>Report 3</body></html>","plain_text":"Report 3"}',
             '{"decision":"pass","summary":"Accepted.","findings":[]}',
         ]
-        harness, _ = self._scripted_harness(responses, HarnessLimits(max_validation_cycles=2))
+        harness, _ = self._scripted_harness(responses, HarnessLimits(max_validation_cycles=3))
         tools = {
             "first_tool": ToolSpec("first_tool", "first", lambda _: {"marker": "FIRST_RESULT_MARKER"}),
             "second_tool": ToolSpec("second_tool", "second", lambda _: {"marker": "SECOND_RESULT_MARKER"}),
@@ -603,7 +603,10 @@ class TestAgentHarness(unittest.TestCase):
         self.assertEqual(author_prompts[-1].count("SECOND_RESULT_MARKER"), 1)
         self.assertEqual(author_prompts[-1].count("PREVIOUS REPORT HTML"), 1)
         self.assertIn("Second issue.", author_prompts[-1])
-        self.assertNotIn("First issue.", author_prompts[-1])
+        # The old revision request was replaced: the first finding is no longer a priority fix,
+        # only a one-line entry in the resolved list.
+        self.assertNotIn('"message": "First issue."', author_prompts[-1])
+        self.assertIn("ALREADY FIXED IN EARLIER CYCLES (do not reintroduce):\n- evidence: First issue.", author_prompts[-1])
 
 
 def _protocol_snapshot() -> ReportSnapshot:
@@ -836,7 +839,7 @@ class TestFocusedFeedback(unittest.TestCase):
             prompts.append(prompt)
             return responses.pop(0)
 
-        harness = ReportHarness("http://ollama", "m", limits=HarnessLimits(max_validation_cycles=1), query=fake_query)
+        harness = ReportHarness("http://ollama", "m", limits=HarnessLimits(max_validation_cycles=2), query=fake_query)
         _, decision, _ = harness.run("objective", _protocol_snapshot(), "author context", {})
 
         self.assertTrue(decision.passed)
@@ -1015,7 +1018,7 @@ class TestAuthorRebuttals(unittest.TestCase):
 
         self.assertEqual(set(result), {"report_html", "plain_text"})
 
-    def _run(self, responses, cycles=1):
+    def _run(self, responses, cycles=2):
         prompts = []
 
         def fake_query(prompt, *args, **kwargs):
@@ -1073,7 +1076,7 @@ class TestAuthorRebuttals(unittest.TestCase):
             REPORT_WITH_QUOTE, failing("Report fails to disclose that cuts are insufficient!"),
             REPORT_WITH_QUOTE, failing("Sushi Stack is missing."),
         ]
-        _, decision, trace, _ = self._run(responses, cycles=2)
+        _, decision, trace, _ = self._run(responses, cycles=3)
 
         self.assertFalse(decision.passed)
         stalled = [event for event in trace.events if event.get("event") == "validation_stalled"]
@@ -1081,6 +1084,238 @@ class TestAuthorRebuttals(unittest.TestCase):
         self.assertEqual(stalled[0]["repeated_error_count"], 1)
         progress = [event for event in trace.events if event.get("event") == "validation_progress"]
         self.assertEqual([event["repeated_error_count"] for event in progress], [None, 1, 0])
+
+
+def _failing_review(*messages, category="completeness"):
+    import json
+
+    return json.dumps({"decision": "fail", "summary": "Issues", "audit": {},
+                       "findings": [_error(category, message) for message in messages]})
+
+
+def _model_calls(trace, role):
+    return [event for event in trace.events if event.get("event") == "model_call" and event.get("role") == role]
+
+
+class TestValidationCycleLimit(unittest.TestCase):
+    def _run_always_failing(self, cycles):
+        counter = {"validator": 0}
+
+        def fake_query(prompt, url, model, response_format=None, **kwargs):
+            if response_format is None:
+                return MARKED_REPORT
+            counter["validator"] += 1
+            return _failing_review(f"Issue number {counter['validator']}.")
+
+        harness = ReportHarness("http://ollama", "m", limits=HarnessLimits(max_validation_cycles=cycles), query=fake_query)
+        return harness.run("objective", _protocol_snapshot(), "author context", {})
+
+    def test_max_validation_cycles_is_the_exact_number_of_reviews(self):
+        for cycles, expected_reviews in ((1, 1), (2, 2), (4, 4), (0, 1), (-3, 1)):
+            with self.subTest(cycles=cycles):
+                report, decision, trace = self._run_always_failing(cycles)
+
+                self.assertFalse(decision.passed)
+                self.assertIn("Validation cycles were exhausted", decision.summary)
+                self.assertIn('Hello "quoted"', report["report_html"])
+                self.assertEqual(len(_model_calls(trace, "validator")), expected_reviews)
+                author_calls = _model_calls(trace, "author")
+                self.assertEqual(len(author_calls), expected_reviews)  # initial report + (reviews - 1) revisions
+                revisions = [event for event in author_calls if "PREVIOUS REPORT HTML" in event["prompt"]]
+                self.assertEqual(len(revisions), expected_reviews - 1)
+                results = [event for event in trace.events if event.get("event") == "validation_cycle_result"]
+                self.assertEqual([event["cycle"] for event in results], list(range(1, expected_reviews + 1)))
+                self.assertEqual(trace.events[-1]["validation_cycles"], expected_reviews)
+
+
+class TestResolvedFindings(unittest.TestCase):
+    def _run(self, responses, cycles=3):
+        def fake_query(prompt, *args, **kwargs):
+            return responses.pop(0)
+
+        harness = ReportHarness("http://ollama", "m", limits=HarnessLimits(max_validation_cycles=cycles), query=fake_query)
+        return harness.run("objective", _protocol_snapshot(), "author context", {})
+
+    def test_resolved_findings_reach_author_and_validator_prompts(self):
+        long_message = "Sushi Stack is missing the disposable cash card " + "x" * 200
+        responses = [
+            MARKED_REPORT, _failing_review("Greeting is missing.", long_message),
+            MARKED_REPORT, _failing_review(long_message),
+            MARKED_REPORT, PASS,
+        ]
+        _, decision, trace = self._run(responses)
+
+        self.assertTrue(decision.passed)
+        author_prompts = [event["prompt"] for event in _model_calls(trace, "author")]
+        validator_prompts = [event["prompt"] for event in _model_calls(trace, "validator")]
+        self.assertNotIn("ALREADY FIXED IN EARLIER CYCLES", author_prompts[1])
+        self.assertNotIn("FINDINGS RESOLVED IN EARLIER CYCLES", validator_prompts[1])
+        self.assertIn("ALREADY FIXED IN EARLIER CYCLES (do not reintroduce):\n- completeness: Greeting is missing.", author_prompts[2])
+        self.assertEqual(author_prompts[2].count("ALREADY FIXED IN EARLIER CYCLES"), 1)
+        self.assertNotIn("completeness: Sushi Stack", author_prompts[2].split("ALREADY FIXED IN EARLIER CYCLES")[1].split("Fix only")[0])
+        self.assertIn(
+            "FINDINGS RESOLVED IN EARLIER CYCLES (you accepted these as fixed; re-flag only with new verbatim "
+            "evidence from the current report):\n- completeness: Greeting is missing.",
+            validator_prompts[2],
+        )
+        progress = [event for event in trace.events if event.get("event") == "validation_progress"]
+        self.assertEqual(progress[0]["resolved_findings"], [])
+        self.assertEqual(progress[1]["resolved_findings"], ["completeness: Greeting is missing."])
+        self.assertEqual(len(progress[2]["resolved_findings"]), 2)
+        label = progress[2]["resolved_findings"][1]
+        self.assertTrue(label.startswith("completeness: Sushi Stack"))
+        self.assertLessEqual(len(label), len("completeness: ") + 101)
+        results = [event for event in trace.events if event.get("event") == "validation_cycle_result"]
+        self.assertEqual([event["resolved_finding_count"] for event in results], [0, 1, 2])
+
+    def test_reappearing_finding_leaves_list_and_review_without_items_changes_nothing(self):
+        responses = [
+            MARKED_REPORT, _failing_review("Greeting is missing.", "Top 3 table is missing."),
+            MARKED_REPORT, _failing_review("Top 3 table is missing."),
+            MARKED_REPORT, '{"decision":"fail",', '{"decision":"fail",',  # malformed twice: no itemized findings
+            MARKED_REPORT, _failing_review("Greeting is missing."),
+        ]
+        _, decision, trace = self._run(responses, cycles=4)
+
+        self.assertFalse(decision.passed)
+        progress = [event["resolved_findings"] for event in trace.events if event.get("event") == "validation_progress"]
+        self.assertEqual(progress, [
+            [],
+            ["completeness: Greeting is missing."],
+            ["completeness: Greeting is missing."],
+            ["completeness: Top 3 table is missing."],
+        ])
+
+    def test_resolved_list_is_bounded(self):
+        from finance.agent_harness import MAX_RESOLVED_FINDINGS, _update_resolved_findings
+
+        earlier = {("completeness", f"issue {index}"): f"completeness: Issue {index}." for index in range(15)}
+        resolved = {}
+        _update_resolved_findings(resolved, earlier, set())
+
+        self.assertEqual(len(resolved), MAX_RESOLVED_FINDINGS)
+        self.assertEqual(list(resolved.values())[-1], "completeness: Issue 14.")
+        _update_resolved_findings(resolved, earlier, {("completeness", "issue 14")})
+        self.assertNotIn(("completeness", "issue 14"), resolved)
+
+
+class FakeClock:
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+class TestRunDeadline(unittest.TestCase):
+    def _harness(self, fake_query, max_run_seconds, clock, cycles=3, timeout=600):
+        return ReportHarness(
+            "http://ollama", "m",
+            limits=HarnessLimits(max_validation_cycles=cycles, max_run_seconds=max_run_seconds),
+            timeout=timeout, query=fake_query, clock=clock,
+        )
+
+    def test_deadline_passed_before_first_call_returns_fallback_with_fail(self):
+        clock = FakeClock()
+        calls = []
+        harness = self._harness(lambda *a, **k: calls.append(1) or MARKED_REPORT, 100, clock)
+        # Time jumps past the deadline right after the run starts, before any model call.
+        harness.trace.listeners.append(lambda event: event["event"] == "run_started" and setattr(clock, "now", clock.now + 500))
+
+        report, decision, trace = harness.run("objective", _protocol_snapshot(), "author context", {})
+
+        self.assertEqual(calls, [])
+        self.assertFalse(decision.passed)
+        self.assertIn("Fallback report", report["report_html"])
+        self.assertIn("time limit", decision.summary)
+        self.assertEqual(trace.events[0]["deadline_seconds"], 100)
+        exceeded = [event for event in trace.events if event.get("event") == "run_deadline_exceeded"]
+        self.assertEqual(len(exceeded), 1)
+        self.assertEqual((exceeded[0]["elapsed_seconds"], exceeded[0]["limit_seconds"], exceeded[0]["role"]), (500, 100, "author"))
+        self.assertEqual(trace.events[-1]["event"], "run_completed")
+
+    def test_deadline_during_revision_keeps_last_sanitized_report(self):
+        clock = FakeClock()
+        responses = [MARKED_REPORT, _failing_review("Wrong total.", category="arithmetic"), MARKED_REPORT, PASS]
+
+        def fake_query(*args, **kwargs):
+            clock.now += 60  # each call takes a minute; the revision call would start after the 100 s limit
+            return responses.pop(0)
+
+        report, decision, trace = self._harness(fake_query, 100, clock).run("objective", _protocol_snapshot(), "author context", {})
+
+        self.assertFalse(decision.passed)
+        self.assertIn("during revision", decision.summary)
+        self.assertIn("Issues", decision.summary)
+        self.assertEqual([finding.message for finding in decision.findings], ["Wrong total."])
+        self.assertIn('Hello "quoted"', report["report_html"])
+        self.assertEqual(len(responses), 2)  # the revision and second review never ran
+        exceeded = next(event for event in trace.events if event.get("event") == "run_deadline_exceeded")
+        self.assertEqual((exceeded["elapsed_seconds"], exceeded["limit_seconds"]), (120, 100))
+        self.assertNotIn("model_call_retry", [event["event"] for event in trace.events])
+
+    def test_per_call_timeout_is_capped_at_time_remaining_with_a_floor(self):
+        clock = FakeClock()
+        timeouts = []
+        steps = iter([700, 280, 0, 0])  # time spent by each call
+        responses = [MARKED_REPORT, _failing_review("Missing greeting."), MARKED_REPORT, PASS]
+
+        def fake_query(*args, timeout=None, **kwargs):
+            timeouts.append(timeout)
+            clock.now += next(steps)
+            return responses.pop(0)
+
+        _, decision, _ = self._harness(fake_query, 1000, clock).run("objective", _protocol_snapshot(), "author context", {})
+
+        self.assertTrue(decision.passed)
+        # 1000 s left > ollama_timeout; then 300 s left; then 20 s left, raised to the 30 s floor.
+        self.assertEqual(timeouts, [600, 300, 30, 30])
+
+    def test_timeout_of_a_capped_call_is_a_deadline_stop_not_a_retry(self):
+        clock = FakeClock()
+        calls = []
+
+        def fake_query(*args, timeout=None, **kwargs):
+            calls.append(timeout)
+            if len(calls) == 1:
+                clock.now += 900
+                return MARKED_REPORT
+            clock.now += timeout
+            raise TimeoutError("read timed out")
+
+        report, decision, trace = self._harness(fake_query, 1000, clock).run("objective", _protocol_snapshot(), "author context", {})
+
+        self.assertEqual(calls, [600, 100])
+        self.assertFalse(decision.passed)
+        self.assertIn("time limit", decision.summary)
+        self.assertIn("not reviewed", decision.summary)
+        self.assertIn('Hello "quoted"', report["report_html"])
+        names = [event["event"] for event in trace.events]
+        self.assertNotIn("model_call_retry", names)
+        self.assertEqual(names.count("run_deadline_exceeded"), 1)
+        result = [event for event in trace.events if event.get("event") == "validation_cycle_result"][-1]
+        self.assertEqual(result["stage"], "run_deadline")
+
+    def test_deadline_disabled_when_zero_or_none(self):
+        for limit in (0, None):
+            with self.subTest(limit=limit):
+                clock = FakeClock()
+                timeouts = []
+                responses = [MARKED_REPORT, PASS]
+
+                def fake_query(*args, timeout=None, **kwargs):
+                    timeouts.append(timeout)
+                    clock.now += 100_000
+                    return responses.pop(0)
+
+                _, decision, trace = self._harness(fake_query, limit, clock).run(
+                    "objective", _protocol_snapshot(), "author context", {}
+                )
+
+                self.assertTrue(decision.passed)
+                self.assertEqual(timeouts, [600, 600])
+                self.assertIsNone(trace.events[0]["deadline_seconds"])
+                self.assertNotIn("run_deadline_exceeded", [event["event"] for event in trace.events])
 
 
 class TestValidatorPrompt(unittest.TestCase):
@@ -1097,6 +1332,7 @@ class TestValidatorPrompt(unittest.TestCase):
         self.assertIn("verbatim", text)
         self.assertIn("AUTHOR REBUTTALS", text)
         self.assertIn("Do not repeat a prior finding unchanged", text)
+        self.assertIn("FINDINGS RESOLVED IN EARLIER CYCLES", text)
 
 
 if __name__ == "__main__":

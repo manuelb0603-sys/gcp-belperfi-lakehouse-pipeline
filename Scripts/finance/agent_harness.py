@@ -34,8 +34,11 @@ class HarnessLimits:
     max_agent_rounds: int = 6
     max_tool_calls: int = 12
     max_calls_per_tool: int = 3
-    max_validation_cycles: int = 2
+    # Total validator reviews (validation cycles) allowed, so at most this value - 1 revisions; values < 1 mean 1.
+    max_validation_cycles: int = 3
     max_report_bytes: int = 250_000
+    # Wall-clock budget for the whole run in seconds; None or <= 0 disables the deadline.
+    max_run_seconds: float | None = 2700
 
 
 @dataclass
@@ -74,6 +77,13 @@ class _AuthorState:
     budget_exhausted: bool = False
     revision_block: str = ""
     retry_suffix: str = ""
+    # Error findings from earlier validation cycles that are absent from the latest cycle's errors,
+    # keyed like the stall detection (category + message prefix) and mapped to a short label.
+    resolved_findings: dict[tuple[str, str], str] = field(default_factory=dict)
+
+    def resolved_labels(self) -> list[str]:
+        """Short labels of findings already fixed in earlier cycles, oldest first."""
+        return list(self.resolved_findings.values())
 
     def history_used(self) -> bool:
         """True when prior-report history was successfully retrieved as evidence."""
@@ -299,6 +309,36 @@ def _finding_key(finding: ValidationFinding) -> tuple[str, str]:
     return (str(finding.category or "").lower(), message[:STALL_MESSAGE_PREFIX_CHARS])
 
 
+MAX_RESOLVED_FINDINGS = 10
+RESOLVED_LABEL_MESSAGE_CHARS = 100
+
+
+def _finding_label(finding: ValidationFinding) -> str:
+    """Short human-readable label for a finding: category plus a truncated message."""
+    message = re.sub(r"\s+", " ", str(finding.message or "")).strip()
+    if len(message) > RESOLVED_LABEL_MESSAGE_CHARS:
+        message = message[:RESOLVED_LABEL_MESSAGE_CHARS].rstrip() + "…"
+    return f"{finding.category or 'uncategorized'}: {message}"
+
+
+def _update_resolved_findings(
+    resolved: dict[tuple[str, str], str],
+    earlier_errors: dict[tuple[str, str], str],
+    current_keys: set[tuple[str, str]],
+) -> None:
+    """Bookkeeping only: track earlier error findings that are absent from the latest cycle's errors.
+
+    A finding that comes back is removed again; the list keeps the most recent MAX_RESOLVED_FINDINGS.
+    """
+    for key in [key for key in resolved if key in current_keys]:
+        del resolved[key]
+    for key, label in earlier_errors.items():
+        if key not in current_keys and key not in resolved:
+            resolved[key] = label
+    while len(resolved) > MAX_RESOLVED_FINDINGS:
+        del resolved[next(iter(resolved))]
+
+
 REPORT_START_MARKER = "<<<REPORT_HTML>>>"
 REPORT_END_MARKER = "<<<END_REPORT_HTML>>>"
 REBUTTALS_START_MARKER = "<<<REBUTTALS>>>"
@@ -384,6 +424,26 @@ class ModelUnavailableError(RuntimeError):
 
 class AgentRoundsExhaustedError(RuntimeError):
     """The author used every allowed round of a phase without returning a report."""
+
+
+class RunDeadlineExceededError(RuntimeError):
+    """The run's max_run_seconds budget ran out before (or during) a model call."""
+
+
+# Lower bound for a deadline-capped model call timeout, so a call near the deadline is not cut off instantly.
+MIN_CALL_TIMEOUT_SECONDS = 30
+
+
+def _is_timeout(exc: Exception) -> bool:
+    """True when a model call failed because its HTTP timeout elapsed."""
+    if isinstance(exc, TimeoutError):
+        return True
+    try:
+        import requests
+    except ImportError:
+        return False
+    exceptions = getattr(requests, "exceptions", None)
+    return exceptions is not None and isinstance(exc, exceptions.Timeout)
 
 
 def _is_model_call_failure(exc: Exception) -> bool:
@@ -662,12 +722,15 @@ class ReportHarness:
         timeout: int = 600,
         query: Callable[..., str] = query_ollama,
         model_options: dict[str, dict[str, Any]] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Create a bounded agent harness with a separate author and validator model.
 
         model_options holds optional per-role Ollama settings, e.g. {"author": {"temperature": 0.3,
         "num_predict": 12000, "think": False}, "validator": {...}}. "think" is sent as Ollama's
-        top-level think flag; every other key goes into the request's options.
+        top-level think flag; every other key goes into the request's options. timeout is the
+        per-call maximum; with limits.max_run_seconds set, each call is also capped at the time
+        left in the run. clock supplies the run-deadline time (injectable for tests).
         """
         self.ollama_url = ollama_url
         self.author_model = author_model
@@ -676,8 +739,46 @@ class ReportHarness:
         self.timeout = timeout
         self.query = query
         self.model_options = model_options or {}
+        self.clock = clock
         self.trace = RunTrace()
         self._validator_unavailable = False
+        self._run_started_at: float | None = None
+        self._deadline: float | None = None
+
+    def _deadline_seconds(self) -> float | None:
+        """The configured run budget in seconds, or None when the deadline is disabled."""
+        limit = self.limits.max_run_seconds
+        return float(limit) if limit is not None and float(limit) > 0 else None
+
+    def _deadline_exceeded(self, role: str, **context: Any) -> RunDeadlineExceededError:
+        """Record the deadline stop and build the exception that ends the run with a fail decision."""
+        elapsed = self.clock() - (self._run_started_at if self._run_started_at is not None else self.clock())
+        limit = self._deadline_seconds()
+        self.trace.add(
+            "run_deadline_exceeded",
+            role=role,
+            elapsed_seconds=round(elapsed, 3),
+            limit_seconds=limit,
+            **context,
+        )
+        return RunDeadlineExceededError(
+            f"Run time limit of {limit:g} seconds reached after {elapsed:.0f} seconds (before or during a {role} model call)"
+        )
+
+    def _call_timeout(self, role: str, **context: Any) -> tuple[float, bool]:
+        """Per-call HTTP timeout, capped at the time left in the run; raises once the deadline has passed.
+
+        Returns (timeout, capped) where capped is True when the deadline, not ollama_timeout, set the timeout.
+        """
+        if self._deadline is None:
+            return self.timeout, False
+        remaining = self._deadline - self.clock()
+        if remaining <= 0:
+            raise self._deadline_exceeded(role, **context)
+        capped_timeout = max(remaining, MIN_CALL_TIMEOUT_SECONDS)
+        if capped_timeout < self.timeout:
+            return capped_timeout, True
+        return self.timeout, False
 
     def _role_kwargs(self, role: str) -> dict[str, Any]:
         """Per-role Ollama request extras; empty when nothing is configured, so defaults apply."""
@@ -691,21 +792,31 @@ class ReportHarness:
         return kwargs
 
     def _query_with_retry(self, role: str, prompt: str, model: str, response_format: Any, **context: Any) -> str:
-        """Call the model, retrying once on a timeout/connection/5xx/empty-response failure."""
+        """Call the model, retrying once on a timeout/connection/5xx/empty-response failure.
+
+        Raises RunDeadlineExceededError before any attempt once max_run_seconds has passed, and when
+        a call times out because its timeout was capped at the time left in the run.
+        """
         for attempt in (1, 2):
+            timeout, capped = self._call_timeout(role, model=model, attempt=attempt, **context)
             started = time.perf_counter()
             try:
                 return self.query(
                     prompt,
                     self.ollama_url,
                     model,
-                    timeout=self.timeout,
+                    timeout=timeout,
                     response_format=response_format,
                     **self._role_kwargs(role),
                 )
             except Exception as exc:
                 elapsed = round(time.perf_counter() - started, 3)
                 self._record_exception(f"{role}_model_call", exc, elapsed_seconds=elapsed, call_attempt=attempt, **context)
+                if capped and _is_timeout(exc):
+                    # The run deadline, not ollama_timeout, cut this call short: stop instead of retrying.
+                    raise self._deadline_exceeded(
+                        role, model=model, attempt=attempt, call_timeout_seconds=round(timeout, 3), **context
+                    ) from exc
                 if not _is_model_call_failure(exc):
                     raise
                 self.trace.add(
@@ -1045,6 +1156,9 @@ class ReportHarness:
         report_requirements is an optional snapshot-derived checklist added once to the author
         base prompt (so revisions inherit it) and to every validator prompt.
         """
+        deadline_seconds = self._deadline_seconds()
+        self._run_started_at = self.clock()
+        self._deadline = self._run_started_at + deadline_seconds if deadline_seconds is not None else None
         self.trace.add(
             "run_started",
             author_model=self.author_model,
@@ -1055,7 +1169,9 @@ class ReportHarness:
                 "max_calls_per_tool": self.limits.max_calls_per_tool,
                 "max_validation_cycles": self.limits.max_validation_cycles,
                 "max_report_bytes": self.limits.max_report_bytes,
+                "max_run_seconds": self.limits.max_run_seconds,
             },
+            deadline_seconds=deadline_seconds,
             tool_names=sorted(tools),
         )
         try:
@@ -1287,12 +1403,15 @@ class ReportHarness:
         ))
         try:
             report = self._author_loop("initial", tools, state)
-        except (ModelUnavailableError, AgentRoundsExhaustedError) as exc:
+        except (ModelUnavailableError, AgentRoundsExhaustedError, RunDeadlineExceededError) as exc:
             # Without an author report there is nothing to validate; return the deterministic fallback, never sent.
             if isinstance(exc, ModelUnavailableError):
                 self.trace.add("model_unavailable", role="author", phase="initial", error=str(exc))
                 reason = "The author model was unavailable after a retry."
                 summary = f"Author model unavailable after a retry ({exc}); the fallback report was not validated."
+            elif isinstance(exc, RunDeadlineExceededError):
+                reason = "The run time limit was reached before the author returned a report."
+                summary = f"{exc}; the fallback report was not validated."
             else:
                 reason = f"The author used all {self.limits.max_agent_rounds} agent rounds without returning a report."
                 summary = f"{reason} ({exc}); the fallback report was not validated."
@@ -1308,8 +1427,13 @@ class ReportHarness:
         previous_validation: dict[str, Any] | None = None
         previous_error_counts: dict[str, int] | None = None
         previous_error_keys: set[tuple[str, str]] | None = None
+        # Every error finding seen in earlier cycles (key -> short label), for the resolved-findings list.
+        earlier_errors: dict[tuple[str, str], str] = {}
         decision: ValidationDecision | None = None
-        for cycle in range(self.limits.max_validation_cycles + 1):
+        last_review: ValidationDecision | None = None
+        # max_validation_cycles is the total number of reviews, so there are at most max_cycles - 1 revisions.
+        max_cycles = max(1, int(self.limits.max_validation_cycles))
+        for cycle in range(max_cycles):
             html = report.get("report_html") if isinstance(report, dict) else None
             history_used = state.history_used()
             self.trace.add(
@@ -1355,6 +1479,14 @@ class ReportHarness:
                     f"{json.dumps(previous_validation, indent=2, ensure_ascii=False)}\n\n"
                     if previous_validation is not None else ""
                 )
+                resolved_labels = state.resolved_labels()
+                if previous_validation is not None and resolved_labels:
+                    prior_validation_text += (
+                        "FINDINGS RESOLVED IN EARLIER CYCLES (you accepted these as fixed; re-flag only with new "
+                        "verbatim evidence from the current report):\n"
+                        + "\n".join(f"- {label}" for label in resolved_labels)
+                        + "\n\n"
+                    )
                 if previous_validation is not None and rebuttals:
                     prior_validation_text += (
                         "AUTHOR REBUTTALS (verify each quote against the report): the author says the report above "
@@ -1373,6 +1505,27 @@ class ReportHarness:
                 )
                 try:
                     decision = self._validator_call(validator_prompt, cycle=cycle + 1)
+                except RunDeadlineExceededError as exc:
+                    # Out of time before this review finished: keep the newest sanitized report (never sent)
+                    # with a fail decision carrying the last completed review's findings.
+                    self.trace.add(
+                        "validation_cycle_result",
+                        cycle=cycle + 1,
+                        decision="fail",
+                        stage="run_deadline",
+                        summary=str(exc),
+                        findings=[],
+                        report_html_bytes=len(safe_html.encode("utf-8")),
+                    )
+                    if html.strip():
+                        report["report_html"] = safe_html
+                    else:
+                        report = last_safe_report or build_fallback_report(
+                            snapshot, "The run time limit was reached and the author returned no report."
+                        )
+                    findings = list(last_review.findings) if last_review is not None else []
+                    last = f"; last review: {last_review.summary}" if last_review is not None else "; the report was not reviewed"
+                    return report, ValidationDecision("fail", findings, f"{exc} during validation{last}"), self.trace
                 except Exception as exc:
                     self.trace.add(
                         "validation_cycle_result",
@@ -1439,7 +1592,15 @@ class ReportHarness:
                     for category in sorted(categories)
                     if error_counts.get(category, 0) > previous_error_counts.get(category, 0)
                 }
-            self.trace.add("validation_progress", cycle=cycle + 1, **progress)
+            if decision.passed or error_findings:
+                # A failed review without itemized errors (for example malformed validator JSON) says nothing
+                # about which findings were fixed, so it leaves the resolved list unchanged.
+                _update_resolved_findings(state.resolved_findings, earlier_errors, set(error_keys))
+                for finding in error_findings:
+                    earlier_errors.setdefault(_finding_key(finding), _finding_label(finding))
+            self.trace.add(
+                "validation_progress", cycle=cycle + 1, **progress, resolved_findings=state.resolved_labels()
+            )
             if previous_error_keys and error_keys and set(error_keys) == previous_error_keys:
                 # Informational only: the same findings came back unchanged, so the revision made no
                 # visible progress (the author did not fix them, or the validator repeated false findings).
@@ -1471,6 +1632,7 @@ class ReportHarness:
                 resolved_error_count_by_category=progress["resolved_error_count_by_category"],
                 new_error_count_by_category=progress["new_error_count_by_category"],
                 repeated_error_count=repeated_error_count,
+                resolved_finding_count=len(state.resolved_findings),
             )
             if safe_html is not None:
                 revision_html = safe_html
@@ -1494,16 +1656,25 @@ class ReportHarness:
             }
             previous_error_counts = error_counts
             previous_error_keys = set(error_keys)
+            last_review = decision
             if decision.passed:
                 return report, decision, self.trace
-            if cycle >= self.limits.max_validation_cycles:
+            if cycle + 1 >= max_cycles:
                 break
             feedback = json.dumps(focused_feedback(decision, snapshot), indent=2, ensure_ascii=False)
+            resolved_labels = state.resolved_labels()
+            already_fixed = (
+                "ALREADY FIXED IN EARLIER CYCLES (do not reintroduce):\n"
+                + "\n".join(f"- {label}" for label in resolved_labels)
+                + "\n"
+                if resolved_labels else ""
+            )
             # Replace (not append) the revision request so only the latest attempt is in context.
             state.revision_block = (
                 "\n\nPREVIOUS REPORT HTML (edit this document; it failed review):\n"
                 f"----- BEGIN PREVIOUS REPORT -----\n{revision_html}\n----- END PREVIOUS REPORT -----\n\n"
                 f"PRIORITY FIXES FROM THE REVIEW:\n{feedback}\n"
+                f"{already_fixed}"
                 "Fix only the listed issues with minimal edits to the previous HTML and keep everything else unchanged; "
                 "use the exact authoritative values given and do not reintroduce a fixed issue in another section. "
                 "Then return the complete revised report between "
@@ -1514,12 +1685,15 @@ class ReportHarness:
             try:
                 report = self._author_loop("revision", tools, state)
                 rebuttals = self._take_rebuttals(report, responding_to_cycle=cycle + 1)
-            except (ModelUnavailableError, AgentRoundsExhaustedError) as exc:
+            except (ModelUnavailableError, AgentRoundsExhaustedError, RunDeadlineExceededError) as exc:
                 # Keep the last sanitized report (never sent: the decision stays fail) and stop revising.
                 if isinstance(exc, ModelUnavailableError):
                     self.trace.add("model_unavailable", role="author", phase="revision", cycle=cycle + 1, error=str(exc))
                     reason = "The author model was unavailable during revision."
                     summary = f"Author model unavailable during revision after a retry ({exc}); last review: {decision.summary}"
+                elif isinstance(exc, RunDeadlineExceededError):
+                    reason = "The run time limit was reached during revision."
+                    summary = f"{exc} during revision; last review: {decision.summary}"
                 else:
                     reason = "The author used all revision agent rounds without returning a report."
                     summary = (

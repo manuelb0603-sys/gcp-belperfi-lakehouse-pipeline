@@ -176,7 +176,7 @@ class RequirementsPromptWiringTests(unittest.TestCase):
             return responses.pop(0)
 
         harness = ReportHarness(
-            "http://ollama", "test-model", limits=HarnessLimits(max_validation_cycles=1), query=fake_query
+            "http://ollama", "test-model", limits=HarnessLimits(max_validation_cycles=2), query=fake_query
         )
         snapshot = calculate_report_snapshot(real_run_rows(), 5000, 3500, savings_goal=2000)
         _, decision, trace = harness.run(
