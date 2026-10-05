@@ -19,11 +19,13 @@ import math
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urlsplit, urlunsplit
 
+from .settings import DEFAULTS
+
 
 logger = logging.getLogger(__name__)
 
 MODEL_ROLES = ("author", "validator", "eval")
-DEFAULT_TIMEOUT = 600
+DEFAULT_TIMEOUT = DEFAULTS["ollama_timeout"]
 DEFAULT_ANTHROPIC_MAX_TOKENS = 16000
 # Anthropic rejects an empty user message; used only when the whole prompt went to the system block.
 EMPTY_USER_MESSAGE = "Follow the instructions above."
@@ -386,8 +388,10 @@ def _split_ollama_section(section: dict[str, Any]) -> tuple[dict[str, Any] | Non
     return (options or None), (bool(think) if think is not None else None)
 
 
-def resolve_model_role(config: dict[str, Any], role: str) -> dict[str, Any]:
+def resolve_model_role(config: Any, role: str) -> dict[str, Any]:
     """Resolved settings for one role: provider, model, and provider-specific fields.
+
+    config is a config dict or a finance.settings.ReportSettings (which resolved its roles here).
 
     model_roles[role] wins when present; otherwise the legacy keys apply (author: model_name;
     validator: validator_model_name, else model_name; ollama_options[role]; model_server_url).
@@ -395,6 +399,8 @@ def resolve_model_role(config: dict[str, Any], role: str) -> dict[str, Any]:
     """
     if role not in MODEL_ROLES:
         raise ValueError(f"Unknown model role {role!r}; expected one of {', '.join(MODEL_ROLES)}")
+    if not isinstance(config, dict) and callable(getattr(config, "role", None)):
+        return config.role(role)  # a ReportSettings: roles were resolved once when it was built
     roles = config.get("model_roles")
     entry = roles.get(role) if isinstance(roles, dict) else None
     if not isinstance(entry, dict) or not entry.get("model"):
@@ -427,8 +433,8 @@ def resolve_model_role(config: dict[str, Any], role: str) -> dict[str, Any]:
     return resolved
 
 
-def build_model_client(config: dict[str, Any], role: str, *, anthropic_client: Any = None) -> ModelClient:
-    """Create the ModelClient for a role ("author", "validator", or "eval") from config.
+def build_model_client(config: Any, role: str, *, anthropic_client: Any = None) -> ModelClient:
+    """Create the ModelClient for a role ("author", "validator", or "eval") from a config dict or ReportSettings.
 
     anthropic_client lets tests inject a fake SDK client; real runs build anthropic.Anthropic().
     """

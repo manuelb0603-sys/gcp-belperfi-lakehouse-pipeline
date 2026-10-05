@@ -20,7 +20,7 @@ from .report_requirements import build_report_requirements
 from .html_text import html_to_text
 from .memory_search import search_long_facts
 from .model_clients import build_model_client
-from .settings import PROJECT_ROOT, parse_money
+from .settings import PROJECT_ROOT, ReportSettings
 
 
 # Stored reports are excerpted without their CSS/script/head boilerplate.
@@ -67,7 +67,7 @@ class FinanceReportResult:
         }
 
 
-def _report_rows(config: dict[str, Any], project_name: str, year: int | None, month: int | None) -> tuple[date | None, list[Any]]:
+def _report_rows(config: Any, project_name: str, year: int | None, month: int | None) -> tuple[date | None, list[Any]]:
     period = get_report_period_spending(project_name, year=year, month=month)
     report_month = period["report_month"]
     rows = period["rows"]
@@ -83,7 +83,7 @@ def _report_rows(config: dict[str, Any], project_name: str, year: int | None, mo
 
 
 def _build_tools(
-    config: dict[str, Any],
+    config: dict[str, Any] | ReportSettings,
     project_name: str,
     snapshot: Any,
     rows: list[Any],
@@ -92,6 +92,8 @@ def _build_tools(
     ollama_url: str,
     model_name: str,
 ) -> dict[str, ToolSpec]:
+    """The author's tools; memory_module is a MemoryStore (or any object with its methods) or None."""
+    settings = ReportSettings.coerce(config)
     selected_month = snapshot.latest_month
     previous_month = snapshot.previous_month
 
@@ -127,8 +129,8 @@ def _build_tools(
                 "get_semantic_memory requires a non-empty 'query'. Retry with a focused "
                 "natural-language query, or skip memory retrieval if none is needed."
             )
-        embedding_model = config.get("embedding_model_name", "nomic-embed-text")
-        timeout = int(config.get("ollama_timeout", 600))
+        embedding_model = settings.embedding_model_name
+        timeout = settings.ollama_timeout
         limit = min(10, max(1, int(arguments.get("limit", 5))))
         facts, retrieval = search_long_facts(
             query_text, memory_module, ollama_url, embedding_model, timeout, limit
@@ -187,32 +189,19 @@ def _build_tools(
     }
 
 
-DEFAULT_MAX_RUN_SECONDS = 2700
+def role_config_for(config: dict[str, Any] | ReportSettings, ollama_url: str | None, model_name: str | None) -> ReportSettings:
+    """Settings for build_model_client where the caller's Ollama URL and author model fill the legacy keys."""
+    return ReportSettings.coerce(config).with_model_overrides(ollama_url, model_name)
 
 
-def role_config_for(config: dict[str, Any], ollama_url: str | None, model_name: str | None) -> dict[str, Any]:
-    """Config for build_model_client where the caller's Ollama URL and author model fill the legacy keys."""
-    role_config = dict(config)
-    if model_name:
-        role_config["model_name"] = model_name
-    if ollama_url:
-        role_config["model_server_url"] = ollama_url
-    return role_config
-
-
-def _max_run_seconds(config: dict[str, Any]) -> float | None:
-    """Run time limit in seconds from config: default 2700 (45 minutes); 0 or null disables it."""
-    if "max_run_seconds" not in config:
-        return DEFAULT_MAX_RUN_SECONDS
-    value = config.get("max_run_seconds")
+def _required_amount(value: float | None, raw: Any, key: str) -> float:
     if value is None:
-        return None
-    seconds = float(value)
-    return seconds if seconds > 0 else None
+        raise ValueError(f"{key} is required for agent reports and must be an amount; got {raw!r}")
+    return value
 
 
 def generate_finance_report(
-    config: dict[str, Any],
+    config: dict[str, Any] | ReportSettings,
     project_name: str,
     ollama_url: str,
     model_name: str,
@@ -226,45 +215,35 @@ def generate_finance_report(
 ) -> FinanceReportResult:
     """Build and validate an HTML report for latest or explicitly selected finance month.
 
+    config is a config dict or ReportSettings; memory_module is a MemoryStore (or None).
     trace_listeners receive each harness trace event as it happens (for live progress).
     """
+    # The caller's model_name and ollama_url stand in for the legacy keys; model_roles (or
+    # model_name/validator_model_name/ollama_options) then pick each role's provider.
+    settings = role_config_for(config, ollama_url, model_name)
     if rows is None:
-        selected_report_month, rows = _report_rows(config, project_name, year, month)
+        selected_report_month, rows = _report_rows(settings, project_name, year, month)
     if not rows:
         raise ValueError("No finance data is available for the requested report month")
     snapshot = calculate_report_snapshot(
         rows,
-        monthly_deposit=parse_money(config.get("Monthly_budget")),
-        fixed_costs=parse_money(config.get("Fixed_costs")),
-        savings_goal=(
-            parse_money(config["Savings_goal_target"])
-            if config.get("Savings_goal_target") is not None
-            else None
-        ),
-        category_goals=config.get("category_goals", {}),
+        monthly_deposit=_required_amount(settings.monthly_budget, settings.monthly_budget_raw, "Monthly_budget"),
+        fixed_costs=_required_amount(settings.fixed_costs, settings.fixed_costs_raw, "Fixed_costs"),
+        savings_goal=settings.savings_goal_target,
+        category_goals=settings.category_goals,
     )
     if selected_report_month is not None and snapshot.latest_month != selected_report_month.isoformat():
         raise ValueError("Selected report month is missing from the fetched spending rows")
 
-    limits = HarnessLimits(
-        max_agent_rounds=int(config.get("max_agent_rounds", 6)),
-        max_tool_calls=int(config.get("max_tool_calls", 12)),
-        max_calls_per_tool=int(config.get("max_calls_per_tool", 3)),
-        max_validation_cycles=int(config.get("max_validation_cycles", 3)),
-        max_report_bytes=int(config.get("max_report_bytes", 250000)),
-        max_run_seconds=_max_run_seconds(config),
-    )
-    # model_roles (or the legacy model_name/validator_model_name/ollama_options keys) pick each role's
-    # provider; the caller's model_name and ollama_url stand in for the legacy keys.
-    role_config = role_config_for(config, ollama_url, model_name)
-    author_client = build_model_client(role_config, "author")
-    validator_client = build_model_client(role_config, "validator")
+    limits = HarnessLimits(**settings.limits())
+    author_client = build_model_client(settings, "author")
+    validator_client = build_model_client(settings, "validator")
     harness = ReportHarness(
         ollama_url=ollama_url,
         author_model=author_client.model,
         validator_model=validator_client.model,
         limits=limits,
-        timeout=int(config.get("ollama_timeout", 600)),
+        timeout=settings.ollama_timeout,
         author_client=author_client,
         validator_client=validator_client,
     )
@@ -274,7 +253,7 @@ def generate_finance_report(
     author_files = ["personality.system.md", "ui.system.md", "financial-settings.md"]
     prompt_context = "\n\n".join((prompt_dir / filename).read_text(encoding="utf-8") for filename in author_files)
     validator_context = (prompt_dir / "validator.system.md").read_text(encoding="utf-8")
-    tools = _build_tools(config, project_name, snapshot, rows, memory_module, thread_key, ollama_url, model_name)
+    tools = _build_tools(settings, project_name, snapshot, rows, memory_module, thread_key, ollama_url, model_name)
     selected_label = date.fromisoformat(snapshot.latest_month).strftime("%B %Y")
     started = time.perf_counter()
     trace = harness.trace

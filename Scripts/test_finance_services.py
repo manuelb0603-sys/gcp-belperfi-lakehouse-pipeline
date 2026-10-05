@@ -364,14 +364,14 @@ class TestSharedMemoryResolution(unittest.TestCase):
             self.assertEqual(settings.memory_db_path("finance_v2"), Path("C:/tmp/custom.sqlite3"))
 
     def test_qa_memory_uses_shared_resolution(self):
-        captured = []
         with (
             patch.dict(os.environ, {"MEMORY_DB_PATH": "C:/tmp/custom.sqlite3"}),
-            patch("finance.memory.init_db", side_effect=captured.append),
+            patch("finance.memory.MemoryStore.init_db") as init_db,
         ):
-            module = qa._memory_module({"memory_schema": "other"})
-        self.assertTrue(hasattr(module, "get_or_create_thread"))
-        self.assertEqual(Path(captured[0]), Path("C:/tmp/custom.sqlite3"))
+            store = qa._memory_module({"memory_schema": "other"})
+        self.assertTrue(hasattr(store, "get_or_create_thread"))
+        init_db.assert_called_once()
+        self.assertEqual(Path(store.db_path), Path("C:/tmp/custom.sqlite3"))
 
     def test_report_thread_key_matches_email_flow(self):
         self.assertEqual(settings.report_thread_key({"email_listings": ["a@x", "b@x"]}), "a@x, b@x")

@@ -12,22 +12,28 @@ from finance.bigquery_tools import get_report_period_spending, get_spending_year
 from finance.memory import open_memory
 from finance.qa import answer_finance_question as shared_answer_finance_question
 from finance.reporting import generate_finance_report
-from finance.settings import load_config, report_thread_key
+from finance.settings import (
+    APP_FALLBACK_MODEL_NAME,
+    APP_FALLBACK_MODEL_SERVER_URL,
+    ReportSettings,
+    load_config,
+    report_thread_key,
+)
 
 
 MONTHS = [(calendar.month_abbr[number], number) for number in range(1, 13)]
-CONFIG = load_config()
-PROJECT_NAME = CONFIG.get("project_name")
-OLLAMA_URL = CONFIG.get("model_server_url", "http://localhost:11434/api/generate")
-OLLAMA_MODEL = CONFIG.get("model_name", "gemma4:e4b")
+SETTINGS = ReportSettings.from_config(load_config())
+PROJECT_NAME = SETTINGS.project_name
+OLLAMA_URL = SETTINGS.model_server_url or APP_FALLBACK_MODEL_SERVER_URL
+OLLAMA_MODEL = SETTINGS.model_name or APP_FALLBACK_MODEL_NAME
 # Same thread key as the weekly email so the report's history tool sees the email reports.
-REPORT_THREAD_KEY = report_thread_key(CONFIG)
+REPORT_THREAD_KEY = report_thread_key(SETTINGS)
 
 
 def _open_app_memory() -> Any:
-    """Open the shared memory database; the app keeps working without memory if this fails."""
+    """Open the shared MemoryStore; the app keeps working without memory if this fails."""
     try:
-        return open_memory(CONFIG.get("memory_schema", "memory"))
+        return open_memory(SETTINGS.memory_schema)
     except Exception as exc:
         print(f"Memory unavailable; continuing without memory: {exc}")
         return None
@@ -83,7 +89,7 @@ def load_finance_summary(year: int | str | None, month: int) -> tuple[str, dict[
             return f"<div class='empty-state'><h3>No data for {label}</h3><p>Choose a different month.</p></div>", None, f"No gold-layer spending data found for {label}."
 
         result = generate_finance_report(
-            config=CONFIG,
+            config=SETTINGS,
             project_name=PROJECT_NAME,
             ollama_url=OLLAMA_URL,
             model_name=OLLAMA_MODEL,
@@ -121,7 +127,7 @@ def answer_finance_question(question: str, report_context: dict[str, Any] | None
             if key != "report_html" and key != "plain_text"
         },
         report_html=report_context.get("report_html", ""),
-        config=CONFIG,
+        config=SETTINGS,
         ollama_url=OLLAMA_URL,
         model_name=OLLAMA_MODEL,
         memory_module=MEMORY,

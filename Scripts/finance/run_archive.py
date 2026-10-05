@@ -6,10 +6,51 @@ import html
 import json
 import os
 import re
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from .settings import PROJECT_ROOT
+
+
+def _run_git(args: list[str], cwd: Path) -> str:
+    completed = subprocess.run(
+        ["git", *args], cwd=str(cwd), capture_output=True, text=True, timeout=10, check=True
+    )
+    return completed.stdout
+
+
+def git_code_version(cwd: Path | None = None, runner: Callable[[list[str], Path], str] = _run_git) -> dict[str, Any]:
+    """Short commit hash and dirty flag of the working tree; tolerates git being missing or failing.
+
+    Returns {"commit": "abc1234", "dirty": False}, or {"commit": None, "dirty": None, "error": ...}.
+    """
+    cwd = Path(cwd) if cwd is not None else PROJECT_ROOT
+    try:
+        commit = runner(["rev-parse", "--short", "HEAD"], cwd).strip() or None
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return {"commit": None, "dirty": None, "error": f"git unavailable: {type(exc).__name__}"}
+    try:
+        dirty: bool | None = bool(runner(["status", "--porcelain"], cwd).strip())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        dirty = None
+    return {"commit": commit, "dirty": dirty}
+
+
+def collect_run_metadata(settings: Any, code_version: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Run-start metadata for run.json/progress.json: code version, author/validator role settings, limits.
+
+    settings is a finance.settings.ReportSettings. Role settings hold provider, model, options,
+    think, and timeouts only; server URLs and credentials are never included.
+    """
+    return {
+        "code_version": code_version if code_version is not None else git_code_version(),
+        "author_role": settings.public_role("author"),
+        "validator_role": settings.public_role("validator"),
+        "harness_limits": settings.limits(),
+    }
 
 
 def save_run(root: Path, run_id: str, manifest: dict[str, Any], trace: list[dict[str, Any]], report_html: str, report_text: str, metrics: dict[str, Any]) -> Path:
@@ -298,7 +339,9 @@ class ProgressRecorder:
         echo: bool = True,
         author_provider: str = "ollama",
         validator_provider: str = "ollama",
+        metadata: dict[str, Any] | None = None,
     ) -> None:
+        """metadata (collect_run_metadata: code version, role settings, limits) is stored in progress.json."""
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.echo = echo
@@ -324,6 +367,8 @@ class ProgressRecorder:
             "stalled_validation_cycles": 0,
             "author_rebuttals": 0,
         }
+        if metadata:
+            self.state.update(metadata)
         self._write_progress()
         self.log(
             f"Run {run_id} started (author={model}, validator={validator_model})"

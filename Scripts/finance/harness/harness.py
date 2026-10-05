@@ -28,6 +28,7 @@ from .feedback import (
 )
 from .html_safety import sanitize_html
 from ..model_clients import ModelClient, OllamaClient
+from ..settings import DEFAULTS
 from .prompts import (
     MISSING_REPORT_HTML,
     PromptParts,
@@ -127,7 +128,7 @@ class ReportHarness:
         author_model: str | None = None,
         validator_model: str | None = None,
         limits: HarnessLimits | None = None,
-        timeout: int = 600,
+        timeout: int = DEFAULTS["ollama_timeout"],
         query: Callable[..., str] | None = None,
         model_options: dict[str, dict[str, Any]] | None = None,
         clock: Callable[[], float] = time.monotonic,

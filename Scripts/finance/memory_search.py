@@ -17,7 +17,10 @@ def search_long_facts(
     backfill_limit: int = 1000,
     batch_size: int = 64,
 ) -> tuple[list[dict[str, Any]], str]:
-    """Hybrid-search facts; lazily batch missing/mismatched embeddings and fall back to BM25."""
+    """Hybrid-search facts; lazily batch missing/mismatched embeddings and fall back to BM25.
+
+    memory_module is a finance.memory.MemoryStore or any object with the same methods.
+    """
     if not query_text or len(query_text) > 2000:
         raise ValueError("Long-fact query must contain between 1 and 2000 characters")
     limit = min(10, max(1, int(limit)))

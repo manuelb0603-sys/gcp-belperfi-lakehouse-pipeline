@@ -11,8 +11,8 @@ import traceback
 from typing import Any
 
 from finance.ollama import embed_text, generate_text
+from finance.settings import ReportSettings
 from finance.settings import load_config as _shared_load_config
-from finance.settings import memory_db_path
 from finance.settings import parse_money
 
 
@@ -126,8 +126,9 @@ def _memory_context_to_prompt(memory_module: Any, receiver_header: str, sender: 
     return "\n".join(lines)
 
 
-def build_ollama_prompt(config: dict, data_payload: str, memory_context: str | None = None) -> str:
+def build_ollama_prompt(config: dict | ReportSettings, data_payload: str, memory_context: str | None = None) -> str:
     """Compose the final prompt so the model knows the objective, constraints, and data sources."""
+    settings = ReportSettings.coerce(config)
     memory_context = memory_context or ""
     return f"""System: You are Mogumogu-chan, a warm, lively personal-finance assistant. Open with a friendly greeting addressed to the reader, use natural Japanese food imagery and a few fitting food emoji (such as 🍡, 🍙, 🍵, 🍣, 🌸), and close with kind encouragement. Keep the personality personable, not childish; financial facts must stay clear and accurate.
 Create a consistent, readable HTML email using Material 3-inspired hierarchy and spacing without making it a generic gray/blue dashboard. Center one content column (about 640 px wide) on a clearly visible pale blush-pink page background (such as #FFF1F5) with a white or near-white report surface. Use dark warm charcoal or berry text and bright rose/hot-pink/coral as the primary accents; avoid dominant purple/plum tones. Carry pink through section markers, the hero, and all snapshot bars. Use one coordinated family of rose shades for positive-spend bars, never green for Needs or peach for Wants. In every chart row, align category labels left, place a proportional bar in the middle, and put the exact currency amount in a fixed-width right-aligned column sharing one right edge. Scale all positive bars against the same maximum category spend across all groups; handle negative/refund categories separately. Maintain the established 8 px spacing rhythm and readable type sizes. Keep secondary data grouped and scannable, but do not omit any required section or metric for compactness. Avoid clutter, tiny text, repeated heavy shadows, nested cards, and excessive emoji. Reserve green/red for financial direction and label trends in words. Tables should have comfortable padding, subtle separators, and clearly aligned numbers. Keep contrast strong and use email-safe HTML/inline styles.
@@ -144,10 +145,10 @@ Instructions:
 - Do not include markdown or code blocks in the output. The output should be a polished HTML email body with clear sections and a warm, encouraging tone.
 
 Context:
-- Monthly deposit: {config.get('Monthly_budget')}.
-- Monthly Fixed costs: {config.get('Fixed_costs')}.
-- Vehicles: {config.get('Vehicle_Info')}.
-- Authoritative numeric monthly savings target: {config.get('Savings_goal_target', 'not configured')}.
+- Monthly deposit: {settings.monthly_budget_raw}.
+- Monthly Fixed costs: {settings.fixed_costs_raw}.
+- Vehicles: {settings.vehicle_info}.
+- Authoritative numeric monthly savings target: {settings.savings_goal_target_raw}.
 - This is a follow-up report; the recipient already knows the recurring details.
 {memory_context}
 Include these sections in this exact order; do not omit them:
@@ -213,13 +214,13 @@ def send_email(sender: str, receivers: list[str], password: str, msg_root: MIMEM
 
 
 def _init_memory_module(memory_schema: str = "memory"):
-    """Load the SQLite-backed memory module for the selected schema (MEMORY_DB_PATH overrides it)."""
+    """Open the SQLite MemoryStore for the selected schema (MEMORY_DB_PATH overrides it); None on failure."""
     try:
         from finance.memory import open_memory
 
-        module = open_memory(memory_schema)
-        log_status(f"Using memory schema '{memory_schema}' at {memory_db_path(memory_schema)}")
-        return module
+        store = open_memory(memory_schema)
+        log_status(f"Using memory schema '{memory_schema}' at {store.db_path}")
+        return store
     except Exception as exc:
         print(f"Memory initialization failed: {exc}")
         return None
@@ -251,8 +252,10 @@ def _ollama_embedding(text: str, ollama_url: str, model_name: str, timeout: int 
     return embed_text(text, ollama_url, model_name, timeout)
 
 
-def _remember_report(memory_module: Any, sender: str, receivers: list[str], receiver_header: str, prompt: str, report_text: str, model_name: str, ollama_url: str, config: dict, report_plain_text: str | None = None) -> None:
-    """Persist the report in short-term memory and extract reusable long facts for future runs.
+def _remember_report(memory_module: Any, sender: str, receivers: list[str], receiver_header: str, prompt: str, report_text: str, model_name: str, ollama_url: str, config: dict | ReportSettings, report_plain_text: str | None = None) -> None:
+    """Persist the report in the memory store and extract reusable long facts for future runs.
+
+    memory_module is a MemoryStore (or None to skip); config is a config dict or ReportSettings.
 
     report_text is the report HTML. When report_plain_text is supplied (agent mode), it is
     stored as the readable text and used for fact extraction instead of raw HTML.
@@ -279,9 +282,10 @@ def _remember_report(memory_module: Any, sender: str, receivers: list[str], rece
         )
         log_status(f"Saved short-term memory row with thread id={thread_id}, short_term id={st_id}")
 
-        fact_model = config.get("fact_model_name", model_name)
-        embedding_model = config.get("embedding_model_name", "nomic-embed-text")
-        embedding_timeout = int(config.get("ollama_timeout", 600))
+        settings = ReportSettings.coerce(config)
+        fact_model = settings.fact_model_name or model_name
+        embedding_model = settings.embedding_model_name
+        embedding_timeout = settings.ollama_timeout
         fact_prompt = (
             f"Extract a JSON array of concise facts from the following {'plain-text' if has_plain_text else 'HTML'} report. "
             "Each item must be an object with keys 'fact_key', 'fact_text', and optional 'weight'.\n\n"
@@ -331,6 +335,7 @@ def _start_progress(
     validator_model: str,
     author_provider: str = "ollama",
     validator_provider: str = "ollama",
+    metadata: dict[str, Any] | None = None,
 ) -> Any:
     """Create the run directory and live progress files up front; a failure only disables them."""
     from run_archive import ProgressRecorder, update_index
@@ -339,6 +344,7 @@ def _start_progress(
         progress = ProgressRecorder(
             archive_root / run_id, run_id, model_name, validator_model,
             author_provider=author_provider, validator_provider=validator_provider,
+            metadata=metadata,
         )
         update_index(archive_root)
         log_status(f"Live run progress: {progress.run_dir / 'progress.log'}")
@@ -349,7 +355,7 @@ def _start_progress(
 
 
 def run_agent_weekly_report(
-    config: dict,
+    config: dict | ReportSettings,
     results: list,
     memory_module: Any,
     sender: str,
@@ -362,27 +368,30 @@ def run_agent_weekly_report(
     memory_schema: str,
 ) -> None:
     """Generate the latest-month agent report, archive it, and handle email delivery."""
-    from finance.model_clients import resolve_model_role
     from finance.reporting import generate_finance_report, role_config_for
-    from run_archive import save_run
+    from run_archive import collect_run_metadata, save_run
 
     started = time.perf_counter()
     thread_key = receiver_header or sender or "email:unknown"
     # Provider and model per role (model_roles, else the legacy model_name/validator_model_name keys).
-    role_config = role_config_for(config, ollama_url, model_name)
-    author_role = resolve_model_role(role_config, "author")
-    validator_role = resolve_model_role(role_config, "validator")
+    settings = role_config_for(config, ollama_url, model_name)
+    author_role = settings.role("author")
+    validator_role = settings.role("validator")
+    # Code version, role settings, and limits recorded at start so run comparisons can tell
+    # code changes from model changes (never secrets or server addresses).
+    run_metadata = collect_run_metadata(settings)
     author_model = str(author_role["model"])
     validator_model = str(validator_role["model"])
     archive_root = RUN_ARCHIVE_ROOT
     # One run directory is created at start so progress can be watched while the run executes.
     run_id = datetime.now().strftime("%Y%m%dT%H%M%S") + f"_{author_model.replace(':', '_')}"
     progress = _start_progress(
-        archive_root, run_id, author_model, validator_model, author_role["provider"], validator_role["provider"]
+        archive_root, run_id, author_model, validator_model, author_role["provider"], validator_role["provider"],
+        metadata=run_metadata,
     )
     try:
         result = generate_finance_report(
-            config=config,
+            config=settings,
             project_name=project_name,
             ollama_url=ollama_url,
             model_name=model_name,
@@ -436,6 +445,7 @@ def run_agent_weekly_report(
                 "status": "exception",
                 "exception_type": type(exc).__name__,
                 "error": str(exc),
+                **run_metadata,
                 "snapshot": failed_snapshot.to_dict() if failed_snapshot is not None else None,
             },
             events,
@@ -453,6 +463,7 @@ def run_agent_weekly_report(
             "run_id": run_id,
             "mode": "agent",
             "status": result.metrics["status"],
+            **run_metadata,
             "snapshot": result.snapshot.to_dict(),
         },
         result.trace.events,
@@ -466,7 +477,7 @@ def run_agent_weekly_report(
         if progress is not None:
             progress.finish(result.metrics["status"], delivery="not_sent")
         return
-    if config.get("dry_run", False):
+    if settings.dry_run:
         print("Dry run enabled; report was rendered and archived but not sent.")
         if progress is not None:
             progress.finish(result.metrics["status"], delivery="dry_run")
@@ -493,6 +504,7 @@ def run_agent_weekly_report(
                 "run_id": run_id,
                 "mode": "agent",
                 "status": "delivery_failed",
+                **run_metadata,
                 "snapshot": result.snapshot.to_dict(),
                 "error": str(exc),
             },
@@ -517,7 +529,7 @@ def run_agent_weekly_report(
         result.report_html,
         model_name,
         ollama_url,
-        config,
+        settings,
         report_plain_text=result.plain_text,
     )
     log_status(f"Shared finance report and email workflow complete in {time.perf_counter() - started:.1f}s")
@@ -532,27 +544,24 @@ def run_weekly_report(config_path: Path | None = None) -> None:
         config_path = Path(__file__).resolve().parent.parent / "config.json"
 
     try:
-        config = load_config(config_path)
+        settings = ReportSettings.from_config(load_config(config_path))
         log_status(f"Loaded config from {config_path}")
     except Exception as exc:
         print(f"Failed to load config: {exc}")
         return
 
-    # Memory module is optional; initialize lazily if present
-    memory = None
-
-    receivers = config.get("email_listings", [])
-    sender = config.get("email_sender")
+    receivers = settings.email_listings
+    sender = settings.email_sender
     receiver_header = ", ".join(receivers)
-    password = config.get("Gmail_app_credentials")
-    project_name = config.get("project_name")
-    ollama_url = config.get("model_server_url")
-    model_name = config.get("model_name")
-    days_back = config.get("days_back", 60)
-    ollama_stream = config.get("ollama_stream", False)
-    ollama_timeout = int(config.get("ollama_timeout", 600))
-    memory_schema = config.get("memory_schema", "memory")
-    report_mode = config.get("report_mode", "legacy").lower()
+    password = settings.gmail_app_credentials
+    project_name = settings.project_name
+    ollama_url = settings.model_server_url
+    model_name = settings.model_name
+    days_back = settings.days_back
+    ollama_stream = settings.ollama_stream
+    ollama_timeout = settings.ollama_timeout
+    memory_schema = settings.memory_schema
+    report_mode = settings.report_mode
 
     if not receivers:
         print("No email recipients configured in email_listings.")
@@ -573,7 +582,7 @@ def run_weekly_report(config_path: Path | None = None) -> None:
         # The shared report service resolves the latest month directly; do not constrain
         # the email run to the legacy rolling days_back window.
         run_agent_weekly_report(
-            config, [], memory_module, sender, receivers, receiver_header,
+            settings, [], memory_module, sender, receivers, receiver_header,
             password, project_name, ollama_url, model_name, memory_schema,
         )
         return
@@ -593,7 +602,7 @@ def run_weekly_report(config_path: Path | None = None) -> None:
     log_status("Building memory context and prompt")
     memory_context = _memory_context_to_prompt(memory_module, receiver_header, sender)
     data_payload = format_data_payload(results)
-    prompt = build_ollama_prompt(config, data_payload, memory_context=memory_context)
+    prompt = build_ollama_prompt(settings, data_payload, memory_context=memory_context)
 
     try:
         log_status(f"Generating report with Ollama model '{model_name}' using timeout={ollama_timeout}s")
@@ -620,7 +629,7 @@ def run_weekly_report(config_path: Path | None = None) -> None:
     memory_module = _init_memory_module(memory_schema)
     if memory_module is not None:
         log_status("Saving report to long/short-term memory")
-        _remember_report(memory_module, sender, receivers, receiver_header, prompt, report_text, model_name, ollama_url, config)
+        _remember_report(memory_module, sender, receivers, receiver_header, prompt, report_text, model_name, ollama_url, settings)
         log_status("Memory persistence complete")
 
     total_elapsed = time.perf_counter() - start_time

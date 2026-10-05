@@ -13,6 +13,7 @@ from typing import Any
 from .html_text import html_to_text
 from .memory_search import search_long_facts
 from .ollama import embed_text, embed_texts, generate_text
+from .settings import ReportSettings
 
 
 def _html_to_text(markup: str) -> str:
@@ -99,33 +100,37 @@ class ReportContextIndex:
 _REPORT_INDEX = ReportContextIndex()
 
 
-def _memory_module(config: dict[str, Any]):
-    """Initialize the shared SQLite memory (MEMORY_DB_PATH or the configured schema)."""
+def _memory_module(config: dict[str, Any] | ReportSettings):
+    """Open the shared SQLite MemoryStore (MEMORY_DB_PATH or the configured schema)."""
     from .memory import open_memory
 
-    return open_memory(config.get("memory_schema", "memory"))
+    return open_memory(ReportSettings.coerce(config).memory_schema)
 
 
 def answer_finance_question(
     question: str,
     report_context: dict[str, Any] | None,
     report_html: str,
-    config: dict[str, Any],
+    config: dict[str, Any] | ReportSettings,
     ollama_url: str,
     model_name: str,
     memory_module: Any = None,
 ) -> str:
-    """Retrieve selected-report evidence and historical long facts, answer, then remember QA."""
+    """Retrieve selected-report evidence and historical long facts, answer, then remember QA.
+
+    config is a config dict or ReportSettings; memory_module is a MemoryStore (opened when None).
+    """
     question = (question or "").strip()
     if not question:
         return "Enter a question about the selected financial summary."
     if not report_context:
         return "Load a year and month summary before asking a question."
 
-    timeout = int(config.get("ollama_timeout", 600))
-    embedding_model = config.get("embedding_model_name", "nomic-embed-text")
-    report_limit = min(8, max(1, int(config.get("qa_report_context_chunks", 5))))
-    memory_limit = min(10, max(1, int(config.get("qa_long_fact_limit", 5))))
+    settings = ReportSettings.coerce(config)
+    timeout = settings.ollama_timeout
+    embedding_model = settings.embedding_model_name
+    report_limit = min(8, max(1, settings.qa_report_context_chunks))
+    memory_limit = min(10, max(1, settings.qa_long_fact_limit))
     try:
         report_passages = _REPORT_INDEX.search(
             question,
@@ -144,7 +149,7 @@ def answer_finance_question(
 
     if memory_module is None:
         try:
-            memory_module = _memory_module(config)
+            memory_module = _memory_module(settings)
         except Exception as exc:
             print(f"Finance memory unavailable; answering without it: {exc}")
     try:
@@ -181,7 +186,7 @@ USER QUESTION:
 
     try:
         selected_period = str(report_context.get("selected_month", "unknown"))
-        thread_key = f"finance-qa:{config.get('memory_schema', 'memory')}"
+        thread_key = f"finance-qa:{settings.memory_schema}"
         thread_id = memory_module.get_or_create_thread("finance_qa", thread_key)
         memory_module.save_short_term(
             thread_internal_id=thread_id,

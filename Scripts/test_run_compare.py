@@ -107,6 +107,109 @@ def _good_reply():
     )
 
 
+class RunMetadataTests(unittest.TestCase):
+    def test_git_code_version_reports_commit_and_dirty_flag(self):
+        from finance.run_archive import git_code_version
+
+        outputs = {"rev-parse": "abc1234\n", "status": " M Scripts/x.py\n"}
+        version = git_code_version(Path("."), runner=lambda args, cwd: outputs[args[0]])
+        self.assertEqual(version, {"commit": "abc1234", "dirty": True})
+        clean = git_code_version(Path("."), runner=lambda args, cwd: "abc1234\n" if args[0] == "rev-parse" else "")
+        self.assertEqual(clean, {"commit": "abc1234", "dirty": False})
+
+    def test_git_code_version_tolerates_missing_git(self):
+        from finance.run_archive import git_code_version
+
+        def missing(args, cwd):
+            raise FileNotFoundError("git")
+
+        version = git_code_version(Path("."), runner=missing)
+        self.assertIsNone(version["commit"])
+        self.assertIsNone(version["dirty"])
+        self.assertIn("FileNotFoundError", version["error"])
+
+    def test_collect_run_metadata_has_roles_and_limits_without_secrets(self):
+        from finance.run_archive import collect_run_metadata
+        from finance.settings import ReportSettings
+
+        settings = ReportSettings.from_config({
+            "model_server_url": "http://private-host:11434", "Gmail_app_credentials": "app-password",
+            "max_validation_cycles": 5,
+            "model_roles": {
+                "author": {"provider": "ollama", "model": "gemma4:e4b", "options": {"num_ctx": 32768}},
+                "validator": {"provider": "ollama", "model": "gemma4:12b", "think": False, "options": {"num_predict": 4000}},
+            },
+        })
+        meta = collect_run_metadata(settings, code_version={"commit": "abc1234", "dirty": False})
+        self.assertEqual(meta["code_version"], {"commit": "abc1234", "dirty": False})
+        self.assertEqual(meta["author_role"]["model"], "gemma4:e4b")
+        self.assertEqual(meta["validator_role"]["options"], {"num_predict": 4000})
+        self.assertIs(meta["validator_role"]["think"], False)
+        self.assertEqual(meta["harness_limits"]["max_validation_cycles"], 5)
+        text = json.dumps(meta)
+        self.assertNotIn("private-host", text)
+        self.assertNotIn("app-password", text)
+
+    def test_email_run_records_metadata_at_start_and_in_manifest(self):
+        from contextlib import redirect_stdout as quiet
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import email_weekly_report as weekly
+        from finance.agent_harness import RunTrace
+
+        seen_at_start = {}
+
+        def generate(**kwargs):
+            run_dir = next(Path(temp_dir).iterdir())
+            seen_at_start.update(json.loads((run_dir / "progress.json").read_text(encoding="utf-8")))
+            trace = RunTrace(listeners=kwargs["trace_listeners"])
+            trace.add("run_completed", decision="pass", tool_calls=0)
+            return SimpleNamespace(passed=True, metrics={"status": "validated"}, snapshot=SimpleNamespace(to_dict=lambda: {}),
+                                   trace=trace, report_html="<p>r</p>", plain_text="r")
+
+        config = {"dry_run": True, "model_roles": {"validator": {"provider": "ollama", "model": "gemma4:12b", "think": False}}}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(weekly, "RUN_ARCHIVE_ROOT", Path(temp_dir)),
+                patch("finance.reporting.generate_finance_report", side_effect=generate),
+                patch("finance.run_archive.git_code_version", return_value={"commit": "abc1234", "dirty": True}),
+                patch.object(weekly, "send_email") as send_email,
+                quiet(io.StringIO()),
+            ):
+                weekly.run_agent_weekly_report(config, [], None, "s", ["r"], "r", "pw", "project", "http://host:11434", "gemma4:e4b", "memory")
+            send_email.assert_not_called()
+            run_dir = next(path for path in Path(temp_dir).iterdir() if path.is_dir())
+            manifest = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+            summary = run_compare.gather_run(run_dir)
+        for source in (seen_at_start, manifest):
+            self.assertEqual(source["code_version"], {"commit": "abc1234", "dirty": True})
+            self.assertEqual(source["author_role"]["model"], "gemma4:e4b")
+            self.assertEqual(source["validator_role"]["model"], "gemma4:12b")
+            self.assertIs(source["validator_role"]["think"], False)
+            self.assertEqual(source["harness_limits"]["max_validation_cycles"], 3)
+            self.assertNotIn("http://host", json.dumps(source["author_role"]))
+        self.assertNotIn("pw", json.dumps({key: manifest[key] for key in ("author_role", "validator_role", "harness_limits")}))
+        self.assertEqual(summary["code_version"], {"commit": "abc1234", "dirty": True})
+        self.assertEqual(summary["options"]["validator_role"]["model"], "gemma4:12b")
+        self.assertEqual(summary["limits"]["max_validation_cycles"], 3)
+
+    def test_compare_prompt_includes_code_version_and_instruction(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            new = make_new_run(root, "20261005T180000_a")
+            manifest = json.loads((new / "run.json").read_text(encoding="utf-8"))
+            manifest["code_version"] = {"commit": "abc1234", "dirty": False}
+            _write_json(new / "run.json", manifest)
+            make_new_run(root, "20261005T190000_b")
+            system, user = run_compare.build_prompt(run_compare.gather_runs(run_compare.resolve_runs(["20261005T180000_a", "20261005T190000_b"], root)))
+        self.assertIn("code_version", system)
+        self.assertIn("code or prompt changes rather than the models", system)
+        data = json.loads(user.split("RUN DATA (JSON):\n", 1)[1])
+        self.assertEqual(data["runs"][0]["code_version"], {"commit": "abc1234", "dirty": False})
+        self.assertEqual(data["runs"][1]["code_version"], "not recorded")
+
+
 class RunIndexTests(unittest.TestCase):
     def test_index_has_number_start_end_for_new_and_old_runs(self):
         with tempfile.TemporaryDirectory() as temp_dir:

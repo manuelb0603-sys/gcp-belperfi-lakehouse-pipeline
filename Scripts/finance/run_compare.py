@@ -19,9 +19,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .model_clients import ModelClient, ModelReply, build_model_client, resolve_model_role
+from .model_clients import ModelClient, ModelReply, build_model_client
 from .run_archive import COMPARISONS_DIR, INDEX_STYLE, format_local, run_times, update_index
-from .settings import PROJECT_ROOT, load_config
+from .settings import PROJECT_ROOT, ReportSettings, load_config
 
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "agent" / "runs"
 MAX_RUNS = 10
@@ -64,7 +64,7 @@ OPTION_KEYS = ("author_options", "validator_options", "ollama_options", "model_r
 
 SYSTEM_PROMPT = """You are an evaluation analyst for a personal-finance report pipeline. Each run is one attempt by an AUTHOR model to write an HTML finance report from a deterministic snapshot, reviewed by a VALIDATOR model in up to max_validation_cycles cycles. A run passes when the validator returns decision "pass"; on a fail the author revises using the top validator errors. Runs can also stop on model failures, timeouts, the run deadline (max_run_seconds), or exhausted author rounds.
 
-You receive JSON describing several runs: timings, models and options, outcome metrics, per-cycle validator decisions with each error finding (category, message, evidence), notable events (stalls, rebuttals, retries, deadline stops, exceptions), per-role model-call statistics (tokens, seconds, done_reason "length" = output token limit hit), and a short excerpt of the final report text (head and tail).
+You receive JSON describing several runs: timings, code version (git commit and whether the working tree had uncommitted changes), models and options, outcome metrics, per-cycle validator decisions with each error finding (category, message, evidence), notable events (stalls, rebuttals, retries, deadline stops, exceptions), per-role model-call statistics (tokens, seconds, done_reason "length" = output token limit hit), and a short excerpt of the final report text (head and tail).
 
 Write a clear comparison in GitHub-flavored Markdown with these sections:
 1. ## Summary: which run/setup performed best and why, in 3-5 sentences.
@@ -73,6 +73,8 @@ Write a clear comparison in GitHub-flavored Markdown with these sections:
 4. ## Validator findings: whether the error findings look genuine or false positives. Judge from the finding's evidence text versus the report excerpt and the other findings; say when the excerpt is too short to decide. Note findings repeated unchanged across cycles.
 5. ## Author vs validator models: assess each model in its role across the runs.
 6. ## Recommendations: concrete, prioritized changes (model choice per role, options such as think / num_predict / num_ctx / timeouts, prompt or validator-instruction changes).
+
+Before attributing a difference in outcome to the models, compare the runs' code_version: runs on different commits, or with dirty=true, may differ because of code or prompt changes rather than the models, so say so and weigh model conclusions accordingly (a missing code_version is "not recorded").
 
 Rules: cite run ids and the numbers exactly as given in the data; never invent metrics, models, or events that are not in the data; say "not recorded" when something is missing. Keep it concise (about 600-1200 words). Do not reproduce the report text beyond short quotes. Output only the Markdown."""
 
@@ -241,14 +243,21 @@ def load_run(run_dir: Path) -> dict[str, Any]:
         if event.get("event") == "tool_call":
             tools[str(event.get("name"))] = tools.get(str(event.get("name")), 0) + 1
 
+    code_version = next(
+        (source["code_version"] for source in (manifest, progress) if isinstance(source.get("code_version"), dict)),
+        None,
+    )
+    limits = started.get("limits") or manifest.get("harness_limits") or progress.get("harness_limits")
+
     return {
         "run_id": run_dir.name,
         "start": format_local(times["start"]),
         "end": "running" if times["running"] else format_local(times["end"]),
         "duration_seconds": times["duration_seconds"],
+        "code_version": code_version,
         "models": models,
         "options": options,
-        "limits": started.get("limits"),
+        "limits": limits,
         "deadline_seconds": started.get("deadline_seconds"),
         "outcome": outcome,
         "cycles": cycles,
@@ -326,6 +335,7 @@ def render_run(raw: dict[str, Any], level: int = 0) -> dict[str, Any]:
         "start": raw["start"],
         "end": raw["end"],
         "duration_seconds": raw["duration_seconds"],
+        "code_version": raw.get("code_version") or "not recorded",
         "models": raw["models"],
     }
     if raw["options"]:
@@ -636,7 +646,7 @@ def _output_paths(folder: Path, created: datetime, run_count: int) -> tuple[Path
 def compare_runs(
     run_ids: list[str],
     *,
-    config: dict[str, Any],
+    config: dict[str, Any] | ReportSettings,
     runs_root: Path = DEFAULT_RUNS_ROOT,
     client: ModelClient | None = None,
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
@@ -646,12 +656,13 @@ def compare_runs(
 
     Raises CompareError (nothing saved) when a run is unknown or the model fails or refuses.
     """
+    settings = ReportSettings.coerce(config)
     folders = resolve_runs(run_ids, runs_root)
     runs = gather_runs(folders)
     system, user = build_prompt(runs)
     if client is None:
-        client = build_model_client(config, "eval")
-    spec = resolve_model_role(config, "eval")
+        client = build_model_client(settings, "eval")
+    spec = settings.role("eval")
     provider = getattr(client, "provider", spec.get("provider"))
     model = getattr(client, "model", spec.get("model"))
     echo(f"Comparing {len(folders)} runs with {provider}:{model} ({len(system) + len(user):,} prompt characters)...")
@@ -731,8 +742,7 @@ def main(argv: list[str] | None = None, *, client: ModelClient | None = None, ru
             total = len(system) + len(user)
             line = f"Prompt: {total:,} characters (system {len(system):,}, user {len(user):,}), about {total // 4:,} tokens."
             try:
-                config = load_config(_resolve_config_path(args.config))
-                spec = resolve_model_role(config, "eval")
+                spec = ReportSettings.from_config(load_config(_resolve_config_path(args.config))).role("eval")
                 line += f" Eval model: {spec['provider']}:{spec['model']}."
                 if spec["provider"] == "anthropic":
                     max_cost = estimate_cost("anthropic", spec["model"], total // 4, spec.get("max_tokens"))
@@ -743,11 +753,10 @@ def main(argv: list[str] | None = None, *, client: ModelClient | None = None, ru
             print(line)
             print("No model call was made.")
             return 0
-        config = load_config(_resolve_config_path(args.config))
-        spec = resolve_model_role(config, "eval")
-        if spec["provider"] == "anthropic":
+        settings = ReportSettings.from_config(load_config(_resolve_config_path(args.config)))
+        if settings.role("eval")["provider"] == "anthropic":
             print("Note: run summaries (findings, metrics, report excerpts) are sent to the Claude API.")
-        output = compare_runs([folder.name for folder in folders], config=config, runs_root=root, client=client)
+        output = compare_runs([folder.name for folder in folders], config=settings, runs_root=root, client=client)
     except CompareError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2

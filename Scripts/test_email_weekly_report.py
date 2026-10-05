@@ -108,19 +108,19 @@ class TestAgentRunFailureArchive(unittest.TestCase):
 
 class TestMemoryPath(unittest.TestCase):
     def test_memory_db_path_environment_override(self):
-        captured = []
         with (
             patch.dict(os.environ, {"MEMORY_DB_PATH": "C:/tmp/custom.sqlite3"}),
-            patch("finance.memory.init_db", side_effect=captured.append),
+            patch("finance.memory.MemoryStore.init_db") as init_db,
             patch.object(weekly, "log_status"),
         ):
-            module = weekly._init_memory_module("memory")
+            store = weekly._init_memory_module("memory")
 
-        self.assertIsNotNone(module)
-        self.assertEqual(Path(captured[0]), Path("C:/tmp/custom.sqlite3"))
+        self.assertIsNotNone(store)
+        init_db.assert_called_once()
+        self.assertEqual(Path(store.db_path), Path("C:/tmp/custom.sqlite3"))
 
     def test_memory_init_failure_returns_none(self):
-        with patch("finance.memory.init_db", side_effect=OSError("locked")):
+        with patch("finance.memory.MemoryStore.init_db", side_effect=OSError("locked")):
             self.assertIsNone(weekly._init_memory_module("memory"))
 
 

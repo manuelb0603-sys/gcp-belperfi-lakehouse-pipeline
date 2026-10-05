@@ -136,6 +136,62 @@ class TestLongFactVectorMemory(unittest.TestCase):
         self.assertEqual(memory.search_long_facts_bm25("what is it"), [])
 
 
+class TestMemoryStore(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_two_stores_are_independent(self):
+        from finance.memory import MemoryStore
+
+        first = MemoryStore(self.root / "a.sqlite3")
+        second = MemoryStore(self.root / "b.sqlite3")
+        first.init_db()
+        second.init_db()
+        thread = first.get_or_create_thread("email", "a@example.com")
+        first.save_short_term(thread, "s", "sender", "p", "<p>h</p>", "t")
+        first.upsert_long_fact("goal", "Save for travel")
+
+        self.assertEqual(len(first.get_short_term(thread)), 1)
+        self.assertEqual(second.get_short_term(thread), [])
+        self.assertEqual([fact["fact_key"] for fact in first.search_long_facts_bm25("travel")], ["goal"])
+        self.assertEqual(second.get_long_facts(), [])
+
+    def test_timestamps_keep_naive_iso_z_format(self):
+        from finance.memory import MemoryStore
+
+        store = MemoryStore(self.root / "m.sqlite3")
+        store.init_db()
+        thread = store.get_or_create_thread("email", "a@example.com")
+        store.save_short_term(thread, "s", "sender", "p", None, "t")
+        created = store.get_short_term(thread)[0]["created_at"]
+        self.assertRegex(created, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
+
+    def test_open_memory_returns_initialized_store_at_resolved_path(self):
+        import os
+
+        from finance.memory import MemoryStore, open_memory
+
+        db_path = self.root / "custom.sqlite3"
+        with patch.dict(os.environ, {"MEMORY_DB_PATH": str(db_path)}):
+            store = open_memory("ignored_schema")
+        self.assertIsInstance(store, MemoryStore)
+        self.assertEqual(Path(store.db_path), db_path)
+        self.assertTrue(db_path.exists())
+
+    def test_module_functions_delegate_to_default_store(self):
+        from finance import memory as finance_memory
+
+        db_path = str(self.root / "default.sqlite3")
+        self.assertEqual(memory.init_db(db_path), db_path)
+        self.assertEqual(finance_memory.default_store().db_path, db_path)
+        memory.upsert_long_fact("k", "v")
+        self.assertEqual(finance_memory.default_store().get_long_facts()[0]["fact_key"], "k")
+
+
 class TestOllamaEmbeddingClient(unittest.TestCase):
     def test_embedding_uses_ollama_embed_endpoint(self):
         class FakeResponse:

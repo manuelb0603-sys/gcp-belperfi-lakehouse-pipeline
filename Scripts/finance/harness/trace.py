@@ -6,6 +6,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from ..settings import DEFAULTS
+
 
 ToolFunction = Callable[[dict[str, Any]], dict[str, Any]]
 
@@ -24,14 +26,14 @@ class ToolSpec:
 class HarnessLimits:
     # These limits keep the agent bounded: it can investigate enough to produce a good
     # report, but it cannot loop forever or consume unbounded tokens or data.
-    max_agent_rounds: int = 6
-    max_tool_calls: int = 12
-    max_calls_per_tool: int = 3
+    max_agent_rounds: int = DEFAULTS["max_agent_rounds"]
+    max_tool_calls: int = DEFAULTS["max_tool_calls"]
+    max_calls_per_tool: int = DEFAULTS["max_calls_per_tool"]
     # Total validator reviews (validation cycles) allowed, so at most this value - 1 revisions; values < 1 mean 1.
-    max_validation_cycles: int = 3
-    max_report_bytes: int = 250_000
+    max_validation_cycles: int = DEFAULTS["max_validation_cycles"]
+    max_report_bytes: int = DEFAULTS["max_report_bytes"]
     # Wall-clock budget for the whole run in seconds; None or <= 0 disables the deadline.
-    max_run_seconds: float | None = 2700
+    max_run_seconds: float | None = DEFAULTS["max_run_seconds"]
 
 
 @dataclass
