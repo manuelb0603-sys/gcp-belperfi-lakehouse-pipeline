@@ -332,6 +332,26 @@ AUTHOR_PROTOCOL = (
     "escape its quotes. Do not add a plain-text version; it is derived from the HTML."
 )
 
+# Snapshot-derived, month-specific checklist (finance/report_requirements.py) shown to both models.
+REQUIREMENTS_HEADER = (
+    "REPORT REQUIREMENTS CHECKLIST (derived from the authoritative snapshot; every item is mandatory)"
+)
+VALIDATOR_CHECKLIST_INSTRUCTION = (
+    "Check every checklist item above explicitly against the report. List each failed item (for example a renamed "
+    "or missing required heading, a wrong value, or a missing disclosure) as an error finding whose evidence quotes "
+    "the report verbatim (or names the section searched when it is missing) and cites the checklist item."
+)
+
+
+def requirements_block(requirements: list[str] | None, for_validator: bool = False) -> str:
+    """Render the checklist prompt block, or an empty string when no requirements were supplied."""
+    if not requirements:
+        return ""
+    block = f"{REQUIREMENTS_HEADER}:\n" + "\n".join(f"- {line}" for line in requirements) + "\n\n"
+    if for_validator:
+        block += f"{VALIDATOR_CHECKLIST_INSTRUCTION}\n\n"
+    return block
+
 
 class ModelReply(str):
     """Model text plus Ollama generation metadata; behaves as a plain string for parsing."""
@@ -1018,8 +1038,13 @@ class ReportHarness:
         prompt_context: str,
         tools: dict[str, ToolSpec],
         validator_context: str = "",
+        report_requirements: list[str] | None = None,
     ) -> tuple[dict[str, Any], ValidationDecision, RunTrace]:
-        """Run the harness and guarantee a terminal trace event for success or failure."""
+        """Run the harness and guarantee a terminal trace event for success or failure.
+
+        report_requirements is an optional snapshot-derived checklist added once to the author
+        base prompt (so revisions inherit it) and to every validator prompt.
+        """
         self.trace.add(
             "run_started",
             author_model=self.author_model,
@@ -1034,7 +1059,7 @@ class ReportHarness:
             tool_names=sorted(tools),
         )
         try:
-            result = self._run_impl(objective, snapshot, prompt_context, tools, validator_context)
+            result = self._run_impl(objective, snapshot, prompt_context, tools, validator_context, report_requirements)
         except Exception as exc:
             last_event = self.trace.events[-1] if self.trace.events else {}
             self._record_exception(
@@ -1248,11 +1273,13 @@ class ReportHarness:
         prompt_context: str,
         tools: dict[str, ToolSpec],
         validator_context: str = "",
+        report_requirements: list[str] | None = None,
     ) -> tuple[dict[str, Any], ValidationDecision, RunTrace]:
         """Run the author loop, collect evidence, and validate the final email HTML."""
         state = _AuthorState(base_prompt=(
             f"{prompt_context}\n\nOBJECTIVE:\n{objective}\n\n"
             f"AUTHORITATIVE SNAPSHOT:\n{json.dumps(snapshot.to_dict(), indent=2)}\n\n"
+            f"{requirements_block(report_requirements)}"
             f"AVAILABLE TOOLS:\n{self._tool_prompt(tools)}\n\n"
             f"{AUTHOR_PROTOCOL}\n"
             "If tool evidence contains an error, use its message to correct the arguments and retry if useful; "
@@ -1338,6 +1365,7 @@ class ReportHarness:
                 validator_prompt = (
                     f"{validator_context}\n\nVALIDATE THIS REPORT:\n{safe_html}\n\n"
                     f"AUTHORITATIVE SNAPSHOT:\n{json.dumps(snapshot.to_dict(), indent=2)}\n\n"
+                    f"{requirements_block(report_requirements, for_validator=True)}"
                     f"TOOL EVIDENCE:\n{json.dumps(state.evidence, indent=2, default=str)}\n\n"
                     f"{prior_validation_text}"
                     "If the report HTML is missing, return fail with a revision instruction telling the author to return "

@@ -29,6 +29,7 @@ This pipeline implements a multi-layer Lakehouse medallion architecture designed
 │   │   ├── qa.py                  # Finance Q&A over the selected report and long-term facts
 │   │   ├── report_metrics.py      # Deterministic snapshot: totals, MoM, disposable cash, goal caps, bar widths
 │   │   ├── report_models.py       # Typed snapshot, validation, and finding models
+│   │   ├── report_requirements.py # Month-specific report requirements checklist built from the snapshot
 │   │   ├── reporting.py           # Builds the snapshot, tools, and harness for one report
 │   │   ├── run_archive.py         # Run archive, live progress files, and the run index
 │   │   └── settings.py            # Config loading and money parsing
@@ -46,6 +47,7 @@ This pipeline implements a multi-layer Lakehouse medallion architecture designed
 │   ├── test_memory.py             # SQLite memory and retrieval tests
 │   ├── test_email_weekly_report.py # Email workflow, archiving, and memory persistence tests
 │   ├── test_report_metrics.py     # Snapshot goal-cap and bar-width math tests
+│   ├── test_report_requirements.py # Requirements checklist content and prompt wiring tests
 │   └── test_run_progress.py       # Live progress files and run-index tests
 ├── agent/
 │   ├── prompts/
@@ -116,6 +118,7 @@ The report can run in two modes. `report_mode: "legacy"` preserves the original 
 
 How the agent run works:
 * **Deterministic snapshot.** `report_metrics.py` computes every number before any model runs: monthly totals, MoM change, disposable cash, and the goal and chart fields (savings shortfall, eligible discretionary total, suggested caps, percent of cap, bar widths, MoM direction, and the top three discretionary categories). The author copies these values; the validator checks the report against them and spot-checks the arithmetic.
+* **Requirements checklist.** `report_requirements.py` turns the snapshot into a short, month-specific checklist (about 10–20 lines): the exact required section headings in order, every Monthly Snapshot bar amount (refunds labeled), the four Sushi Stack values with month labels, the goal-method disclosures (for example that discretionary cuts alone cannot reach the target, with the remaining gap, or that no numeric savings target is configured), and each Top 3 row's spend, cap label, and percent of cap. `reporting.py` passes it to the harness, which adds it once as a "REPORT REQUIREMENTS CHECKLIST" block after the snapshot in the author base prompt (so revisions inherit it) and in every validator prompt, where the validator must check each item and report failures as error findings. It is content guidance only: no Python code inspects the report HTML against it. `ReportHarness.run` still works without it (`report_requirements=None`).
 * **Author protocol.** To request evidence, the author replies with a small JSON object, `{"tool_calls": [...]}`. When the report is ready, it replies with the raw HTML between `<<<REPORT_HTML>>>` and `<<<END_REPORT_HTML>>>`, so the HTML never has to be escaped inside JSON. The plain-text email part is derived from the HTML. The validator still replies with schema-constrained JSON.
 * **Recovery instead of aborting.** Malformed or truncated author output gets a format retry. Rejected HTML (unsafe markup, oversize, or a missing history label), over-budget or unknown tool calls, and tool errors go back to the author as feedback. A model call that times out, cannot connect, returns HTTP 5xx, or comes back empty is retried once. If it fails again, the run ends with a fail decision: the deterministic fallback report if the author never produced one, otherwise the last sanitized report. Running out of `max_agent_rounds` ends the run the same way (an `agent_rounds_exhausted` trace event; a revision keeps the last sanitized report and the last review's findings). Nothing is sent on a fail.
 * **Focused revisions.** Each revision gets the previous HTML and only the top three errors (arithmetic first, then completeness, evidence, history, policy, html, usability, visual design), with the exact snapshot values they concern. The author is told to fix only those with minimal edits.

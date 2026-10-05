@@ -17,6 +17,7 @@ from .bigquery_tools import (
     get_transaction_detail,
 )
 from .report_metrics import calculate_report_snapshot
+from .report_requirements import build_report_requirements
 from .memory_search import search_long_facts
 from .settings import PROJECT_ROOT, parse_money
 
@@ -267,6 +268,7 @@ def generate_finance_report(
             prompt_context=prompt_context,
             validator_context=validator_context,
             tools=tools,
+            report_requirements=build_report_requirements(snapshot),
         )
     except Exception as exc:
         trace.add("exception", phase="finance_report_generation", exception_type=type(exc).__name__, error=str(exc))

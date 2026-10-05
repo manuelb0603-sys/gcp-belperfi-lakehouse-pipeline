@@ -21,6 +21,8 @@ Required report content and order (do not omit or rename these sections):
 6. Top 3 Discretionary Categories: provide a table of the categories in snapshot.top_discretionary_categories, in that order, with category, current spend, previous spend, MoM change, goal/target, and percent of goal. Use configured category_goals when present and label them as configured targets. When no configured category goal exists, show the snapshot's suggested_cap as a clearly labeled suggested monthly cap (it already reflects the observed current-versus-previous trend and the monthly savings target); do not show N/A when a supported recommendation can be calculated. Never classify a fixed or uncontrollable category as discretionary. If fewer than three eligible categories or no prior-month value exists, include available rows and label the missing comparison clearly rather than inventing data.
 7. Mogumogu's Tips for the Week: finish with one or two actionable, specific, kind suggestions tied to the supplied spending evidence, plus a brief encouraging sign-off and a small fitting Japanese-food emoji.
 
+The REPORT REQUIREMENTS CHECKLIST supplied with the snapshot is authoritative for this month: follow every item exactly, including the exact section headings, values, and disclosures.
+
 Do not let brevity, prior-report style, or a decorative redesign remove any required section. If data does not support a requested comparison or goal, state that limitation in the relevant row/section while preserving the section itself.
 
 Precomputed snapshot fields (authoritative; copy them verbatim instead of recomputing):

@@ -118,8 +118,10 @@ class TestSharedFinanceReportService(unittest.TestCase):
                 self.trace = SimpleNamespace(events=[])
                 self.tools = None
 
-            def run(self, objective, snapshot, prompt_context, validator_context, tools):
+            def run(self, objective, snapshot, prompt_context, validator_context, tools, report_requirements=None):
                 self.objective = objective
+                self.report_requirements = report_requirements
+                instances.append(self)
                 self.tools = tools
                 self.asserted_summary_rows = tools["get_spending_summary"].function({})["rows"]
                 try:
@@ -134,6 +136,7 @@ class TestSharedFinanceReportService(unittest.TestCase):
                     self.trace,
                 )
 
+        instances = []
         with patch.object(reporting, "ReportHarness", FakeHarness):
             result = reporting.generate_finance_report(
                 config={
@@ -153,6 +156,10 @@ class TestSharedFinanceReportService(unittest.TestCase):
         self.assertEqual(result.snapshot.latest_month, "2026-02-01")
         self.assertEqual(result.snapshot.previous_month, "2026-01-01")
         self.assertEqual(result.snapshot.savings_goal, 2000)
+        requirements = instances[0].report_requirements
+        self.assertTrue(requirements)
+        self.assertIn('"Monthly Snapshot"', requirements[0])
+        self.assertTrue(any("February 2026 total net expense $450.00" in line for line in requirements))
 
 
     def test_generator_reraises_harness_failure_with_trace_and_snapshot(self):
