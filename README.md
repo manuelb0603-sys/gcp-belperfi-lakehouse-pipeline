@@ -30,12 +30,14 @@ This pipeline implements a multi-layer Lakehouse medallion architecture designed
 │   │   │   ├── html_safety.py     # Mechanical HTML gate and plain-text derivation
 │   │   │   ├── trace.py           # RunTrace, HarnessLimits, ToolSpec
 │   │   │   ├── errors.py          # Run-stop errors and model-call failure classification
-│   │   │   ├── transport.py       # Ollama generate call
+│   │   │   ├── transport.py       # Legacy query_ollama and the query-callable adapter used by tests
 │   │   │   └── fallback.py        # Deterministic fallback report
 │   │   ├── bigquery_tools.py      # Read-only tools for gold-layer spending and transaction evidence
+│   │   ├── html_text.py           # Shared html_to_text (report plain text, history excerpts, Q&A)
 │   │   ├── memory.py              # SQLite-backed short-term and long-term memory store
 │   │   ├── memory_search.py       # Hybrid (embedding + BM25) long-fact retrieval
-│   │   ├── ollama.py              # Ollama text-generation and embedding clients
+│   │   ├── model_clients.py       # ModelClient layer: OllamaClient, AnthropicClient, model_roles config
+│   │   ├── ollama.py              # Compatibility generate_text/embed_text/embed_texts over OllamaClient
 │   │   ├── qa.py                  # Finance Q&A over the selected report and long-term facts
 │   │   ├── report_metrics.py      # Deterministic snapshot: totals, MoM, disposable cash, goal caps, bar widths
 │   │   ├── report_models.py       # Typed snapshot, validation, and finding models
@@ -55,6 +57,7 @@ This pipeline implements a multi-layer Lakehouse medallion architecture designed
 │   ├── test_agent_harness.py      # Harness protocol, parsing, sanitization, retries, and feedback tests
 │   ├── test_finance_services.py   # Shared reporting/tool wiring tests
 │   ├── test_memory.py             # SQLite memory and retrieval tests
+│   ├── test_model_clients.py      # Model clients (fake Ollama/Anthropic), model_roles, html_to_text parity
 │   ├── test_email_weekly_report.py # Email workflow, archiving, and memory persistence tests
 │   ├── test_report_metrics.py     # Snapshot goal-cap and bar-width math tests
 │   ├── test_report_requirements.py # Requirements checklist content and prompt wiring tests
@@ -135,7 +138,7 @@ How the agent run works:
 * **Evidence-grounded findings and rebuttals.** The validator prompt requires every error finding to quote the wrong report text verbatim and cite the conflicting snapshot field, to search the whole report for paraphrases before calling something missing, and not to repeat a prior finding without new evidence. During a revision the author may dispute a finding the previous report already satisfied by adding, after `<<<END_REPORT_HTML>>>`, a block `<<<REBUTTALS>>>[{"finding": "<short finding message>", "quote": "<verbatim report text>"}]<<<END_REBUTTALS>>>` (optionally wrapped in `<!-- -->`). The block is always stripped from the report HTML, malformed blocks are ignored (`author_rebuttals_ignored` trace event), and valid ones are traced (`author_rebuttals`) and passed to the next validator prompt as "AUTHOR REBUTTALS (verify each quote against the report)". The harness does not check quotes or filter findings; the validator decides. Genuine findings must still be fixed.
 * **Stall detection.** When a cycle's error findings match the previous cycle's (normalized category plus message prefix), a `validation_stalled` trace event and progress line are recorded. Each `validation_progress` event carries `repeated_error_count`. This is informational and does not change the decision.
 
-Set `dry_run` to `true` to execute the BigQuery, memory, author, validator, and rendering flow without sending email. Each run is saved under `agent/runs/<run_id>/` with its HTML report, plain text, trace, manifest, and metrics. The run directory is created when the run starts so it can be watched live: `trace.jsonl` is appended as events happen (and rewritten once with the complete trace at the end), `progress.json` holds the current status, phase, round, validation cycle, tool-call count, latest error count, repeated-error count, stalled-cycle count, and author-rebuttal count, and `progress.log` has one timestamped line per model call (with elapsed seconds), tool call, and validation result (the start line shows the run time limit, and a `Run time limit reached` line marks a deadline stop). The same lines print to the console. Follow a run with `Get-Content agent\runs\<run_id>\progress.log -Wait`. A run that raises is renamed with a `_failed` suffix. Failures after the agent harness starts are also archived with the available trace and traceback before control returns to the email workflow. The JSONL trace records model prompts/raw responses (with elapsed seconds, Ollama's `done_reason`, and prompt/output token counts), tool calls and errors, model-call failures and retries, recovery actions, and each validation cycle's outcome. A `prompt_eval_count` close to `num_ctx` means the prompt was likely truncated; a `done_reason` of `length` means the output hit `num_predict`. For revisions, the validator receives the prior review as comparison context and must independently reassess the new report. Metrics summarize model calls, rounds, tools, retries, report size, and initial-to-final validator-reported error counts. These progress counts help spot resolved or recurring findings; they are based on model findings, not a deterministic correctness score, and do not train or permanently change the model. Traces can contain financial details and transaction evidence, so keep the run archive private and do not commit or share it indiscriminately. Open `agent/runs/index.html` in a browser to view reports and compare objective metrics across models and runs. The index is regenerated automatically after each run.
+Set `dry_run` to `true` to execute the BigQuery, memory, author, validator, and rendering flow without sending email. Each run is saved under `agent/runs/<run_id>/` with its HTML report, plain text, trace, manifest, and metrics. The run directory is created when the run starts so it can be watched live: `trace.jsonl` is appended as events happen (and rewritten once with the complete trace at the end), `progress.json` holds the current status, phase, round, validation cycle, tool-call count, latest error count, repeated-error count, stalled-cycle count, and author-rebuttal count, and `progress.log` has one timestamped line per model call (with elapsed seconds), tool call, and validation result (the start line shows the run time limit, and a `Run time limit reached` line marks a deadline stop). The same lines print to the console. Follow a run with `Get-Content agent\runs\<run_id>\progress.log -Wait`. A run that raises is renamed with a `_failed` suffix. Failures after the agent harness starts are also archived with the available trace and traceback before control returns to the email workflow. The JSONL trace records model prompts/raw responses (with elapsed seconds, the provider, the normalized `done_reason`, prompt/output token counts, and for Claude the token `usage` including cache reads), tool calls and errors, model-call failures and retries, recovery actions, and each validation cycle's outcome. A `prompt_eval_count` close to `num_ctx` means the prompt was likely truncated; a `done_reason` of `length` means the output hit `num_predict`. For revisions, the validator receives the prior review as comparison context and must independently reassess the new report. Metrics summarize model calls, rounds, tools, retries, report size, and initial-to-final validator-reported error counts. These progress counts help spot resolved or recurring findings; they are based on model findings, not a deterministic correctness score, and do not train or permanently change the model. Traces can contain financial details and transaction evidence, so keep the run archive private and do not commit or share it indiscriminately. Open `agent/runs/index.html` in a browser to view reports and compare objective metrics across models and runs. The index is regenerated automatically after each run.
 
 #### Runtime config knobs
 
@@ -144,16 +147,17 @@ The live project configuration is read from `config.json` (not `config.example.j
 * `report_mode`: set to `"agent"` to use the structured author/validator flow. `"legacy"` (the default when the key is omitted) keeps the original one-shot report generation flow.
 * `dry_run`: when `true`, the project runs the full BigQuery + prompt + validation + archive flow without sending email. This is recommended while tuning the model or validating report quality. Default `false`. Only agent mode honors it; legacy mode currently sends regardless.
 * `model_server_url`: Ollama server, either the base URL (`http://your-host:11434`) or the full endpoint (`http://your-host:11434/api/generate`); the generate and embed endpoints are derived from it.
-* `model_name`: the author model.
-* `validator_model_name`: the model used to validate the authored report. A different model family from the author is recommended (for example author `gemma4:12b`, validator `qwen3.5:9b`): a same-model pair tends to share blind spots and approve its own weak output. Defaults to `model_name` when omitted.
+* `model_name`: the author model (an Ollama model). Also the default for legacy mode and for `fact_model_name`, so keep it set to an Ollama model even when the author role runs on Claude.
+* `validator_model_name`: the model used to validate the authored report. Defaults to `model_name` when omitted. See Model providers below for the recommended local pairing (author `gemma4:e4b`, validator `gemma4:12b` with `think: false`).
+* `model_roles`: optional per-role provider and model (`author`, `validator`, `eval`); see Model providers below. A role that is absent falls back to the keys above (`model_name`, `validator_model_name`, `ollama_options[role]`, `model_server_url`).
 * `ollama_options`: optional per-role Ollama generation settings, sent as the request `options`:
   ```json
   "ollama_options": {
     "author": {"temperature": 0.3, "num_predict": 12000, "repeat_penalty": 1.1, "num_ctx": 32768},
-    "validator": {"temperature": 0.1, "num_predict": 4000, "num_ctx": 32768}
+    "validator": {"think": false, "temperature": 0.1, "num_predict": 4000, "num_ctx": 32768}
   }
   ```
-  A role may also set `"think": true|false`, sent as Ollama's top-level `think` flag for reasoning models. Hidden thinking counts toward `num_predict`: a reasoning validator such as `qwen3.5:9b` can spend its whole budget thinking and return no JSON, so the example sets `"think": false` for the validator (or raise its `num_predict` substantially if you enable thinking). Unset keys are not sent, so the server's defaults apply. `num_predict` caps output so a model stuck in a loop stops quickly instead of running until `ollama_timeout`. About `32768` for `num_ctx` covers the largest validator prompts; a much larger context on a 16 GB server wastes memory and can push the model partly onto the CPU.
+  A role may also set `"think": true|false`, sent as Ollama's top-level `think` flag for reasoning models. Hidden thinking counts toward `num_predict`: a reasoning validator can spend its whole budget thinking and return no JSON, so the example sets `"think": false` for the validator (or raise its `num_predict` substantially if you enable thinking). Unset keys are not sent, so the server's defaults apply. `num_predict` caps output so a model stuck in a loop stops quickly instead of running until `ollama_timeout`. About `32768` for `num_ctx` covers the largest validator prompts; a much larger context on a 16 GB server wastes memory and can push the model partly onto the CPU.
 * `max_agent_rounds`: how many author rounds (tool requests and format retries) are allowed per phase (initial report, then each revision). Running out ends the run with a fail decision (the fallback report in the initial phase, the last sanitized report in a revision), which is archived normally and never sent.
 * `max_tool_calls`: total number of tool calls permitted across the run.
 * `max_calls_per_tool`: per-tool call ceiling to prevent one tool from being overused.
@@ -162,13 +166,34 @@ The live project configuration is read from `config.json` (not `config.example.j
 * `max_report_bytes`: maximum generated HTML size allowed before the report is rejected as too large.
 * `days_back`: legacy mode only; how many days of BigQuery history the summary query looks back over. Agent mode reads the latest month and its predecessor.
 * `ollama_stream`: legacy mode only; keep `false` so the model returns a complete response.
-* `ollama_timeout`: the per-call request timeout for Ollama calls in seconds (default `600` when omitted); in agent mode a call is also capped at the time left under `max_run_seconds`. Increase this for larger or slower models that need more time to reason. A typical starting point is `1800` (30 minutes), with larger models sometimes needing more.
+* `ollama_timeout`: the per-call request timeout for model calls (Ollama and Claude) in seconds (default `600` when omitted); in agent mode a call is also capped at the time left under `max_run_seconds`. Increase this for larger or slower models that need more time to reason. A typical starting point is `1800` (30 minutes), with larger models sometimes needing more.
 * `embedding_model_name`: Ollama model for long-term fact and query embeddings. Default: `nomic-embed-text`; pull it on the Ollama server before using semantic memory.
 * `memory_schema`: name of the SQLite memory file under `agent/memory/` (see Report Memory).
 * `Monthly_budget`, `Fixed_costs`, `Savings_goal_target`: monthly deposit, fixed costs, and the single numeric monthly savings target used by the snapshot. `Vehicle_Info` is legacy-mode context.
 * `category_goals`: optional `{"Category": amount}` monthly goals. A configured goal replaces the suggested cap for that category and is labeled as configured.
 
 Optional keys not in `config.example.json`: `fact_model_name` (model for extracting long-term facts after a sent report; defaults to `model_name`), and `qa_report_context_chunks` / `qa_long_fact_limit` (context sizes for the Finance Summary and QA app; default 5 each).
+
+#### Model providers
+
+Every model call goes through one client layer, `Scripts/finance/model_clients.py`: `OllamaClient` (local Ollama, also used for embeddings) and `AnthropicClient` (Claude, through the official `anthropic` Python SDK). Each role picks its provider in the optional `model_roles` key:
+
+```json
+"model_roles": {
+  "author":    {"provider": "ollama", "model": "gemma4:e4b"},
+  "validator": {"provider": "ollama", "model": "gemma4:12b", "think": false},
+  "eval":      {"provider": "anthropic", "model": "claude-sonnet-5-5", "effort": "medium", "max_tokens": 16000}
+}
+```
+
+* **Roles.** `author` writes the report and `validator` reviews it. `eval` is reserved for an upcoming LLM comparison/explanation of selected runs; when unset it falls back to the validator's settings. A role missing from `model_roles` (or the whole key missing) uses the legacy keys: `model_name` / `validator_model_name`, `ollama_options[role]`, and `model_server_url`, so existing configs keep working unchanged.
+* **Ollama role fields.** `model`, optional `options` and `think` (when neither is given, `ollama_options[role]` applies), optional `base_url` (default `model_server_url`) and `timeout` (default `ollama_timeout`). Requests are identical to before: one prompt, `format` for the validator's JSON schema, `options` and `think` only when set.
+* **Claude role fields.** `model`, optional `max_tokens` (default `16000`), `effort` (`low`/`medium`/`high`/`xhigh`/`max`; omit it for `claude-haiku-4-5`, which does not support effort), and `cache_system` (default `true`). No thinking or sampling parameters (temperature etc.) are sent, because current models reject them; `ollama_options` do not apply. The validator uses structured output (`output_config.format` with the same JSON schema). A refusal is recorded with `done_reason: "refusal"` and its `stop_details`; a `max_tokens` stop is treated like Ollama's `length`. The SDK is created with `max_retries=1`, and its timeout, connection, 429, and 5xx errors count as model-call failures for the harness's single retry. A 4xx error such as a bad request (for example an invalid model ID) is not retried: it is raised, the run aborts and is archived with a `_failed` suffix, and nothing is sent.
+* **Switching a role to Claude.** Install the SDK into the workspace venv (`..\.venv\Scripts\python.exe -m pip install anthropic`; Ollama-only setups do not need it), set the role to `{"provider": "anthropic", "model": "claude-sonnet-5-5"}`, and provide credentials through the environment: the `ANTHROPIC_API_KEY` environment variable or an `ant auth login` profile. Never put an API key in `config.json`.
+* **Models and cost** (per million tokens, input / output): `claude-opus-5-5` $4 / $20, `claude-sonnet-5-5` $2 / $10, `claude-haiku-4-5` $1 / $5.
+* **Prompt caching.** For Claude, the stable instruction text goes in a cached system block and only the per-call content is the user message: the author's base prompt (context, objective, snapshot, checklist, tools, protocol) is the system part and the tool evidence, revision request, and retries are the user part; for the validator, `validator.system.md` is the system part and the report, snapshot, evidence, and prior review are the user part. Repeated author rounds within a run therefore read the base prompt from the cache. Ollama still receives exactly the same single concatenated prompt as before, and the trace's `prompt` field always records that full text. Trace `model_response` events from Claude include `usage` (`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`) so cache hits are visible; `run_started`, `model_call`, `progress.json`, and `metrics.json` record the provider and model per role.
+* **Privacy.** When a role uses Anthropic, its prompts leave your machine: the snapshot, report HTML, tool evidence (including transaction-level rows from `get_transaction_detail`), memory excerpts, and validator feedback are sent to the Claude API. Keep every role on Ollama if the data must stay local. Embeddings and memory fact extraction always use Ollama.
+* **Recommended local pairing** (from testing on a 16 GB GPU): author `gemma4:e4b` and validator `gemma4:12b` with `think: false`. `qwen3.5:9b` was unreliable as a validator without thinking and ran out of tokens (thinking consumed `num_predict`) with it. Models of 26B parameters and larger did not fit a 16 GB GPU and slowed to partial CPU inference.
 
 The `max_*` and `days_back` values in `config.example.json` are also the code defaults used when a key is omitted. These values are intentionally conservative for a demo or controlled deployment: they keep the model bounded, prevent runaway tool use, and make each run easy to review in the generated archive.
 
@@ -200,8 +225,8 @@ The SQLite database and SQL scratch files are excluded from Git. Delete the loca
    ```json
    {
      "model_server_url": "http://your-host:11434/api/generate",
-     "model_name": "gemma4:12b",
-     "validator_model_name": "qwen3.5:9b",
+     "model_name": "gemma4:e4b",
+     "validator_model_name": "gemma4:12b",
      "report_mode": "agent",
      "dry_run": true,
      "Monthly_budget": 5000,
@@ -213,7 +238,8 @@ The SQLite database and SQL scratch files are excluded from Git. Delete the loca
 
 2. **Ensure Ollama is running** locally or on a reachable server:
    * Download from [ollama.com](https://ollama.com) if not installed
-   * Pull the author, validator, and embedding models, for example `ollama pull gemma4:12b`, `ollama pull qwen3.5:9b`, and `ollama pull nomic-embed-text`
+   * Pull the author, validator, and embedding models, for example `ollama pull gemma4:e4b`, `ollama pull gemma4:12b`, and `ollama pull nomic-embed-text` (set the validator's `think` to `false` in `ollama_options` or `model_roles`)
+   * Optional: to run a role on Claude instead, see Model providers above
 
 3. **Set up Gmail App Password:** 
    * Generate an app-specific password for your sending email in Google Account settings (2FA required on sender account). Do NOT use your main password!  
@@ -238,7 +264,7 @@ The SQLite database and SQL scratch files are excluded from Git. Delete the loca
    & "..\.venv\Scripts\python.exe" "Scripts\Finance Summary and QA.py"
    ```
 
-6. **Run the tests** with the same environment (they mock BigQuery, Ollama, and SMTP and write only to temporary folders):
+6. **Run the tests** with the same environment (they mock BigQuery, Ollama, the Anthropic SDK, and SMTP, never make paid API calls, and write only to temporary folders):
    ```powershell
    ..\.venv\Scripts\python.exe -m unittest discover -s Scripts -p "test_*.py"
    ```

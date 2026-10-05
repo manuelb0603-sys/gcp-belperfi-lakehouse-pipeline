@@ -324,12 +324,22 @@ def _remember_report(memory_module: Any, sender: str, receivers: list[str], rece
 RUN_ARCHIVE_ROOT = Path(__file__).resolve().parent.parent / "agent" / "runs"
 
 
-def _start_progress(archive_root: Path, run_id: str, model_name: str, validator_model: str) -> Any:
+def _start_progress(
+    archive_root: Path,
+    run_id: str,
+    model_name: str,
+    validator_model: str,
+    author_provider: str = "ollama",
+    validator_provider: str = "ollama",
+) -> Any:
     """Create the run directory and live progress files up front; a failure only disables them."""
     from run_archive import ProgressRecorder, update_index
 
     try:
-        progress = ProgressRecorder(archive_root / run_id, run_id, model_name, validator_model)
+        progress = ProgressRecorder(
+            archive_root / run_id, run_id, model_name, validator_model,
+            author_provider=author_provider, validator_provider=validator_provider,
+        )
         update_index(archive_root)
         log_status(f"Live run progress: {progress.run_dir / 'progress.log'}")
         return progress
@@ -352,16 +362,24 @@ def run_agent_weekly_report(
     memory_schema: str,
 ) -> None:
     """Generate the latest-month agent report, archive it, and handle email delivery."""
-    from finance.reporting import generate_finance_report
+    from finance.model_clients import resolve_model_role
+    from finance.reporting import generate_finance_report, role_config_for
     from run_archive import save_run
 
     started = time.perf_counter()
     thread_key = receiver_header or sender or "email:unknown"
-    validator_model = config.get("validator_model_name", model_name)
+    # Provider and model per role (model_roles, else the legacy model_name/validator_model_name keys).
+    role_config = role_config_for(config, ollama_url, model_name)
+    author_role = resolve_model_role(role_config, "author")
+    validator_role = resolve_model_role(role_config, "validator")
+    author_model = str(author_role["model"])
+    validator_model = str(validator_role["model"])
     archive_root = RUN_ARCHIVE_ROOT
     # One run directory is created at start so progress can be watched while the run executes.
-    run_id = datetime.now().strftime("%Y%m%dT%H%M%S") + f"_{model_name.replace(':', '_')}"
-    progress = _start_progress(archive_root, run_id, model_name, validator_model)
+    run_id = datetime.now().strftime("%Y%m%dT%H%M%S") + f"_{author_model.replace(':', '_')}"
+    progress = _start_progress(
+        archive_root, run_id, author_model, validator_model, author_role["provider"], validator_role["provider"]
+    )
     try:
         result = generate_finance_report(
             config=config,
@@ -392,8 +410,10 @@ def run_agent_weekly_report(
         })
         events.append({"event": "run_aborted", "timestamp": time.time(), "phase": "finance_report_generation"})
         failed_metrics = {
-            "model": model_name,
+            "model": author_model,
             "validator_model": validator_model,
+            "author_provider": author_role["provider"],
+            "validator_provider": validator_role["provider"],
             "mode": "agent",
             "status": "exception",
             "validation": "error",

@@ -27,8 +27,11 @@ from .feedback import (
     measure_progress,
 )
 from .html_safety import sanitize_html
+from ..model_clients import ModelClient, OllamaClient
 from .prompts import (
     MISSING_REPORT_HTML,
+    PromptParts,
+    as_prompt_parts,
     author_base_prompt,
     author_format_retry_text,
     author_length_limit_error,
@@ -37,13 +40,13 @@ from .prompts import (
     new_evidence_section,
     revision_block,
     sanitization_revision_instruction,
-    validator_format_retry_prompt,
+    validator_format_retry_suffix,
     validator_length_limit_error,
-    validator_prompt,
+    validator_prompt_parts,
 )
 from .protocol import VALIDATOR_RESPONSE_SCHEMA, parse_author_response, parse_json_response
 from .trace import HarnessLimits, RunTrace, ToolSpec
-from .transport import _response_meta, query_ollama
+from .transport import QueryFunctionClient, _response_meta
 
 
 # Lower bound for a deadline-capped model call timeout, so a call near the deadline is not cut off instantly.
@@ -79,7 +82,11 @@ class _AuthorState:
 
     def prompt(self) -> str:
         """Compose the current author prompt from the base, evidence, notes, and revision request."""
-        parts = [self.base_prompt, *self.evidence_sections]
+        return self.prompt_parts().text
+
+    def prompt_parts(self) -> PromptParts:
+        """The author prompt split for caching: the base prompt (system) and everything after it (user)."""
+        parts = list(self.evidence_sections)
         if self.history_used():
             parts.append(history_label_requirement())
         if self.budget_exhausted:
@@ -88,7 +95,7 @@ class _AuthorState:
             parts.append(self.revision_block)
         if self.retry_suffix:
             parts.append(self.retry_suffix)
-        return "".join(parts)
+        return PromptParts(self.base_prompt, "".join(parts))
 
 
 @dataclass
@@ -116,31 +123,45 @@ class _ValidationState:
 class ReportHarness:
     def __init__(
         self,
-        ollama_url: str,
-        author_model: str,
+        ollama_url: str | None = None,
+        author_model: str | None = None,
         validator_model: str | None = None,
         limits: HarnessLimits | None = None,
         timeout: int = 600,
-        query: Callable[..., str] = query_ollama,
+        query: Callable[..., str] | None = None,
         model_options: dict[str, dict[str, Any]] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        author_client: ModelClient | None = None,
+        validator_client: ModelClient | None = None,
     ) -> None:
         """Create a bounded agent harness with a separate author and validator model.
 
-        model_options holds optional per-role Ollama settings, e.g. {"author": {"temperature": 0.3,
+        author_client/validator_client are finance.model_clients ModelClients (Ollama or
+        Anthropic; see build_model_client). Without them, the legacy arguments build Ollama
+        clients: ollama_url, author_model, validator_model (default: the author model), and
+        model_options, optional per-role Ollama settings, e.g. {"author": {"temperature": 0.3,
         "num_predict": 12000, "think": False}, "validator": {...}}. "think" is sent as Ollama's
-        top-level think flag; every other key goes into the request's options. timeout is the
-        per-call maximum; with limits.max_run_seconds set, each call is also capped at the time
-        left in the run. clock supplies the run-deadline time (injectable for tests).
+        top-level think flag; every other key goes into the request's options. query, when given,
+        replaces the Ollama transport with a ``query(prompt, url, model, timeout=, response_format=,
+        **role_options)`` callable (tests inject fakes this way). timeout is the per-call maximum;
+        with limits.max_run_seconds set, each call is also capped at the time left in the run.
+        clock supplies the run-deadline time (injectable for tests).
         """
         self.ollama_url = ollama_url
-        self.author_model = author_model
-        self.validator_model = validator_model or author_model
         self.limits = limits or HarnessLimits()
         self.timeout = timeout
         self.query = query
         self.model_options = model_options or {}
         self.clock = clock
+        self.author_client: ModelClient = author_client or self._legacy_client("author", author_model)
+        if validator_client is None:
+            if author_client is not None and validator_model is None:
+                validator_client = author_client
+            else:
+                validator_client = self._legacy_client("validator", validator_model or self.author_client.model)
+        self.validator_client: ModelClient = validator_client
+        self.author_model = self.author_client.model
+        self.validator_model = self.validator_client.model
         self.trace = RunTrace()
         self._validator_unavailable = False
         self._run_started_at: float | None = None
@@ -183,6 +204,24 @@ class ReportHarness:
             return capped_timeout, True
         return self.timeout, False
 
+    def _legacy_client(self, role: str, model: str | None) -> ModelClient:
+        """Client for the legacy constructor arguments: the injected query callable, else Ollama."""
+        if not model:
+            raise ValueError(f"ReportHarness needs {role}_client or a model name for the {role}")
+        kwargs = self._role_kwargs(role)
+        if self.query is not None:
+            return QueryFunctionClient(self.query, self.ollama_url, model, kwargs)
+        return OllamaClient(
+            self.ollama_url, model, options=kwargs.get("options"), think=kwargs.get("think"), default_timeout=self.timeout
+        )
+
+    def _client(self, role: str) -> ModelClient:
+        return self.author_client if role == "author" else self.validator_client
+
+    @staticmethod
+    def _provider(client: Any) -> str:
+        return str(getattr(client, "provider", "unknown"))
+
     def _role_kwargs(self, role: str) -> dict[str, Any]:
         """Per-role Ollama request extras; empty when nothing is configured, so defaults apply."""
         section = self.model_options.get(role) or {}
@@ -194,24 +233,20 @@ class ReportHarness:
             kwargs["think"] = bool(section["think"])
         return kwargs
 
-    def _query_with_retry(self, role: str, prompt: str, model: str, response_format: Any, **context: Any) -> str:
-        """Call the model, retrying once on a timeout/connection/5xx/empty-response failure.
+    def _query_with_retry(self, role: str, prompt: PromptParts, json_schema: Any, **context: Any) -> str:
+        """Call the role's model client, retrying once on a timeout/connection/5xx/empty-response failure.
 
         Raises RunDeadlineExceededError before any attempt once max_run_seconds has passed, and when
         a call times out because its timeout was capped at the time left in the run.
         """
+        client = self._client(role)
+        model = client.model
         for attempt in (1, 2):
             timeout, capped = self._call_timeout(role, model=model, attempt=attempt, **context)
             started = time.perf_counter()
             try:
-                return self.query(
-                    prompt,
-                    self.ollama_url,
-                    model,
-                    timeout=timeout,
-                    response_format=response_format,
-                    **self._role_kwargs(role),
-                )
+                # Ollama and query fakes get system + user concatenated (the historical single prompt).
+                return client.generate(prompt.user, system=prompt.system or None, json_schema=json_schema, timeout=timeout)
             except Exception as exc:
                 elapsed = round(time.perf_counter() - started, 3)
                 self._record_exception(f"{role}_model_call", exc, elapsed_seconds=elapsed, call_attempt=attempt, **context)
@@ -377,21 +412,24 @@ class ReportHarness:
 
     # ----- author and validator turns -----
 
-    def _author_call(self, prompt: str) -> dict[str, Any]:
+    def _author_call(self, prompt: str | PromptParts) -> dict[str, Any]:
         """Send the current prompt to the author model and parse marker HTML or tool-call JSON.
 
         Raises ModelUnavailableError when the model fails twice with a transport/server error.
         """
+        parts = as_prompt_parts(prompt)
+        full_prompt = parts.text
         self.trace.add(
             "model_call",
             role="author",
             model=self.author_model,
-            prompt=prompt,
-            prompt_chars=len(prompt),
+            provider=self._provider(self.author_client),
+            prompt=full_prompt,
+            prompt_chars=len(full_prompt),
         )
         started = time.perf_counter()
         # No format schema: the report comes back as raw HTML between markers (see AUTHOR_PROTOCOL).
-        response = self._query_with_retry("author", prompt, self.author_model, None)
+        response = self._query_with_retry("author", parts, None)
         elapsed = round(time.perf_counter() - started, 3)
         meta = _response_meta(response)
         try:
@@ -428,7 +466,7 @@ class ReportHarness:
         )
         return result
 
-    def _validator_call(self, prompt: str, cycle: int | None = None) -> ValidationDecision:
+    def _validator_call(self, prompt: str | PromptParts, cycle: int | None = None) -> ValidationDecision:
         """Run the validation model and convert its structured result into a typed verdict."""
         self._validator_unavailable = False
         reply = self._validator_reply(prompt, cycle)
@@ -437,17 +475,19 @@ class ReportHarness:
         return self._decision_from_payload(cycle, *reply)
 
     def _validator_reply(
-        self, prompt: str, cycle: int | None
+        self, prompt: str | PromptParts, cycle: int | None
     ) -> ValidationDecision | tuple[dict[str, Any], str, dict[str, Any], float]:
         """Query the validator with one format retry: (payload, response, meta, elapsed) or a fail decision."""
+        prompt = as_prompt_parts(prompt)
         retry_prompt = prompt
         for attempt in (1, 2):
             self.trace.add(
                 "model_call",
                 role="validator",
                 model=self.validator_model,
-                prompt=retry_prompt,
-                prompt_chars=len(retry_prompt),
+                provider=self._provider(self.validator_client),
+                prompt=retry_prompt.text,
+                prompt_chars=len(retry_prompt.text),
                 validation_cycle=cycle,
                 attempt=attempt,
             )
@@ -456,7 +496,6 @@ class ReportHarness:
                 response = self._query_with_retry(
                     "validator",
                     retry_prompt,
-                    self.validator_model,
                     VALIDATOR_RESPONSE_SCHEMA,
                     validation_cycle=cycle,
                     format_attempt=attempt,
@@ -487,7 +526,8 @@ class ReportHarness:
                 )
                 if attempt == 2:
                     return ValidationDecision("fail", [], "Validator returned malformed JSON twice; the report was not accepted.")
-                retry_prompt = validator_format_retry_prompt(prompt, error, length_limited)
+                # The retry request follows the per-cycle content, so the cached system part is unchanged.
+                retry_prompt = PromptParts(prompt.system, prompt.user + validator_format_retry_suffix(error, length_limited))
                 self.trace.add(
                     "validator_format_retry",
                     validation_cycle=cycle,
@@ -557,6 +597,8 @@ class ReportHarness:
             "run_started",
             author_model=self.author_model,
             validator_model=self.validator_model,
+            author_provider=self._provider(self.author_client),
+            validator_provider=self._provider(self.validator_client),
             limits={
                 "max_agent_rounds": self.limits.max_agent_rounds,
                 "max_tool_calls": self.limits.max_tool_calls,
@@ -687,7 +729,7 @@ class ReportHarness:
         for round_number in range(1, self.limits.max_agent_rounds + 1):
             if phase == "initial":
                 self.trace.add("agent_round", round=round_number)
-            author_result = self._author_call(state.prompt())
+            author_result = self._author_call(state.prompt_parts())
             self._trace_author_action(author_result, phase, round_number, state.pending_tool_errors)
             state.pending_tool_errors.clear()
             if author_result.get("error"):
@@ -979,8 +1021,8 @@ class ReportHarness:
         vstate: _ValidationState,
         validator_context: str,
         report_requirements: list[str] | None,
-    ) -> str:
-        return validator_prompt(
+    ) -> PromptParts:
+        return validator_prompt_parts(
             validator_context,
             vstate.safe_html,
             json.dumps(snapshot.to_dict(), indent=2),

@@ -8,27 +8,16 @@ import json
 import math
 import re
 from collections import OrderedDict
-from html.parser import HTMLParser
 from typing import Any
 
+from .html_text import html_to_text
 from .memory_search import search_long_facts
 from .ollama import embed_text, embed_texts, generate_text
 
 
-class _TextExtractor(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.parts: list[str] = []
-
-    def handle_data(self, data: str) -> None:
-        if data.strip():
-            self.parts.append(data.strip())
-
-
 def _html_to_text(markup: str) -> str:
-    parser = _TextExtractor()
-    parser.feed(markup or "")
-    return "\n".join(parser.parts)
+    """Every non-blank text node of the summary HTML on its own line (no tags skipped)."""
+    return html_to_text(markup, separator="\n")
 
 
 def _chunks(text: str, max_chars: int = 900, overlap: int = 120) -> list[str]:

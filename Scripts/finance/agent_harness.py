@@ -4,7 +4,7 @@ Existing imports (including the private names tests use) keep working; new code 
 from the finance.harness modules directly.
 """
 
-from .ollama import api_url  # noqa: F401
+from .model_clients import AnthropicClient, ModelClient, OllamaClient, api_url, build_model_client  # noqa: F401
 from .harness.errors import (  # noqa: F401
     RUN_STOP_ERRORS,
     AgentRoundsExhaustedError,
@@ -35,7 +35,6 @@ from .harness.html_safety import (  # noqa: F401
     HISTORY_LABEL,
     ReportSanitizationError,
     _plain_text_from_html,
-    _ReportTextExtractor,
     _UnsafeMarkupParser,
     sanitize_html,
 )
@@ -63,5 +62,5 @@ from .harness.protocol import (  # noqa: F401
     parse_json_response,
 )
 from .harness.trace import HarnessLimits, RunTrace, ToolFunction, ToolSpec  # noqa: F401
-from .harness.transport import _response_meta, query_ollama  # noqa: F401
+from .harness.transport import QueryFunctionClient, _response_meta, query_ollama  # noqa: F401
 from .report_models import ReportSnapshot, ValidationDecision, ValidationFinding  # noqa: F401

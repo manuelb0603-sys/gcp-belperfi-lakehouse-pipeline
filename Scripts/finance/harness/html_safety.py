@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from html.parser import HTMLParser
 
+from ..html_text import html_to_text
+
 
 HISTORY_LABEL = "Previous report for reference:"
 
@@ -30,37 +32,9 @@ class _UnsafeMarkupParser(HTMLParser):
         self.handle_starttag(tag, attrs)
 
 
-class _ReportTextExtractor(HTMLParser):
-    """Extract a readable plain-text alternative from a valid HTML report."""
-
-    block_tags = {"address", "article", "br", "div", "h1", "h2", "h3", "li", "p", "section", "tr"}
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.parts: list[str] = []
-        self.in_style = False
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.lower() == "style":
-            self.in_style = True
-        if tag.lower() in self.block_tags:
-            self.parts.append("\n")
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag.lower() == "style":
-            self.in_style = False
-        if tag.lower() in self.block_tags:
-            self.parts.append("\n")
-
-    def handle_data(self, data: str) -> None:
-        if not self.in_style:
-            self.parts.append(data)
-
-
 def _plain_text_from_html(report_html: str) -> str:
-    parser = _ReportTextExtractor()
-    parser.feed(report_html)
-    return re.sub(r"\n\s*\n+", "\n\n", "".join(parser.parts)).strip()
+    """Readable plain-text alternative of a report: block elements become lines, style text is dropped."""
+    return html_to_text(report_html, skip_tags=("style",), block_newlines=True)
 
 
 class ReportSanitizationError(ValueError):

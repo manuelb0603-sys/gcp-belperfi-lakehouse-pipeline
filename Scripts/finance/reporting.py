@@ -6,7 +6,6 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
-from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable
 
@@ -18,38 +17,25 @@ from .bigquery_tools import (
 )
 from .report_metrics import calculate_report_snapshot
 from .report_requirements import build_report_requirements
+from .html_text import html_to_text
 from .memory_search import search_long_facts
+from .model_clients import build_model_client
 from .settings import PROJECT_ROOT, parse_money
 
 
-class _HistoryTextExtractor(HTMLParser):
-    """Collect visible text from a stored report, skipping style and script blocks."""
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.parts: list[str] = []
-        self.skip_depth = 0
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.lower() in {"style", "script", "head", "title"}:
-            self.skip_depth += 1
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag.lower() in {"style", "script", "head", "title"} and self.skip_depth:
-            self.skip_depth -= 1
-
-    def handle_data(self, data: str) -> None:
-        if not self.skip_depth and data.strip():
-            self.parts.append(data.strip())
+# Stored reports are excerpted without their CSS/script/head boilerplate.
+HISTORY_SKIP_TAGS = ("style", "script", "head", "title")
 
 
 def _history_text(entry: dict[str, Any]) -> str:
     """Prefer stored plain text; otherwise strip markup so excerpts are not CSS boilerplate."""
     text = str(entry.get("response_text") or "")
     if not text.strip() or re.search(r"<\s*(html|body|style|div|table)\b", text, re.I):
-        parser = _HistoryTextExtractor()
-        parser.feed(text if text.strip() else str(entry.get("response_html") or ""))
-        text = " ".join(parser.parts)
+        text = html_to_text(
+            text if text.strip() else str(entry.get("response_html") or ""),
+            skip_tags=HISTORY_SKIP_TAGS,
+            separator=" ",
+        )
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -204,6 +190,16 @@ def _build_tools(
 DEFAULT_MAX_RUN_SECONDS = 2700
 
 
+def role_config_for(config: dict[str, Any], ollama_url: str | None, model_name: str | None) -> dict[str, Any]:
+    """Config for build_model_client where the caller's Ollama URL and author model fill the legacy keys."""
+    role_config = dict(config)
+    if model_name:
+        role_config["model_name"] = model_name
+    if ollama_url:
+        role_config["model_server_url"] = ollama_url
+    return role_config
+
+
 def _max_run_seconds(config: dict[str, Any]) -> float | None:
     """Run time limit in seconds from config: default 2700 (45 minutes); 0 or null disables it."""
     if "max_run_seconds" not in config:
@@ -258,13 +254,19 @@ def generate_finance_report(
         max_report_bytes=int(config.get("max_report_bytes", 250000)),
         max_run_seconds=_max_run_seconds(config),
     )
+    # model_roles (or the legacy model_name/validator_model_name/ollama_options keys) pick each role's
+    # provider; the caller's model_name and ollama_url stand in for the legacy keys.
+    role_config = role_config_for(config, ollama_url, model_name)
+    author_client = build_model_client(role_config, "author")
+    validator_client = build_model_client(role_config, "validator")
     harness = ReportHarness(
         ollama_url=ollama_url,
-        author_model=model_name,
-        validator_model=config.get("validator_model_name", model_name),
+        author_model=author_client.model,
+        validator_model=validator_client.model,
         limits=limits,
         timeout=int(config.get("ollama_timeout", 600)),
-        model_options=config.get("ollama_options") if isinstance(config.get("ollama_options"), dict) else None,
+        author_client=author_client,
+        validator_client=validator_client,
     )
     if trace_listeners:
         harness.trace.listeners.extend(trace_listeners)
@@ -303,8 +305,10 @@ def generate_finance_report(
     initial_validation_errors = progress_events[0]["error_count"] if progress_events else None
     final_validation_errors = progress_events[-1]["error_count"] if progress_events else None
     metrics = {
-        "model": model_name,
-        "validator_model": config.get("validator_model_name", model_name),
+        "model": author_client.model,
+        "validator_model": validator_client.model,
+        "author_provider": author_client.provider,
+        "validator_provider": validator_client.provider,
         "mode": "agent",
         "status": "validated" if decision and decision.passed else "validation_failed",
         "validation": decision.decision if decision else "error",

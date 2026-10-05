@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, NamedTuple
 
 from .html_safety import HISTORY_LABEL
 from .protocol import REBUTTALS_END_MARKER, REBUTTALS_START_MARKER, REPORT_END_MARKER, REPORT_START_MARKER
@@ -44,6 +44,26 @@ VALIDATOR_CHECKLIST_INSTRUCTION = (
     "or missing required heading, a wrong value, or a missing disclosure) as an error finding whose evidence quotes "
     "the report verbatim (or names the section searched when it is missing) and cites the checklist item."
 )
+
+class PromptParts(NamedTuple):
+    """A model prompt split for prompt caching: stable instructions (system) and per-call content (user).
+
+    Ollama receives ``text`` (system + user concatenated exactly, the historical single prompt);
+    Anthropic sends system as a cached system block and user as the user message.
+    """
+
+    system: str
+    user: str
+
+    @property
+    def text(self) -> str:
+        return f"{self.system}{self.user}"
+
+
+def as_prompt_parts(prompt: "str | PromptParts") -> PromptParts:
+    """Accept a plain prompt string (all user content) or PromptParts."""
+    return prompt if isinstance(prompt, PromptParts) else PromptParts("", str(prompt))
+
 
 # Stand-in shown to the validator when the author returned no report HTML at all.
 MISSING_REPORT_HTML = "<html><body><p>Missing report_html in author output.</p></body></html>"
@@ -126,12 +146,17 @@ def validator_length_limit_error(exc: Exception) -> str:
 
 def validator_format_retry_prompt(prompt: str, error: str, length_limited: bool) -> str:
     """Validator prompt repeated with a request for one schema-conforming JSON object."""
+    return f"{prompt}{validator_format_retry_suffix(error, length_limited)}"
+
+
+def validator_format_retry_suffix(error: str, length_limited: bool) -> str:
+    """The text validator_format_retry_prompt appends to the validator prompt (added to the user part)."""
     length_hint = (
         " Your previous answer ran out of tokens: keep the audit evidence and findings short."
         if length_limited else ""
     )
     return (
-        f"{prompt}\n\nFORMAT RETRY: Your previous validator response was not valid JSON "
+        f"\n\nFORMAT RETRY:Your previous validator response was not valid JSON "
         f"({error}). Re-evaluate the same report and return one concise, schema-conforming JSON object only. "
         f"Do not include unescaped quotation marks, markdown fences, or text outside the JSON object.{length_hint}"
     )
@@ -194,15 +219,31 @@ def validator_prompt(
     rebuttals: list[dict[str, str]],
 ) -> str:
     """The full validator prompt for one review cycle."""
-    return (
-        f"{validator_context}\n\nVALIDATE THIS REPORT:\n{safe_html}\n\n"
+    return validator_prompt_parts(
+        validator_context, safe_html, snapshot_json, requirements, evidence, previous_validation, resolved_labels, rebuttals
+    ).text
+
+
+def validator_prompt_parts(
+    validator_context: str,
+    safe_html: str,
+    snapshot_json: str,
+    requirements: list[str] | None,
+    evidence: list[dict[str, Any]],
+    previous_validation: dict[str, Any] | None,
+    resolved_labels: list[str],
+    rebuttals: list[dict[str, str]],
+) -> PromptParts:
+    """Validator prompt split into the stable validator instructions (system) and this cycle's review content."""
+    return PromptParts(validator_context, (
+        f"\n\nVALIDATE THIS REPORT:\n{safe_html}\n\n"
         f"AUTHORITATIVE SNAPSHOT:\n{snapshot_json}\n\n"
         f"{requirements_block(requirements, for_validator=True)}"
         f"TOOL EVIDENCE:\n{json.dumps(evidence, indent=2, default=str)}\n\n"
         f"{_prior_validation_text(previous_validation, resolved_labels, rebuttals)}"
         "If the report HTML is missing, return fail with a revision instruction telling the author to return "
         f"the complete HTML report between {REPORT_START_MARKER} and {REPORT_END_MARKER}."
-    )
+    ))
 
 
 def revision_block(revision_html: str, feedback: dict[str, Any], resolved_labels: list[str]) -> str:

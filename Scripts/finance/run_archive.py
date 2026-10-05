@@ -72,7 +72,7 @@ const metrics = {json.dumps({item.get("run_id"): item for item in rows}, default
 function compareSelected() {{
     const ids = [...document.querySelectorAll('.run-select:checked')].map(item => item.value);
     if (ids.length < 2) {{ document.getElementById('comparison').textContent = 'Select at least two runs.'; return; }}
-    const keys = ['model','mode','status','validation','runtime_seconds','agent_rounds','tool_calls','validation_cycles','validator_calls','author_format_retries','validator_format_retries','initial_validation_errors','final_validation_errors','validation_error_reduction','validation_cycles_improved','validation_cycles_regressed','report_bytes'];
+    const keys = ['model','author_provider','validator_model','validator_provider','mode','status','validation','runtime_seconds','agent_rounds','tool_calls','validation_cycles','validator_calls','author_format_retries','validator_format_retries','initial_validation_errors','final_validation_errors','validation_error_reduction','validation_cycles_improved','validation_cycles_regressed','report_bytes'];
     document.getElementById('comparison').textContent = keys.map(key => key + ': ' + ids.map(id => id + '=' + (metrics[id][key] ?? '')).join(' | ')).join('\\n');
 }}
 </script></body></html>"""
@@ -88,7 +88,16 @@ class ProgressRecorder:
     save_run rewrites trace.jsonl once at the end with the complete trace.
     """
 
-    def __init__(self, run_dir: Path, run_id: str, model: str, validator_model: str, echo: bool = True) -> None:
+    def __init__(
+        self,
+        run_dir: Path,
+        run_id: str,
+        model: str,
+        validator_model: str,
+        echo: bool = True,
+        author_provider: str = "ollama",
+        validator_provider: str = "ollama",
+    ) -> None:
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.echo = echo
@@ -99,6 +108,8 @@ class ProgressRecorder:
             "status": "running",
             "model": model,
             "validator_model": validator_model,
+            "author_provider": author_provider,
+            "validator_provider": validator_provider,
             "started_at": now,
             "updated_at": now,
             "elapsed_seconds": 0.0,
@@ -113,7 +124,11 @@ class ProgressRecorder:
             "author_rebuttals": 0,
         }
         self._write_progress()
-        self.log(f"Run {run_id} started (author={model}, validator={validator_model})")
+        self.log(
+            f"Run {run_id} started (author={model}, validator={validator_model})"
+            if author_provider == validator_provider == "ollama"
+            else f"Run {run_id} started (author={author_provider}:{model}, validator={validator_provider}:{validator_model})"
+        )
 
     def __call__(self, event: dict[str, Any]) -> None:
         """RunTrace listener: persist the event and refresh the live status files."""

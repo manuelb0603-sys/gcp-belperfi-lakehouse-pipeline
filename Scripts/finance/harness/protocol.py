@@ -6,6 +6,7 @@ import json
 import re
 from typing import Any
 
+from ..model_clients import ModelReply  # noqa: F401  (re-exported; moved to finance.model_clients)
 from .html_safety import _plain_text_from_html
 
 
@@ -15,27 +16,6 @@ REBUTTALS_START_MARKER = "<<<REBUTTALS>>>"
 REBUTTALS_END_MARKER = "<<<END_REBUTTALS>>>"
 MAX_REBUTTALS = 5
 MAX_REBUTTAL_FIELD_CHARS = 400
-
-
-class ModelReply(str):
-    """Model text plus Ollama generation metadata; behaves as a plain string for parsing."""
-
-    done_reason: str | None
-    eval_count: int | None
-    prompt_eval_count: int | None
-
-    def __new__(
-        cls,
-        text: str,
-        done_reason: str | None = None,
-        eval_count: int | None = None,
-        prompt_eval_count: int | None = None,
-    ) -> "ModelReply":
-        reply = super().__new__(cls, text)
-        reply.done_reason = done_reason
-        reply.eval_count = eval_count
-        reply.prompt_eval_count = prompt_eval_count
-        return reply
 
 
 def parse_json_response(text: str, required_keys: set[str] | None = None) -> dict[str, Any]:
@@ -231,7 +211,7 @@ VALIDATOR_RESPONSE_SCHEMA: dict[str, Any] = {
                     },
                     "message": {"type": "string"},
                     "evidence": {"type": "string"},
-                    "revision_instruction": {"type": ["string", "null"]},
+                    "revision_instruction": {"anyOf": [{"type": "string"}, {"type": "null"}]},
                 },
                 "required": ["severity", "category", "message", "evidence", "revision_instruction"],
                 "additionalProperties": False,

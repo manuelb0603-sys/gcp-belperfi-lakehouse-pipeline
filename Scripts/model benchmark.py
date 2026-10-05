@@ -1,13 +1,13 @@
 import json
 import time
-import urllib.request
 from pathlib import Path
 
-from finance.ollama import api_url
+from finance.model_clients import OllamaClient
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 with CONFIG_PATH.open(encoding="utf-8") as config_file:
-    OLLAMA_URL = api_url(json.load(config_file)["model_server_url"], "generate")
+    # Base URL or any Ollama API endpoint; OllamaClient normalizes it to /api/generate.
+    OLLAMA_URL = json.load(config_file)["model_server_url"]
 
 # The exact tags to pull in Ollama before running:
 MODELS_TO_TEST = ["qwen3.5:35b", "qwen3.8:27b","qwen3.5:9b","qwen3-coder:30b", "qwen2.5-coder:14b","gemma4:12b","gemma4:31b"]
@@ -35,44 +35,34 @@ def run_benchmark(model_name):
     print("="*60)
     print("[-] Processing prompt... Please wait...")
     
-    payload = {
-        "model": model_name,
-        "prompt": TEST_PROMPT,
-        "stream": False,
-        "options": {
-            "num_predict": 250  # Increased token limit so you can see full code outputs
-        }
-    }
-    
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(OLLAMA_URL, data=data, headers={"Content-Type": "application/json"})
-    
+    # Increased token limit so you can see full code outputs
+    client = OllamaClient(OLLAMA_URL, model_name, options={"num_predict": 250})
+
     start_time = time.time()
     try:
-        with urllib.request.urlopen(req) as response:
-            res_body = json.loads(response.read().decode("utf-8"))
-            end_clock = time.time()
-            
-            # Extract response text and statistics
-            response_text = res_body.get("response", "")
-            eval_count = res_body.get("eval_count", 0)
-            eval_duration = res_body.get("eval_duration", 1) / 1e9 
-            
-            tokens_per_second = eval_count / eval_duration if eval_duration > 0 else 0
-            total_clock = end_clock - start_time
-            
-            # Print the actual text generation for auditing
-            print("\n** GENERATED OUTPUT:")
-            print("-" * 40)
-            print(response_text)
-            print("-" * 40)
-            
-            print(f"✅ Performance Metrics for {model_name}:")
-            print(f"    - Speed: {tokens_per_second:.2f} tokens/sec")
-            print(f"    - Generation Time: {eval_duration:.2f} seconds")
-            print(f"    - Total Generated Tokens: {eval_count}")
-            print(f"    - Total Latency: {total_clock:.2f} seconds")
-            return tokens_per_second
+        reply = client.generate(TEST_PROMPT)
+        end_clock = time.time()
+
+        # Extract response text and statistics
+        response_text = str(reply)
+        eval_count = reply.eval_count or 0
+        eval_duration = reply.metadata.get("eval_duration", 1) / 1e9
+
+        tokens_per_second = eval_count / eval_duration if eval_duration > 0 else 0
+        total_clock = end_clock - start_time
+        
+        # Print the actual text generation for auditing
+        print("\n** GENERATED OUTPUT:")
+        print("-" * 40)
+        print(response_text)
+        print("-" * 40)
+        
+        print(f"✅ Performance Metrics for {model_name}:")
+        print(f"    - Speed: {tokens_per_second:.2f} tokens/sec")
+        print(f"    - Generation Time: {eval_duration:.2f} seconds")
+        print(f"    - Total Generated Tokens: {eval_count}")
+        print(f"    - Total Latency: {total_clock:.2f} seconds")
+        return tokens_per_second
     except Exception as e:
         print(f"❌ Skipped {model_name}: Check if pulled or if Ollama is running.")
         return None

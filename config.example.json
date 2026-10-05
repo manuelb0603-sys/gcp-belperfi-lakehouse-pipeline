@@ -1,7 +1,13 @@
 {
   "model_server_url": "http://your-host-address:11434/api/generate",
-  "model_name": "your-model-name",
-  "validator_model_name": "your-validator-model-name",
+  "model_name": "gemma4:e4b",
+  "validator_model_name": "gemma4:12b",
+  "model_roles": {
+    "author": {"provider": "ollama", "model": "gemma4:e4b"},
+    "validator": {"provider": "ollama", "model": "gemma4:12b"},
+    "eval": {"provider": "anthropic", "model": "claude-sonnet-5-5", "effort": "medium", "max_tokens": 16000},
+    "_note": "Optional; roles left out fall back to model_name / validator_model_name / ollama_options. eval is optional (defaults to the validator). Anthropic roles need the anthropic package and credentials from the ANTHROPIC_API_KEY environment variable or `ant auth login`, never this file; their prompts (report data and evidence) leave this machine."
+  },
   "report_mode": "agent", 
   "dry_run": true,
   "max_agent_rounds": 6,

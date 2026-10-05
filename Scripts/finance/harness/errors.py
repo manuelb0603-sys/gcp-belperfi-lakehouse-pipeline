@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-
-class EmptyModelResponse(ValueError):
-    """Ollama answered without any text; treated like an unavailable model call."""
+from ..model_clients import EmptyModelResponse, is_anthropic_timeout, is_anthropic_transient  # noqa: F401
 
 
 class ModelUnavailableError(RuntimeError):
@@ -24,8 +22,8 @@ RUN_STOP_ERRORS = (ModelUnavailableError, AgentRoundsExhaustedError, RunDeadline
 
 
 def _is_timeout(exc: Exception) -> bool:
-    """True when a model call failed because its HTTP timeout elapsed."""
-    if isinstance(exc, TimeoutError):
+    """True when a model call failed because its HTTP timeout elapsed (requests or anthropic SDK)."""
+    if isinstance(exc, TimeoutError) or is_anthropic_timeout(exc):
         return True
     try:
         import requests
@@ -36,8 +34,12 @@ def _is_timeout(exc: Exception) -> bool:
 
 
 def _is_model_call_failure(exc: Exception) -> bool:
-    """True for timeouts, connection failures, HTTP 5xx, and empty responses (worth one retry)."""
-    if isinstance(exc, (TimeoutError, ConnectionError, EmptyModelResponse)):
+    """True for timeouts, connection failures, HTTP 5xx, and empty responses (worth one retry).
+
+    Anthropic SDK errors are matched by class name (the SDK is never imported here): timeouts,
+    connection errors, 429 rate limits and 5xx count; 4xx such as BadRequestError do not.
+    """
+    if isinstance(exc, (TimeoutError, ConnectionError, EmptyModelResponse)) or is_anthropic_transient(exc):
         return True
     try:
         import requests
