@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,21 @@ def load_config(config_path: Path | str | None = None) -> dict[str, Any]:
     path = Path(config_path) if config_path is not None else DEFAULT_CONFIG_PATH
     with path.open("r", encoding="utf-8") as config_file:
         return json.load(config_file)
+
+
+def memory_db_path(memory_schema: str = "memory") -> Path:
+    """Resolve the SQLite memory database: MEMORY_DB_PATH, else agent/memory/<memory_schema>.sqlite3."""
+    if os.environ.get("MEMORY_DB_PATH"):
+        return Path(os.environ["MEMORY_DB_PATH"])
+    schema = str(memory_schema or "memory")
+    if not re.fullmatch(r"[A-Za-z0-9_]+", schema):
+        raise ValueError("memory_schema may contain only letters, numbers, and underscores")
+    return PROJECT_ROOT / "agent" / "memory" / f"{schema}.sqlite3"
+
+
+def report_thread_key(config: dict[str, Any]) -> str:
+    """Thread key for report history; matches the weekly email flow so all reports share one history."""
+    return ", ".join(config.get("email_listings") or []) or config.get("email_sender") or "email:unknown"
 
 
 def parse_money(value: Any) -> float:

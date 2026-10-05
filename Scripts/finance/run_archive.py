@@ -108,6 +108,9 @@ class ProgressRecorder:
             "last_event": None,
             "tool_calls": 0,
             "last_validation_error_count": None,
+            "last_repeated_error_count": None,
+            "stalled_validation_cycles": 0,
+            "author_rebuttals": 0,
         }
         self._write_progress()
         self.log(f"Run {run_id} started (author={model}, validator={validator_model})")
@@ -174,6 +177,11 @@ class ProgressRecorder:
         elif name == "validation_cycle_result":
             if event.get("error_count") is not None:
                 self.state["last_validation_error_count"] = event.get("error_count")
+            self.state["last_repeated_error_count"] = event.get("repeated_error_count")
+        elif name == "validation_stalled":
+            self.state["stalled_validation_cycles"] += 1
+        elif name == "author_rebuttals":
+            self.state["author_rebuttals"] += event.get("rebuttal_count") or 0
         elif name == "run_completed":
             self.state["phase"] = "completed"
         elif name == "run_aborted":
@@ -210,9 +218,27 @@ def _describe_event(event: dict[str, Any]) -> str | None:
             where = f", validation cycle {event.get('validation_cycle')} attempt {event.get('attempt')}"
         return f"{event.get('role')} model call started ({event.get('model')}, {event.get('prompt_chars', 0):,} prompt chars{where})"
     if name == "model_response":
+        tokens = ""
+        if event.get("eval_count") is not None or event.get("prompt_eval_count") is not None:
+            tokens = f", tokens in/out {event.get('prompt_eval_count', '?')}/{event.get('eval_count', '?')}"
+        stop = f", stopped: {event.get('done_reason')}" if event.get("done_reason") not in (None, "stop") else ""
         return (
             f"{event.get('role')} response: parse {event.get('parse_status')}, "
-            f"{event.get('response_chars', 0):,} chars in {event.get('elapsed_seconds', '?')}s"
+            f"{event.get('response_chars', 0):,} chars in {event.get('elapsed_seconds', '?')}s{tokens}{stop}"
+        )
+    if name == "model_call_failed":
+        return (
+            f"{event.get('role')} model call failed (attempt {event.get('attempt')}, "
+            f"{event.get('elapsed_seconds', '?')}s): {event.get('error_type')}: {event.get('error')}"
+        )
+    if name == "model_call_retry":
+        return f"Retrying {event.get('role')} model call (attempt {event.get('attempt')})"
+    if name == "model_unavailable":
+        return f"{event.get('role')} model unavailable during {event.get('phase')}; stopping with a fail decision"
+    if name == "agent_rounds_exhausted":
+        return (
+            f"Author used all {event.get('max_agent_rounds')} rounds in {event.get('phase')} without a report; "
+            "stopping with a fail decision"
         )
     if name == "tool_call":
         return f"Tool {event.get('name')} ok ({event.get('phase')})"
@@ -228,6 +254,23 @@ def _describe_event(event: dict[str, Any]) -> str | None:
         return (
             f"Validation cycle {event.get('cycle')} result ({event.get('stage', 'validator')}): "
             f"{event.get('decision')}, {event.get('error_count', '?')} errors, {event.get('warning_count', '?')} warnings"
+            + (
+                f", {event.get('repeated_error_count')} repeated from the previous cycle"
+                if event.get("repeated_error_count") else ""
+            )
+        )
+    if name == "author_rebuttals":
+        findings = "; ".join(str(item.get("finding", ""))[:80] for item in event.get("rebuttals") or [])
+        return (
+            f"Author disputed {event.get('rebuttal_count', 0)} finding(s) from validation cycle "
+            f"{event.get('responding_to_cycle')}: {findings}"
+        )
+    if name == "author_rebuttals_ignored":
+        return f"Author rebuttals ignored: {event.get('error') or event.get('reason')}"
+    if name == "validation_stalled":
+        return (
+            f"Validation stalled: cycle {event.get('cycle')} repeated {event.get('repeated_error_count')} error "
+            f"finding(s) from the previous cycle unchanged ({event.get('rebuttal_count', 0)} author rebuttal(s))"
         )
     if name == "exception":
         return f"Exception in {event.get('phase')}: {event.get('exception_type')}: {event.get('error')}"

@@ -113,6 +113,28 @@ class TestProgressRecorder(unittest.TestCase):
             save_run(Path(temp_dir), "run1", {}, trace.events, "<p>r</p>", "r", {"status": "validation_failed"})
             self.assertEqual(len(_read_lines(run_dir / "trace.jsonl")), 6)
 
+    def test_rebuttal_and_stall_events_are_logged_and_counted(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir) / "run1"
+            recorder = ProgressRecorder(run_dir, "run1", "author-model", "validator-model", echo=False)
+            trace = RunTrace(listeners=[recorder])
+            trace.add("author_rebuttals", responding_to_cycle=1, rebuttal_count=1,
+                      rebuttals=[{"finding": "Cuts note missing", "quote": "would not meet your goal"}])
+            trace.add("author_rebuttals_ignored", responding_to_cycle=2, reason="Malformed", error="not JSON")
+            trace.add("validation_stalled", cycle=2, repeated_error_count=2, rebuttal_count=1, findings=[])
+            trace.add("validation_cycle_result", cycle=2, decision="fail", stage="validator",
+                      error_count=2, warning_count=0, repeated_error_count=2)
+
+            progress = json.loads((run_dir / "progress.json").read_text(encoding="utf-8"))
+            self.assertEqual(progress["author_rebuttals"], 1)
+            self.assertEqual(progress["stalled_validation_cycles"], 1)
+            self.assertEqual(progress["last_repeated_error_count"], 2)
+            log = (run_dir / "progress.log").read_text(encoding="utf-8")
+            self.assertIn("Author disputed 1 finding(s) from validation cycle 1: Cuts note missing", log)
+            self.assertIn("Author rebuttals ignored: not JSON", log)
+            self.assertIn("Validation stalled: cycle 2 repeated 2 error finding(s)", log)
+            self.assertIn("fail, 2 errors, 0 warnings, 2 repeated from the previous cycle", log)
+
     def test_index_lists_running_run_from_progress(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             ProgressRecorder(Path(temp_dir) / "20260101T000000_live", "20260101T000000_live", "m", "v", echo=False)
@@ -171,7 +193,7 @@ class TestEmailRunDirectories(unittest.TestCase):
         def generate(**kwargs):
             trace = RunTrace(listeners=kwargs["trace_listeners"])
             trace.add("agent_round", round=1)
-            error = RuntimeError("Maximum agent rounds exceeded")
+            error = RuntimeError("Unexpected harness failure")
             error.run_trace = trace
             raise error
 
@@ -181,7 +203,7 @@ class TestEmailRunDirectories(unittest.TestCase):
             self.assertTrue(run_dirs[0].name.endswith("_model_tag_failed"))
             progress = json.loads((run_dirs[0] / "progress.json").read_text(encoding="utf-8"))
             self.assertEqual(progress["status"], "exception")
-            self.assertIn("Maximum agent rounds exceeded", progress["error"])
+            self.assertIn("Unexpected harness failure", progress["error"])
             events = [json.loads(line)["event"] for line in _read_lines(run_dirs[0] / "trace.jsonl")]
             self.assertEqual(events, ["agent_round", "exception", "run_aborted"])
             self.assertIn("status=exception", (run_dirs[0] / "progress.log").read_text(encoding="utf-8"))

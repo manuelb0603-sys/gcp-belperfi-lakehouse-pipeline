@@ -1,6 +1,16 @@
 import unittest
 
-from agent_harness import HarnessLimits, ReportHarness, ToolSpec, parse_json_response, sanitize_html
+from agent_harness import (
+    HarnessLimits,
+    ModelReply,
+    ModelUnavailableError,
+    ReportHarness,
+    ToolSpec,
+    focused_feedback,
+    parse_author_response,
+    parse_json_response,
+    sanitize_html,
+)
 from report_models import ReportSnapshot
 
 
@@ -264,17 +274,22 @@ class TestAgentHarness(unittest.TestCase):
 
         harness = ReportHarness("http://ollama", "test-model", query=failing_query)
 
-        with self.assertRaises(TimeoutError):
+        with self.assertRaises(ModelUnavailableError):
             harness._author_call("prompt")
 
         exception_events = [event for event in harness.trace.events if event.get("event") == "exception"]
+        self.assertEqual(len(exception_events), 2)
         self.assertEqual(exception_events[-1]["phase"], "author_model_call")
         self.assertEqual(exception_events[-1]["exception_type"], "TimeoutError")
         self.assertEqual(exception_events[-1]["error"], "model timed out")
+        names = [event["event"] for event in harness.trace.events]
+        self.assertEqual(names.count("model_call_failed"), 2)
+        self.assertEqual(names.count("model_call_retry"), 1)
 
     def test_unhandled_run_exception_records_traceback_and_aborted_event(self):
+        # A non-transport error (a client bug, not a timeout/connection failure) still aborts the run.
         def failing_query(*args, **kwargs):
-            raise ConnectionError("ollama endpoint unavailable")
+            raise RuntimeError("ollama client misconfigured")
 
         snapshot = ReportSnapshot(
             as_of="2026-09-15",
@@ -292,17 +307,17 @@ class TestAgentHarness(unittest.TestCase):
         )
         harness = ReportHarness("http://ollama", "test-model", query=failing_query)
 
-        with self.assertRaisesRegex(ConnectionError, "endpoint unavailable"):
+        with self.assertRaisesRegex(RuntimeError, "client misconfigured"):
             harness.run("objective", snapshot, "author context", {})
 
         events = harness.trace.events
         self.assertEqual(events[0]["event"], "run_started")
         failure = next(event for event in events if event.get("event") == "exception" and event.get("phase") == "harness_unhandled")
-        self.assertEqual(failure["exception_type"], "ConnectionError")
+        self.assertEqual(failure["exception_type"], "RuntimeError")
         self.assertIn("Traceback", failure["traceback"])
         aborted = events[-1]
         self.assertEqual(aborted["event"], "run_aborted")
-        self.assertEqual(aborted["exception_type"], "ConnectionError")
+        self.assertEqual(aborted["exception_type"], "RuntimeError")
 
     def test_tool_exception_is_added_to_trace(self):
         responses = [
@@ -427,8 +442,8 @@ class TestAgentHarness(unittest.TestCase):
         self.assertEqual(tool_results, [{}])
         author_prompts = [event["prompt"] for event in trace.events if event.get("event") == "model_call" and event.get("role") == "author"]
         self.assertIn("additional evidence", author_prompts[-1])
-        self.assertIn("FAILED REPORT FOR REVISION", author_prompts[1])
-        self.assertIn("resolved_error_count_by_category", author_prompts[1])
+        self.assertIn("PREVIOUS REPORT HTML", author_prompts[1])
+        self.assertIn("PRIORITY FIXES FROM THE REVIEW", author_prompts[1])
         self.assertIn("do not reintroduce a fixed issue", author_prompts[1])
         self.assertIn("<html><body>Initial</body></html>", author_prompts[1])
         validator_prompts = [event["prompt"] for event in trace.events if event.get("event") == "model_call" and event.get("role") == "validator"]
@@ -482,7 +497,7 @@ class TestAgentHarness(unittest.TestCase):
         self.assertTrue(decision.passed)
         self.assertIn("Previous report for reference:", report["report_html"])
         self.assertIn("HISTORY LABEL REQUIREMENT", prompts[1])
-        self.assertIn("FAILED REPORT FOR REVISION", prompts[2])
+        self.assertIn("PREVIOUS REPORT HTML", prompts[2])
         self.assertIn('"category": "history"', prompts[2])
         cycle_results = [event for event in trace.events if event.get("event") == "validation_cycle_result"]
         self.assertEqual(
@@ -586,9 +601,502 @@ class TestAgentHarness(unittest.TestCase):
         author_prompts = [event["prompt"] for event in trace.events if event.get("event") == "model_call" and event.get("role") == "author"]
         self.assertEqual(author_prompts[-1].count("FIRST_RESULT_MARKER"), 1)
         self.assertEqual(author_prompts[-1].count("SECOND_RESULT_MARKER"), 1)
-        self.assertEqual(author_prompts[-1].count("FAILED REPORT FOR REVISION"), 1)
+        self.assertEqual(author_prompts[-1].count("PREVIOUS REPORT HTML"), 1)
         self.assertIn("Second issue.", author_prompts[-1])
         self.assertNotIn("First issue.", author_prompts[-1])
+
+
+def _protocol_snapshot() -> ReportSnapshot:
+    return ReportSnapshot(
+        as_of="2026-09-15",
+        latest_month="2026-08",
+        previous_month="2026-07",
+        latest_total_net_expense=1000,
+        previous_total_net_expense=900,
+        mom_change_percent=11.1,
+        monthly_deposit=5000,
+        fixed_costs=2200,
+        disposable_cash=1600,
+        savings_goal=500,
+        categories=[],
+        source_tables=[],
+    )
+
+
+MARKED_REPORT = '<<<REPORT_HTML>>>\n<html><body><h1>Hello "quoted"</h1><p>Report</p></body></html>\n<<<END_REPORT_HTML>>>'
+PASS = '{"decision":"pass","summary":"Accepted","findings":[]}'
+
+
+def _error(category: str, message: str) -> dict:
+    return {"severity": "error", "category": category, "message": message, "evidence": "seen", "revision_instruction": "fix it"}
+
+
+class TestAuthorProtocol(unittest.TestCase):
+    def test_marker_report_is_parsed_and_plain_text_derived(self):
+        result = parse_author_response("Here you go:\n" + MARKED_REPORT + "\nThanks!")
+
+        self.assertEqual(result["report_html"], '<html><body><h1>Hello "quoted"</h1><p>Report</p></body></html>')
+        self.assertIn("Hello", result["plain_text"])
+        self.assertNotIn("<h1>", result["plain_text"])
+
+    def test_missing_end_marker_is_a_truncation_error(self):
+        with self.assertRaisesRegex(ValueError, "missing; the output was likely truncated"):
+            parse_author_response("<<<REPORT_HTML>>>\n<html><body>cut off")
+
+    def test_fenced_tool_call_json_is_accepted(self):
+        result = parse_author_response('```json\n{"tool_calls":[{"name":"get_spending_summary","arguments":{}}]}\n```')
+
+        self.assertEqual(result["tool_calls"][0]["name"], "get_spending_summary")
+
+    def test_prose_around_tool_call_json_is_accepted(self):
+        result = parse_author_response(
+            'I need more data first. {"tool_calls":[{"name":"get_category_detail","arguments":{"category":"Shopping"}}]} Done.'
+        )
+
+        self.assertEqual(result["tool_calls"][0]["arguments"], {"category": "Shopping"})
+
+    def test_whole_html_document_without_markers_is_accepted_but_unclosed_is_not(self):
+        result = parse_author_response("<!DOCTYPE html><html><body><p>Report</p></body></html>")
+        self.assertIn("<p>Report</p>", result["report_html"])
+
+        with self.assertRaisesRegex(ValueError, "neither a report"):
+            parse_author_response("<html><body><p>Report")
+
+    def test_response_without_markers_or_tool_calls_is_an_error(self):
+        with self.assertRaisesRegex(ValueError, "neither a report"):
+            parse_author_response("Sure! I will write the report now.")
+
+    def test_author_uses_no_format_schema_and_role_options_are_passed(self):
+        calls = []
+
+        def fake_query(prompt, url, model, **kwargs):
+            calls.append((model, kwargs))
+            return MARKED_REPORT if len(calls) == 1 else PASS
+
+        harness = ReportHarness(
+            "http://ollama",
+            "author-model",
+            validator_model="validator-model",
+            query=fake_query,
+            model_options={
+                "author": {"temperature": 0.3, "num_predict": 12000, "think": False},
+                "validator": {"temperature": 0.1, "num_ctx": 32768, "repeat_penalty": None},
+            },
+        )
+
+        report, decision, _ = harness.run("objective", _protocol_snapshot(), "author context", {})
+
+        self.assertTrue(decision.passed)
+        author_model, author_kwargs = calls[0]
+        self.assertEqual(author_model, "author-model")
+        self.assertIsNone(author_kwargs["response_format"])
+        self.assertEqual(author_kwargs["options"], {"temperature": 0.3, "num_predict": 12000})
+        self.assertIs(author_kwargs["think"], False)
+        validator_model, validator_kwargs = calls[1]
+        self.assertEqual(validator_model, "validator-model")
+        self.assertIsInstance(validator_kwargs["response_format"], dict)
+        self.assertEqual(validator_kwargs["options"], {"temperature": 0.1, "num_ctx": 32768})
+        self.assertNotIn("think", validator_kwargs)
+        author_prompt = next(event["prompt"] for event in harness.trace.events if event.get("event") == "model_call")
+        self.assertIn("<<<END_REPORT_HTML>>>", author_prompt)
+        self.assertNotIn('"report_html"', author_prompt)
+
+    def test_no_options_configured_sends_no_extras(self):
+        captured = {}
+
+        def fake_query(prompt, url, model, **kwargs):
+            captured.update(kwargs)
+            return '{"tool_calls":[]}'
+
+        ReportHarness("http://ollama", "m", query=fake_query)._author_call("prompt")
+
+        self.assertNotIn("options", captured)
+        self.assertNotIn("think", captured)
+
+    def test_query_ollama_returns_empty_reply_when_token_limit_spent_on_thinking(self):
+        import sys
+
+        import agent_harness
+
+        class FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"response": "", "thinking": "x" * 500, "done_reason": "length", "eval_count": 4000}
+
+        class FakeRequests:
+            def post(self, url, json, timeout):
+                return FakeResponse()
+
+        original = sys.modules.get("requests")
+        sys.modules["requests"] = FakeRequests()
+        try:
+            reply = agent_harness.query_ollama("prompt", "http://ollama", "model")
+        finally:
+            if original is None:
+                sys.modules.pop("requests", None)
+            else:
+                sys.modules["requests"] = original
+
+        self.assertEqual(str(reply), "")
+        self.assertEqual(reply.done_reason, "length")
+
+    def test_query_ollama_sends_options_think_and_omits_format_when_none(self):
+        import sys
+
+        import agent_harness
+
+        class FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"response": MARKED_REPORT, "done_reason": "stop", "eval_count": 42, "prompt_eval_count": 1000}
+
+        class FakeRequests:
+            payload = None
+
+            def post(self, url, json, timeout):
+                FakeRequests.payload = json
+                return FakeResponse()
+
+        original = sys.modules.get("requests")
+        sys.modules["requests"] = FakeRequests()
+        try:
+            reply = agent_harness.query_ollama(
+                "prompt", "http://ollama", "model", response_format=None,
+                options={"temperature": 0.3}, think=False,
+            )
+        finally:
+            if original is None:
+                sys.modules.pop("requests", None)
+            else:
+                sys.modules["requests"] = original
+
+        self.assertNotIn("format", FakeRequests.payload)
+        self.assertEqual(FakeRequests.payload["options"], {"temperature": 0.3})
+        self.assertIs(FakeRequests.payload["think"], False)
+        self.assertEqual(reply, MARKED_REPORT)
+        self.assertEqual((reply.done_reason, reply.eval_count, reply.prompt_eval_count), ("stop", 42, 1000))
+
+    def test_author_output_cut_by_token_limit_is_a_format_error(self):
+        truncated = ModelReply("<<<REPORT_HTML>>>\n<html><body>partial", done_reason="length", eval_count=12000, prompt_eval_count=9000)
+        harness = ReportHarness("http://ollama", "m", query=lambda *a, **k: truncated)
+
+        result = harness._author_call("prompt")
+
+        self.assertIn("token limit", result["error"])
+        response = [event for event in harness.trace.events if event.get("event") == "model_response"][-1]
+        self.assertEqual(response["done_reason"], "length")
+        self.assertEqual(response["eval_count"], 12000)
+        self.assertEqual(response["prompt_eval_count"], 9000)
+
+    def test_validator_output_cut_by_token_limit_is_malformed(self):
+        truncated = ModelReply('{"decision":"fail","summary":"long', done_reason="length")
+        harness = ReportHarness("http://ollama", "m", query=lambda *a, **k: truncated)
+
+        decision = harness._validator_call("validator prompt", cycle=1)
+
+        self.assertFalse(decision.passed)
+        self.assertIn("malformed JSON twice", decision.summary)
+        errors = [event["error"] for event in harness.trace.events if event.get("event") == "model_response"]
+        self.assertTrue(all("token limit" in error for error in errors))
+
+
+class TestFocusedFeedback(unittest.TestCase):
+    def test_top_three_errors_are_prioritized_with_snapshot_values(self):
+        from report_models import ValidationDecision, ValidationFinding
+
+        findings = [
+            ValidationFinding(**_error("visual_design", "Bars are purple.")),
+            ValidationFinding(**_error("usability", "Small text.")),
+            ValidationFinding(**_error("evidence", "Unsupported coffee claim.")),
+            ValidationFinding(**_error("arithmetic", "Disposable cash shows -1779.84.")),
+            ValidationFinding(**_error("completeness", "Missing Sushi Stack.")),
+            ValidationFinding(severity="warning", category="arithmetic", message="Minor rounding.", evidence="", revision_instruction=""),
+        ]
+        feedback = focused_feedback(ValidationDecision("fail", findings, "Several issues"), _protocol_snapshot())
+
+        self.assertEqual([item["category"] for item in feedback["fix_these"]], ["arithmetic", "completeness", "evidence"])
+        self.assertEqual(feedback["remaining_lower_priority_errors"], 2)
+        self.assertEqual(feedback["fix_these"][0]["authoritative_values"], {"disposable_cash": 1600})
+        self.assertNotIn("authoritative_values", feedback["fix_these"][1])
+
+    def test_revision_prompt_lists_only_top_three(self):
+        failing = {
+            "decision": "fail", "summary": "Issues", "audit": {},
+            "findings": [_error("visual_design", f"Design issue {index}.") for index in range(4)]
+            + [_error("arithmetic", "MoM value is wrong.")],
+        }
+        responses = [MARKED_REPORT, __import__("json").dumps(failing), MARKED_REPORT, PASS]
+        prompts = []
+
+        def fake_query(prompt, *args, **kwargs):
+            prompts.append(prompt)
+            return responses.pop(0)
+
+        harness = ReportHarness("http://ollama", "m", limits=HarnessLimits(max_validation_cycles=1), query=fake_query)
+        _, decision, _ = harness.run("objective", _protocol_snapshot(), "author context", {})
+
+        self.assertTrue(decision.passed)
+        revision_prompt = prompts[2]
+        self.assertIn("MoM value is wrong.", revision_prompt)
+        self.assertIn('"mom_change_percent": 11.1', revision_prompt)
+        self.assertIn("Design issue 0.", revision_prompt)
+        self.assertNotIn("Design issue 2.", revision_prompt)
+        self.assertIn('"remaining_lower_priority_errors": 2', revision_prompt)
+        self.assertIn("minimal edits", revision_prompt)
+
+
+class TestModelCallFailures(unittest.TestCase):
+    def _harness(self, responses, cycles=2):
+        def fake_query(*args, **kwargs):
+            item = responses.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        return ReportHarness("http://ollama", "m", limits=HarnessLimits(max_validation_cycles=cycles), query=fake_query)
+
+    def test_author_timeout_is_retried_once(self):
+        harness = self._harness([TimeoutError("slow"), MARKED_REPORT, PASS])
+
+        report, decision, trace = harness.run("objective", _protocol_snapshot(), "author context", {})
+
+        self.assertTrue(decision.passed)
+        names = [event["event"] for event in trace.events]
+        self.assertEqual(names.count("model_call_failed"), 1)
+        self.assertEqual(names.count("model_call_retry"), 1)
+
+    def test_author_unavailable_initially_returns_fallback_with_fail(self):
+        harness = self._harness([TimeoutError("slow"), ConnectionError("down")])
+
+        report, decision, trace = harness.run("objective", _protocol_snapshot(), "author context", {})
+
+        self.assertFalse(decision.passed)
+        self.assertIn("Author model unavailable", decision.summary)
+        self.assertIn("Fallback report", report["report_html"])
+        self.assertTrue(any(event["event"] == "model_unavailable" for event in trace.events))
+        self.assertEqual(trace.events[-1]["event"], "run_completed")
+
+    def test_author_unavailable_during_revision_keeps_last_sanitized_report(self):
+        failing = '{"decision":"fail","summary":"Fix it","audit":{},"findings":[%s]}' % __import__("json").dumps(_error("arithmetic", "Wrong total."))
+        harness = self._harness([MARKED_REPORT, failing, TimeoutError("slow"), TimeoutError("slow again")])
+
+        report, decision, trace = harness.run("objective", _protocol_snapshot(), "author context", {})
+
+        self.assertFalse(decision.passed)
+        self.assertIn("unavailable during revision", decision.summary)
+        self.assertIn('Hello "quoted"', report["report_html"])
+        self.assertEqual(len(decision.findings), 1)
+
+    def test_validator_unavailable_returns_fail_without_crashing(self):
+        harness = self._harness([MARKED_REPORT, TimeoutError("slow"), TimeoutError("slow again")])
+
+        report, decision, trace = harness.run("objective", _protocol_snapshot(), "author context", {})
+
+        self.assertFalse(decision.passed)
+        self.assertIn("Validator unavailable", decision.summary)
+        self.assertIn("<p>Report</p>", report["report_html"])
+        result = [event for event in trace.events if event.get("event") == "validation_cycle_result"][-1]
+        self.assertEqual(result["stage"], "validator_unavailable")
+        author_calls = [event for event in trace.events if event.get("event") == "model_call" and event.get("role") == "author"]
+        self.assertEqual(len(author_calls), 1)
+
+
+class TestAgentRoundsExhausted(unittest.TestCase):
+    TOOL_REQUEST = '{"tool_calls":[{"name":"broken","arguments":{}}]}'
+
+    def _run(self, responses):
+        def fake_query(*args, **kwargs):
+            return responses.pop(0)
+
+        def broken(arguments):
+            raise ValueError("tool failed")
+
+        harness = ReportHarness(
+            "http://ollama", "m", limits=HarnessLimits(max_agent_rounds=2, max_validation_cycles=2), query=fake_query
+        )
+        return harness.run("objective", _protocol_snapshot(), "author context", {"broken": ToolSpec("broken", "fails", broken)})
+
+    def test_initial_round_exhaustion_returns_fallback_with_fail(self):
+        report, decision, trace = self._run([self.TOOL_REQUEST, self.TOOL_REQUEST])
+
+        self.assertFalse(decision.passed)
+        self.assertIn("agent rounds", decision.summary)
+        self.assertIn("Fallback report", report["report_html"])
+        names = [event["event"] for event in trace.events]
+        self.assertIn("agent_rounds_exhausted", names)
+        self.assertNotIn("run_aborted", names)
+        self.assertEqual(names[-1], "run_completed")
+        exhausted = next(event for event in trace.events if event["event"] == "agent_rounds_exhausted")
+        self.assertEqual(exhausted["phase"], "initial")
+        unresolved = next(event for event in trace.events if event["event"] == "tool_errors_unresolved")
+        self.assertEqual(unresolved["failed_tools"][0]["tool"], "broken")
+
+    def test_revision_round_exhaustion_keeps_last_sanitized_report(self):
+        failing = '{"decision":"fail","summary":"Fix it","audit":{},"findings":[%s]}' % __import__("json").dumps(_error("arithmetic", "Wrong total."))
+        report, decision, trace = self._run([MARKED_REPORT, failing, self.TOOL_REQUEST, self.TOOL_REQUEST])
+
+        self.assertFalse(decision.passed)
+        self.assertIn("revision agent rounds", decision.summary)
+        self.assertIn("Fix it", decision.summary)
+        self.assertEqual([finding.message for finding in decision.findings], ["Wrong total."])
+        self.assertIn('Hello "quoted"', report["report_html"])
+        exhausted = next(event for event in trace.events if event["event"] == "agent_rounds_exhausted")
+        self.assertEqual(exhausted["phase"], "revision")
+        self.assertEqual(trace.events[-1]["event"], "run_completed")
+        validator_calls = [event for event in trace.events if event.get("event") == "model_call" and event.get("role") == "validator"]
+        self.assertEqual(len(validator_calls), 1)
+
+
+class TestQueryOllamaUrl(unittest.TestCase):
+    def test_base_and_full_generate_urls_post_to_generate_endpoint(self):
+        from unittest.mock import MagicMock, patch
+
+        import agent_harness
+
+        fake_requests = MagicMock()
+        fake_requests.post.return_value.json.return_value = {"response": "ok"}
+        with patch.dict("sys.modules", {"requests": fake_requests}):
+            for url in ("http://host:11434", "http://host:11434/", "http://host:11434/api/generate"):
+                agent_harness.query_ollama("prompt", url, "model", timeout=5)
+
+        posted = [call.args[0] for call in fake_requests.post.call_args_list]
+        self.assertEqual(posted, ["http://host:11434/api/generate"] * 3)
+
+
+REBUTTAL_JSON = '[{"finding": "Cuts-insufficient note missing", "quote": "would not meet your goal"}]'
+REPORT_WITH_QUOTE = (
+    "<<<REPORT_HTML>>>\n<html><body><p>Even cutting everything would not meet your goal.</p></body></html>\n"
+    "<<<END_REPORT_HTML>>>"
+)
+
+
+class TestAuthorRebuttals(unittest.TestCase):
+    def test_valid_rebuttals_are_parsed_and_kept_out_of_report_html(self):
+        for wrapper in ("{block}", "<!-- {block} -->"):
+            block = f"<<<REBUTTALS>>>\n{REBUTTAL_JSON}\n<<<END_REBUTTALS>>>"
+            result = parse_author_response(REPORT_WITH_QUOTE + "\n" + wrapper.format(block=block))
+
+            self.assertEqual(result["rebuttals"], [{"finding": "Cuts-insufficient note missing", "quote": "would not meet your goal"}])
+            self.assertNotIn("rebuttal_error", result)
+            self.assertNotIn("REBUTTALS", result["report_html"])
+            self.assertNotIn("<!--", result["report_html"])
+            self.assertNotIn("Cuts-insufficient", result["plain_text"])
+
+    def test_rebuttal_block_inside_report_markers_is_stripped(self):
+        text = (
+            "<<<REPORT_HTML>>>\n<html><body><p>Report</p></body></html>\n"
+            f"<!-- <<<REBUTTALS>>>{REBUTTAL_JSON}<<<END_REBUTTALS>>> -->\n<<<END_REPORT_HTML>>>"
+        )
+        result = parse_author_response(text)
+
+        self.assertEqual(result["report_html"], "<html><body><p>Report</p></body></html>")
+        self.assertEqual(len(result["rebuttals"]), 1)
+
+    def test_malformed_rebuttals_are_ignored_without_failing_the_parse(self):
+        cases = [
+            "<<<REBUTTALS>>>\n[{\"finding\": \"x\", \"quote\": \n<<<END_REBUTTALS>>>",  # invalid JSON
+            "<<<REBUTTALS>>>\n[{\"finding\": \"x\"}, \"text\"]\n<<<END_REBUTTALS>>>",  # no usable entries
+            "<<<REBUTTALS>>>\n" + REBUTTAL_JSON,  # unclosed block
+        ]
+        for suffix in cases:
+            result = parse_author_response(REPORT_WITH_QUOTE + "\n" + suffix)
+
+            self.assertIn("would not meet your goal", result["report_html"])
+            self.assertNotIn("REBUTTALS", result["report_html"])
+            self.assertNotIn("rebuttals", result)
+            self.assertIn("rebuttal_error", result)
+
+    def test_absent_rebuttals_leave_result_unchanged(self):
+        result = parse_author_response(REPORT_WITH_QUOTE)
+
+        self.assertEqual(set(result), {"report_html", "plain_text"})
+
+    def _run(self, responses, cycles=1):
+        prompts = []
+
+        def fake_query(prompt, *args, **kwargs):
+            prompts.append(prompt)
+            return responses.pop(0)
+
+        harness = ReportHarness("http://ollama", "m", limits=HarnessLimits(max_validation_cycles=cycles), query=fake_query)
+        report, decision, trace = harness.run("objective", _protocol_snapshot(), "author context", {})
+        return report, decision, trace, prompts
+
+    def test_rebuttals_reach_next_validator_prompt_and_trace(self):
+        import json
+
+        failing = json.dumps({"decision": "fail", "summary": "Issues", "audit": {},
+                              "findings": [_error("completeness", "Cuts-insufficient note missing.")]})
+        revision = REPORT_WITH_QUOTE + f"\n<<<REBUTTALS>>>\n{REBUTTAL_JSON}\n<<<END_REBUTTALS>>>"
+        report, decision, trace, prompts = self._run([REPORT_WITH_QUOTE, failing, revision, PASS])
+
+        self.assertTrue(decision.passed)
+        self.assertIn("<<<REBUTTALS>>>", prompts[2])  # the revision request documents the format
+        self.assertNotIn("AUTHOR REBUTTALS", prompts[1])
+        second_validator_prompt = prompts[3]
+        self.assertIn("AUTHOR REBUTTALS (verify each quote against the report)", second_validator_prompt)
+        self.assertIn('"quote": "would not meet your goal"', second_validator_prompt)
+        self.assertNotIn("REBUTTALS>>>", report["report_html"])
+        self.assertNotIn("rebuttals", report)
+        events = [event for event in trace.events if event.get("event") == "author_rebuttals"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["responding_to_cycle"], 1)
+        self.assertEqual(events[0]["rebuttals"][0]["quote"], "would not meet your goal")
+
+    def test_malformed_rebuttals_during_revision_are_traced_and_ignored(self):
+        import json
+
+        failing = json.dumps({"decision": "fail", "summary": "Issues", "audit": {},
+                              "findings": [_error("completeness", "Missing note.")]})
+        revision = REPORT_WITH_QUOTE + "\n<<<REBUTTALS>>>not json<<<END_REBUTTALS>>>"
+        _, decision, trace, prompts = self._run([REPORT_WITH_QUOTE, failing, revision, PASS])
+
+        self.assertTrue(decision.passed)
+        self.assertNotIn("AUTHOR REBUTTALS", prompts[3])
+        names = [event["event"] for event in trace.events]
+        self.assertIn("author_rebuttals_ignored", names)
+        self.assertNotIn("author_rebuttals", names)
+
+    def test_repeated_findings_record_validation_stalled(self):
+        import json
+
+        def failing(message):
+            return json.dumps({"decision": "fail", "summary": "Issues", "audit": {},
+                               "findings": [_error("completeness", message)]})
+
+        responses = [
+            REPORT_WITH_QUOTE, failing("Report fails to disclose that cuts are insufficient."),
+            REPORT_WITH_QUOTE, failing("Report fails to disclose that cuts are insufficient!"),
+            REPORT_WITH_QUOTE, failing("Sushi Stack is missing."),
+        ]
+        _, decision, trace, _ = self._run(responses, cycles=2)
+
+        self.assertFalse(decision.passed)
+        stalled = [event for event in trace.events if event.get("event") == "validation_stalled"]
+        self.assertEqual([event["cycle"] for event in stalled], [2])
+        self.assertEqual(stalled[0]["repeated_error_count"], 1)
+        progress = [event for event in trace.events if event.get("event") == "validation_progress"]
+        self.assertEqual([event["repeated_error_count"] for event in progress], [None, 1, 0])
+
+
+class TestValidatorPrompt(unittest.TestCase):
+    def test_prompt_keeps_gates_and_adds_evidence_rule(self):
+        from pathlib import Path
+
+        text = (Path(__file__).resolve().parents[1] / "agent" / "prompts" / "validator.system.md").read_text(encoding="utf-8")
+        for gate in (
+            "1. FINANCIAL MATH", "2. SAVINGS-DRIVEN CATEGORY GOALS", "3. REQUIRED CONTENT AND PERSONALITY",
+            "4. MATERIAL 3-INSPIRED VISUAL INSPECTION", "5. READABILITY AND ACCESSIBILITY", "6. EVIDENCE AND HTML SAFETY",
+            "Decision rules:", "never downgrade a failed hard requirement",
+        ):
+            self.assertIn(gate, text)
+        self.assertIn("verbatim", text)
+        self.assertIn("AUTHOR REBUTTALS", text)
+        self.assertIn("Do not repeat a prior finding unchanged", text)
 
 
 if __name__ == "__main__":

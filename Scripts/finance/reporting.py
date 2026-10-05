@@ -248,6 +248,7 @@ def generate_finance_report(
         validator_model=config.get("validator_model_name", model_name),
         limits=limits,
         timeout=int(config.get("ollama_timeout", 600)),
+        model_options=config.get("ollama_options") if isinstance(config.get("ollama_options"), dict) else None,
     )
     if trace_listeners:
         harness.trace.listeners.extend(trace_listeners)

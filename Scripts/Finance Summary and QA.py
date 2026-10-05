@@ -9,9 +9,10 @@ from typing import Any
 import gradio as gr
 
 from finance.bigquery_tools import get_report_period_spending, get_spending_years
+from finance.memory import open_memory
 from finance.qa import answer_finance_question as shared_answer_finance_question
 from finance.reporting import generate_finance_report
-from finance.settings import load_config
+from finance.settings import load_config, report_thread_key
 
 
 MONTHS = [(calendar.month_abbr[number], number) for number in range(1, 13)]
@@ -19,6 +20,20 @@ CONFIG = load_config()
 PROJECT_NAME = CONFIG.get("project_name")
 OLLAMA_URL = CONFIG.get("model_server_url", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = CONFIG.get("model_name", "gemma4:e4b")
+# Same thread key as the weekly email so the report's history tool sees the email reports.
+REPORT_THREAD_KEY = report_thread_key(CONFIG)
+
+
+def _open_app_memory() -> Any:
+    """Open the shared memory database; the app keeps working without memory if this fails."""
+    try:
+        return open_memory(CONFIG.get("memory_schema", "memory"))
+    except Exception as exc:
+        print(f"Memory unavailable; continuing without memory: {exc}")
+        return None
+
+
+MEMORY = _open_app_memory()
 
 
 def _serialize_rows(rows: list[Any]) -> list[dict[str, Any]]:
@@ -76,7 +91,8 @@ def load_finance_summary(year: int | str | None, month: int) -> tuple[str, dict[
             month=month,
             rows=rows,
             selected_report_month=selected_month,
-            thread_key=f"finance-ui:{CONFIG.get('memory_schema', 'memory')}",
+            memory_module=MEMORY,
+            thread_key=REPORT_THREAD_KEY,
         )
         report_context = {
             "selected_month": result.snapshot.latest_month,
@@ -108,6 +124,7 @@ def answer_finance_question(question: str, report_context: dict[str, Any] | None
         config=CONFIG,
         ollama_url=OLLAMA_URL,
         model_name=OLLAMA_MODEL,
+        memory_module=MEMORY,
     )
 
 

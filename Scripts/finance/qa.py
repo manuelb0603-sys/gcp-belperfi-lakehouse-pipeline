@@ -12,8 +12,7 @@ from html.parser import HTMLParser
 from typing import Any
 
 from .memory_search import search_long_facts
-from .ollama import embed_texts, generate_text
-from .settings import PROJECT_ROOT
+from .ollama import embed_text, embed_texts, generate_text
 
 
 class _TextExtractor(HTMLParser):
@@ -112,15 +111,10 @@ _REPORT_INDEX = ReportContextIndex()
 
 
 def _memory_module(config: dict[str, Any]):
-    """Initialize the existing SQLite memory module for the configured schema."""
-    import memory
+    """Initialize the shared SQLite memory (MEMORY_DB_PATH or the configured schema)."""
+    from .memory import open_memory
 
-    schema = str(config.get("memory_schema", "memory"))
-    if not re.fullmatch(r"[A-Za-z0-9_]+", schema):
-        raise ValueError("memory_schema may contain only letters, numbers, and underscores")
-    database_path = PROJECT_ROOT / "agent" / "memory" / f"{schema}.sqlite3"
-    memory.init_db(str(database_path))
-    return memory
+    return open_memory(config.get("memory_schema", "memory"))
 
 
 def answer_finance_question(
@@ -159,7 +153,11 @@ def answer_finance_question(
         print(f"Selected-report vector search unavailable; including report data directly: {exc}")
         report_passages = [json.dumps(report_context, ensure_ascii=False, default=str)[:6000]]
 
-    memory_module = memory_module or _memory_module(config)
+    if memory_module is None:
+        try:
+            memory_module = _memory_module(config)
+        except Exception as exc:
+            print(f"Finance memory unavailable; answering without it: {exc}")
     try:
         long_facts, retrieval_method = search_long_facts(
             question,

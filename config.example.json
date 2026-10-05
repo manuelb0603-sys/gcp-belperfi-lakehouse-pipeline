@@ -12,12 +12,17 @@
   "days_back": 60,
   "ollama_stream": false,
   "ollama_timeout": 1800,
+  "ollama_options": {
+    "author": {"temperature": 0.3, "num_predict": 12000, "repeat_penalty": 1.1, "num_ctx": 32768},
+    "validator": {"think": false,"temperature": 0.1, "num_predict": 4000, "num_ctx": 32768}
+  },
   "embedding_model_name": "nomic-embed-text",
   "memory_schema": "memory",
   "Monthly_budget": "your-monthly-budget",
   "Fixed_costs": "Ex. Rent: $2000, Car Loan: $500",
   "Vehicle_Info": "2017 Honda Civic LX, 2022 Honda Accord",
   "Savings_goal_target": 2000,
+  "category_goals": {},
   "project_name": "your-gcp-project-id",
   "Gmail_app_credentials": "your_16_char_app_password",
   "email_listings": ["you@example.com"],

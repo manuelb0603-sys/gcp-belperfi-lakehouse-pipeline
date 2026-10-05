@@ -4,8 +4,6 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 import json
-import importlib.util
-import os
 import sys
 import re
 import time
@@ -14,6 +12,7 @@ from typing import Any
 
 from finance.ollama import embed_text, generate_text
 from finance.settings import load_config as _shared_load_config
+from finance.settings import memory_db_path
 from finance.settings import parse_money
 
 
@@ -192,7 +191,7 @@ def build_email_message(sender: str, receiver_header: str, report_text: str, pla
     msg_root.attach(msg_alt)
 
     if plain_text and plain_text.strip():
-        # Agent mode supplies a validated plain-text rendering of the report.
+        # Agent mode supplies plain text derived from the validated report HTML.
         plain_body = plain_text.strip()
     else:
         plain_lines = [f"Weekly Financial Progress — {date.today().strftime('%B %d, %Y')}", ""]
@@ -214,25 +213,12 @@ def send_email(sender: str, receivers: list[str], password: str, msg_root: MIMEM
 
 
 def _init_memory_module(memory_schema: str = "memory"):
-    """Load the SQLite-backed memory module for the selected schema if it exists."""
+    """Load the SQLite-backed memory module for the selected schema (MEMORY_DB_PATH overrides it)."""
     try:
-        if not re.fullmatch(r"[A-Za-z0-9_]+", memory_schema):
-            raise ValueError("memory_schema may contain only letters, numbers, and underscores")
+        from finance.memory import open_memory
 
-        memory_path = Path(__file__).with_name("memory.py")
-        # MEMORY_DB_PATH overrides the schema-derived default database location.
-        database_path = (
-            Path(os.environ["MEMORY_DB_PATH"])
-            if os.environ.get("MEMORY_DB_PATH")
-            else memory_path.parent.parent / "agent" / "memory" / f"{memory_schema}.sqlite3"
-        )
-        spec = importlib.util.spec_from_file_location("memory_module", str(memory_path))
-        if spec is None or spec.loader is None:
-            return None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        module.init_db(str(database_path))
-        log_status(f"Using memory schema '{memory_schema}' at {database_path}")
+        module = open_memory(memory_schema)
+        log_status(f"Using memory schema '{memory_schema}' at {memory_db_path(memory_schema)}")
         return module
     except Exception as exc:
         print(f"Memory initialization failed: {exc}")

@@ -1,10 +1,12 @@
+import os
 import unittest
 from datetime import date
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from finance import bigquery_tools
-from finance import qa, reporting
+from finance import qa, reporting, settings
 from finance.agent_harness import RunTrace
 from report_models import ValidationDecision
 
@@ -306,6 +308,38 @@ class TestFinanceQuestionMemory(unittest.TestCase):
             qa.answer_finance_question(" ", {"selected_month": "2026-02"}, "", {}, "url", "model", memory_module=object()),
             "Enter a question about the selected financial summary.",
         )
+
+
+class TestSharedMemoryResolution(unittest.TestCase):
+    def test_schema_path_without_override(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MEMORY_DB_PATH", None)
+            path = settings.memory_db_path("finance_v2")
+        self.assertEqual(path, settings.PROJECT_ROOT / "agent" / "memory" / "finance_v2.sqlite3")
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MEMORY_DB_PATH", None)
+            self.assertEqual(settings.memory_db_path(None).name, "memory.sqlite3")
+            with self.assertRaises(ValueError):
+                settings.memory_db_path("../escape")
+
+    def test_environment_override_wins(self):
+        with patch.dict(os.environ, {"MEMORY_DB_PATH": "C:/tmp/custom.sqlite3"}):
+            self.assertEqual(settings.memory_db_path("finance_v2"), Path("C:/tmp/custom.sqlite3"))
+
+    def test_qa_memory_uses_shared_resolution(self):
+        captured = []
+        with (
+            patch.dict(os.environ, {"MEMORY_DB_PATH": "C:/tmp/custom.sqlite3"}),
+            patch("finance.memory.init_db", side_effect=captured.append),
+        ):
+            module = qa._memory_module({"memory_schema": "other"})
+        self.assertTrue(hasattr(module, "get_or_create_thread"))
+        self.assertEqual(Path(captured[0]), Path("C:/tmp/custom.sqlite3"))
+
+    def test_report_thread_key_matches_email_flow(self):
+        self.assertEqual(settings.report_thread_key({"email_listings": ["a@x", "b@x"]}), "a@x, b@x")
+        self.assertEqual(settings.report_thread_key({"email_sender": "s@x"}), "s@x")
+        self.assertEqual(settings.report_thread_key({}), "email:unknown")
 
 
 if __name__ == "__main__":

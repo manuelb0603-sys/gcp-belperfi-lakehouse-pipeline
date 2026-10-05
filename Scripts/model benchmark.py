@@ -3,9 +3,11 @@ import time
 import urllib.request
 from pathlib import Path
 
+from finance.ollama import api_url
+
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 with CONFIG_PATH.open(encoding="utf-8") as config_file:
-    OLLAMA_URL = json.load(config_file)["model_server_url"]
+    OLLAMA_URL = api_url(json.load(config_file)["model_server_url"], "generate")
 
 # The exact tags to pull in Ollama before running:
 MODELS_TO_TEST = ["qwen3.5:35b", "qwen3.8:27b","qwen3.5:9b","qwen3-coder:30b", "qwen2.5-coder:14b","gemma4:12b","gemma4:31b"]

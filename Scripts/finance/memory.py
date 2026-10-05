@@ -107,6 +107,16 @@ def init_db(db_path: Optional[str] = None) -> str:
     return _DB_PATH
 
 
+def open_memory(memory_schema: str = "memory"):
+    """Initialize the shared memory database (see settings.memory_db_path) and return this module."""
+    import sys
+
+    from .settings import memory_db_path
+
+    init_db(str(memory_db_path(memory_schema)))
+    return sys.modules[__name__]
+
+
 def _get_conn():
     if not _DB_PATH:
         raise RuntimeError("Database not initialized. Call init_db() first.")

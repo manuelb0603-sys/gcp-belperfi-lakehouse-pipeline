@@ -80,7 +80,7 @@ class TestRememberReport(unittest.TestCase):
 
 class TestAgentRunFailureArchive(unittest.TestCase):
     def test_harness_failure_is_archived_as_exception_with_harness_trace(self):
-        error = RuntimeError("Maximum agent rounds exceeded")
+        error = RuntimeError("Unexpected harness failure")
         error.run_trace = SimpleNamespace(events=[{"event": "agent_round", "round": 1}])
         error.report_snapshot = SimpleNamespace(to_dict=lambda: {"latest_month": "2026-02-01"})
         saved = []
@@ -109,22 +109,19 @@ class TestAgentRunFailureArchive(unittest.TestCase):
 class TestMemoryPath(unittest.TestCase):
     def test_memory_db_path_environment_override(self):
         captured = []
-
-        def fake_exec(module):
-            module.init_db = lambda path: captured.append(path)
-
-        loader = SimpleNamespace(exec_module=fake_exec)
-        spec = SimpleNamespace(loader=loader)
         with (
             patch.dict(os.environ, {"MEMORY_DB_PATH": "C:/tmp/custom.sqlite3"}),
-            patch("importlib.util.spec_from_file_location", return_value=spec),
-            patch("importlib.util.module_from_spec", return_value=SimpleNamespace()),
+            patch("finance.memory.init_db", side_effect=captured.append),
             patch.object(weekly, "log_status"),
         ):
             module = weekly._init_memory_module("memory")
 
         self.assertIsNotNone(module)
         self.assertEqual(Path(captured[0]), Path("C:/tmp/custom.sqlite3"))
+
+    def test_memory_init_failure_returns_none(self):
+        with patch("finance.memory.init_db", side_effect=OSError("locked")):
+            self.assertIsNone(weekly._init_memory_module("memory"))
 
 
 if __name__ == "__main__":
