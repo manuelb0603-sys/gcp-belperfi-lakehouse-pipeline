@@ -1,4 +1,6 @@
+import json
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -83,6 +85,8 @@ class TestAgentRunFailureArchive(unittest.TestCase):
         error.report_snapshot = SimpleNamespace(to_dict=lambda: {"latest_month": "2026-02-01"})
         saved = []
         with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(weekly, "RUN_ARCHIVE_ROOT", Path(temp_dir)),
             patch("finance.reporting.generate_finance_report", side_effect=error),
             patch.object(run_archive, "save_run", side_effect=lambda *args: saved.append(args)),
             patch.object(weekly, "send_email") as send_email,

@@ -42,10 +42,22 @@ class RunTrace:
     # Keep a full execution timeline so the run can be inspected later for debugging,
     # auditing, and artifact comparison across runs.
     events: list[dict[str, Any]] = field(default_factory=list)
+    # Optional observers (for example a live progress recorder) notified of each event.
+    # Listener failures are reported once and never interrupt the run.
+    listeners: list[Callable[[dict[str, Any]], None]] = field(default_factory=list, repr=False, compare=False)
+    _listener_failed: bool = field(default=False, repr=False, compare=False)
 
     def add(self, event: str, **values: Any) -> None:
-        """Record a single event in the agent timeline."""
-        self.events.append({"event": event, "timestamp": time.time(), **values})
+        """Record a single event in the agent timeline and notify any listeners."""
+        item = {"event": event, "timestamp": time.time(), **values}
+        self.events.append(item)
+        for listener in self.listeners:
+            try:
+                listener(item)
+            except Exception as exc:
+                if not self._listener_failed:
+                    self._listener_failed = True
+                    print(f"Run trace listener failed; continuing without it: {exc}", flush=True)
 
 
 @dataclass
@@ -484,6 +496,7 @@ class ReportHarness:
             prompt=prompt,
             prompt_chars=len(prompt),
         )
+        started = time.perf_counter()
         try:
             response = self.query(
                 prompt,
@@ -493,8 +506,9 @@ class ReportHarness:
                 response_format=AUTHOR_RESPONSE_SCHEMA,
             )
         except Exception as exc:
-            self._record_exception("author_model_call", exc)
+            self._record_exception("author_model_call", exc, elapsed_seconds=round(time.perf_counter() - started, 3))
             raise
+        elapsed = round(time.perf_counter() - started, 3)
         try:
             result = parse_json_response(response)
             if "tool_calls" in result:
@@ -519,6 +533,7 @@ class ReportHarness:
                 error=str(exc),
                 raw_response=response,
                 response_chars=len(response),
+                elapsed_seconds=elapsed,
             )
             return {
                 "report_html": "",
@@ -534,6 +549,7 @@ class ReportHarness:
             keys=list(result),
             raw_response=response,
             response_chars=len(response),
+            elapsed_seconds=elapsed,
         )
         return result
 
@@ -551,6 +567,7 @@ class ReportHarness:
                 validation_cycle=cycle,
                 attempt=attempt + 1,
             )
+            started = time.perf_counter()
             try:
                 response = self.query(
                     retry_prompt,
@@ -560,8 +577,15 @@ class ReportHarness:
                     response_format=VALIDATOR_RESPONSE_SCHEMA,
                 )
             except Exception as exc:
-                self._record_exception("validator_model_call", exc, validation_cycle=cycle, attempt=attempt + 1)
+                self._record_exception(
+                    "validator_model_call",
+                    exc,
+                    validation_cycle=cycle,
+                    attempt=attempt + 1,
+                    elapsed_seconds=round(time.perf_counter() - started, 3),
+                )
                 raise
+            elapsed = round(time.perf_counter() - started, 3)
             try:
                 payload = parse_json_response(response)
                 break
@@ -575,6 +599,7 @@ class ReportHarness:
                     response_chars=len(response),
                     validation_cycle=cycle,
                     attempt=attempt + 1,
+                    elapsed_seconds=elapsed,
                 )
                 if attempt == 0:
                     retry_prompt = (
@@ -604,6 +629,7 @@ class ReportHarness:
                 payload=payload,
                 raw_response=response,
                 response_chars=len(response),
+                elapsed_seconds=elapsed,
             )
             return ValidationDecision("fail", [], "Validator decision was missing or invalid; report was not accepted.")
         try:
@@ -620,6 +646,7 @@ class ReportHarness:
             payload=payload,
             raw_response=response,
             response_chars=len(response),
+            elapsed_seconds=elapsed,
         )
         return result
 

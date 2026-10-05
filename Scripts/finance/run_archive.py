@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import html
 import json
+import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,10 +26,23 @@ def save_run(root: Path, run_id: str, manifest: dict[str, Any], trace: list[dict
 def update_index(root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
-    for metrics_path in sorted(root.glob("*/metrics.json"), reverse=True):
+    for run_dir in sorted((path for path in root.iterdir() if path.is_dir()), reverse=True):
+        # Finished runs have metrics.json; in-progress runs only have progress.json.
         try:
-            item = json.loads(metrics_path.read_text(encoding="utf-8"))
-            item["run_id"] = metrics_path.parent.name
+            if (run_dir / "metrics.json").exists():
+                item = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+            elif (run_dir / "progress.json").exists():
+                progress = json.loads((run_dir / "progress.json").read_text(encoding="utf-8"))
+                item = {
+                    "model": progress.get("model"),
+                    "mode": "agent",
+                    "status": progress.get("status"),
+                    "runtime_seconds": progress.get("elapsed_seconds"),
+                    "tool_calls": progress.get("tool_calls"),
+                }
+            else:
+                continue
+            item["run_id"] = run_dir.name
             rows.append(item)
         except (OSError, json.JSONDecodeError):
             continue
@@ -64,3 +79,162 @@ function compareSelected() {{
     index = root / "index.html"
     index.write_text(page, encoding="utf-8")
     return index
+
+class ProgressRecorder:
+    """Stream run trace events into the run directory so an in-progress run can be watched.
+
+    Writes trace.jsonl (one event per line, appended as it happens), progress.json (a
+    small status snapshot), and progress.log (one readable line per meaningful event).
+    save_run rewrites trace.jsonl once at the end with the complete trace.
+    """
+
+    def __init__(self, run_dir: Path, run_id: str, model: str, validator_model: str, echo: bool = True) -> None:
+        self.run_dir = Path(run_dir)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.echo = echo
+        self._started = time.perf_counter()
+        now = datetime.now(timezone.utc).isoformat()
+        self.state: dict[str, Any] = {
+            "run_id": run_id,
+            "status": "running",
+            "model": model,
+            "validator_model": validator_model,
+            "started_at": now,
+            "updated_at": now,
+            "elapsed_seconds": 0.0,
+            "phase": "starting",
+            "agent_round": None,
+            "validation_cycle": None,
+            "last_event": None,
+            "tool_calls": 0,
+            "last_validation_error_count": None,
+        }
+        self._write_progress()
+        self.log(f"Run {run_id} started (author={model}, validator={validator_model})")
+
+    def __call__(self, event: dict[str, Any]) -> None:
+        """RunTrace listener: persist the event and refresh the live status files."""
+        with (self.run_dir / "trace.jsonl").open("a", encoding="utf-8") as trace_file:
+            trace_file.write(json.dumps(event, default=str) + "\n")
+        self._update_state(event)
+        line = _describe_event(event)
+        if line:
+            self.log(line)
+        self._write_progress()
+
+    def log(self, message: str) -> None:
+        """Append one timestamped line to progress.log and echo it to the console."""
+        line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"
+        try:
+            with (self.run_dir / "progress.log").open("a", encoding="utf-8") as log_file:
+                log_file.write(line + "\n")
+        except OSError as exc:
+            print(f"Could not write progress.log: {exc}", flush=True)
+        if self.echo:
+            print(line, flush=True)
+
+    def finish(self, status: str, **details: Any) -> None:
+        """Record the final run status; never raises so archiving and delivery can continue."""
+        self.state.update(details)
+        self.state["status"] = status
+        self.state["phase"] = "finished"
+        summary = ", ".join(f"{key}={value}" for key, value in details.items())
+        self.log(f"Run finished: status={status}" + (f" ({summary})" if summary else ""))
+        self._write_progress()
+
+    def move_to(self, run_dir: Path) -> bool:
+        """Rename the run directory (for example to add a _failed suffix) when it is safe."""
+        target = Path(run_dir)
+        if target.exists():
+            return False
+        try:
+            os.replace(self.run_dir, target)
+        except OSError:
+            return False
+        self.run_dir = target
+        self.state["run_id"] = target.name
+        self._write_progress()
+        return True
+
+    def _update_state(self, event: dict[str, Any]) -> None:
+        name = event.get("event")
+        self.state["last_event"] = name
+        if name == "agent_round":
+            self.state["agent_round"] = event.get("round")
+            self.state["phase"] = "author"
+        elif name == "model_call":
+            self.state["phase"] = f"{event.get('role')}_model_call"
+        elif name in {"tool_call", "tool_error"}:
+            self.state["phase"] = "tools"
+            if name == "tool_call":
+                self.state["tool_calls"] += 1
+        elif name == "validation_cycle_start":
+            self.state["validation_cycle"] = event.get("cycle")
+            self.state["phase"] = "validation"
+        elif name == "validation_cycle_result":
+            if event.get("error_count") is not None:
+                self.state["last_validation_error_count"] = event.get("error_count")
+        elif name == "run_completed":
+            self.state["phase"] = "completed"
+        elif name == "run_aborted":
+            self.state["phase"] = "aborted"
+
+    def _write_progress(self) -> None:
+        self.state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.state["elapsed_seconds"] = round(time.perf_counter() - self._started, 1)
+        path = self.run_dir / "progress.json"
+        temp_path = self.run_dir / "progress.json.tmp"
+        payload = json.dumps(self.state, indent=2, default=str)
+        try:
+            temp_path.write_text(payload, encoding="utf-8")
+            os.replace(temp_path, path)
+        except OSError:
+            # A reader holding progress.json open on Windows can block the atomic swap.
+            try:
+                path.write_text(payload, encoding="utf-8")
+                temp_path.unlink(missing_ok=True)
+            except OSError as exc:
+                print(f"Could not write progress.json: {exc}", flush=True)
+
+
+def _describe_event(event: dict[str, Any]) -> str | None:
+    """Turn a trace event into a short progress.log line, or None for low-signal events."""
+    name = event.get("event")
+    if name == "run_started":
+        return f"Harness started; tools: {', '.join(event.get('tool_names') or []) or 'none'}"
+    if name == "agent_round":
+        return f"Author round {event.get('round')}"
+    if name == "model_call":
+        where = ""
+        if event.get("validation_cycle") is not None:
+            where = f", validation cycle {event.get('validation_cycle')} attempt {event.get('attempt')}"
+        return f"{event.get('role')} model call started ({event.get('model')}, {event.get('prompt_chars', 0):,} prompt chars{where})"
+    if name == "model_response":
+        return (
+            f"{event.get('role')} response: parse {event.get('parse_status')}, "
+            f"{event.get('response_chars', 0):,} chars in {event.get('elapsed_seconds', '?')}s"
+        )
+    if name == "tool_call":
+        return f"Tool {event.get('name')} ok ({event.get('phase')})"
+    if name == "tool_error":
+        return f"Tool {event.get('name')} error: {event.get('error_type')}: {event.get('error')}"
+    if name in {"author_format_retry", "validator_format_retry"}:
+        return f"{name.replace('_', ' ')}: {event.get('error')}"
+    if name == "validation_cycle_start":
+        return f"Validation cycle {event.get('cycle')} started ({event.get('report_html_bytes', 0):,} report bytes)"
+    if name == "report_sanitization_failed":
+        return f"HTML gate rejected report ({event.get('category')}): {event.get('error')}"
+    if name == "validation_cycle_result":
+        return (
+            f"Validation cycle {event.get('cycle')} result ({event.get('stage', 'validator')}): "
+            f"{event.get('decision')}, {event.get('error_count', '?')} errors, {event.get('warning_count', '?')} warnings"
+        )
+    if name == "exception":
+        return f"Exception in {event.get('phase')}: {event.get('exception_type')}: {event.get('error')}"
+    if name == "run_completed":
+        return f"Harness completed: decision={event.get('decision')}, tool calls={event.get('tool_calls')}"
+    if name == "run_aborted":
+        reason = event.get("exception_type") or event.get("status") or "aborted"
+        error = event.get("error")
+        return f"Harness aborted: {reason}" + (f": {error}" if error else "")
+    return None

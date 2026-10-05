@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .agent_harness import HarnessLimits, ReportHarness, ToolSpec
 from .bigquery_tools import (
@@ -211,8 +211,12 @@ def generate_finance_report(
     month: int | None = None,
     rows: list[Any] | None = None,
     selected_report_month: date | None = None,
+    trace_listeners: list[Callable[[dict[str, Any]], None]] | None = None,
 ) -> FinanceReportResult:
-    """Build and validate an HTML report for latest or explicitly selected finance month."""
+    """Build and validate an HTML report for latest or explicitly selected finance month.
+
+    trace_listeners receive each harness trace event as it happens (for live progress).
+    """
     if rows is None:
         selected_report_month, rows = _report_rows(config, project_name, year, month)
     if not rows:
@@ -245,6 +249,8 @@ def generate_finance_report(
         limits=limits,
         timeout=int(config.get("ollama_timeout", 600)),
     )
+    if trace_listeners:
+        harness.trace.listeners.extend(trace_listeners)
     prompt_dir = PROJECT_ROOT / "agent" / "prompts"
     author_files = ["personality.system.md", "ui.system.md", "financial-settings.md"]
     prompt_context = "\n\n".join((prompt_dir / filename).read_text(encoding="utf-8") for filename in author_files)

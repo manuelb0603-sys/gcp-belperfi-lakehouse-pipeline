@@ -6,6 +6,7 @@ from pathlib import Path
 import json
 import importlib.util
 import os
+import sys
 import re
 import time
 import traceback
@@ -27,7 +28,7 @@ def log_status(message: str, start_time: float | None = None) -> None:
     suffix = ""
     if start_time is not None:
         suffix = f" | elapsed={time.perf_counter() - start_time:.1f}s"
-    print(f"[{timestamp}] {message}{suffix}")
+    print(f"[{timestamp}] {message}{suffix}", flush=True)
 
 
 def load_config(config_path: Path) -> dict:
@@ -334,6 +335,23 @@ def _remember_report(memory_module: Any, sender: str, receivers: list[str], rece
         print(f"Memory logging failed: {exc}")
 
 
+RUN_ARCHIVE_ROOT = Path(__file__).resolve().parent.parent / "agent" / "runs"
+
+
+def _start_progress(archive_root: Path, run_id: str, model_name: str, validator_model: str) -> Any:
+    """Create the run directory and live progress files up front; a failure only disables them."""
+    from run_archive import ProgressRecorder, update_index
+
+    try:
+        progress = ProgressRecorder(archive_root / run_id, run_id, model_name, validator_model)
+        update_index(archive_root)
+        log_status(f"Live run progress: {progress.run_dir / 'progress.log'}")
+        return progress
+    except Exception as exc:
+        print(f"Live run progress unavailable; continuing without it: {exc}", flush=True)
+        return None
+
+
 def run_agent_weekly_report(
     config: dict,
     results: list,
@@ -353,6 +371,11 @@ def run_agent_weekly_report(
 
     started = time.perf_counter()
     thread_key = receiver_header or sender or "email:unknown"
+    validator_model = config.get("validator_model_name", model_name)
+    archive_root = RUN_ARCHIVE_ROOT
+    # One run directory is created at start so progress can be watched while the run executes.
+    run_id = datetime.now().strftime("%Y%m%dT%H%M%S") + f"_{model_name.replace(':', '_')}"
+    progress = _start_progress(archive_root, run_id, model_name, validator_model)
     try:
         result = generate_finance_report(
             config=config,
@@ -361,13 +384,17 @@ def run_agent_weekly_report(
             model_name=model_name,
             memory_module=memory_module,
             thread_key=thread_key,
+            trace_listeners=[progress] if progress is not None else None,
         )
     except Exception as exc:
-        print(f"Shared finance report generation failed: {exc}")
+        print(f"Shared finance report generation failed: {exc}", flush=True)
         failed_trace = getattr(exc, "run_trace", None)
         failed_snapshot = getattr(exc, "report_snapshot", None)
-        run_id = datetime.now().strftime("%Y%m%dT%H%M%S") + f"_{model_name.replace(':', '_')}_failed"
-        archive_root = Path(__file__).resolve().parent.parent / "agent" / "runs"
+        # Keep the _failed suffix by renaming the live directory; if that is not possible,
+        # keep the original directory and record the failure in its status files.
+        failed_run_id = f"{run_id}_failed"
+        if progress is None or progress.move_to(archive_root / failed_run_id):
+            run_id = failed_run_id
         events = failed_trace.events if failed_trace is not None else []
         events.append({
             "event": "exception",
@@ -380,7 +407,7 @@ def run_agent_weekly_report(
         events.append({"event": "run_aborted", "timestamp": time.time(), "phase": "finance_report_generation"})
         failed_metrics = {
             "model": model_name,
-            "validator_model": config.get("validator_model_name", model_name),
+            "validator_model": validator_model,
             "mode": "agent",
             "status": "exception",
             "validation": "error",
@@ -392,6 +419,8 @@ def run_agent_weekly_report(
             "validator_calls": sum(event.get("event") == "model_call" and event.get("role") == "validator" for event in events),
             "report_bytes": 0,
         }
+        if progress is not None:
+            progress.finish("exception", error=f"{type(exc).__name__}: {exc}")
         save_run(
             archive_root,
             run_id,
@@ -411,8 +440,6 @@ def run_agent_weekly_report(
         print(f"Failed agent run trace archived at {archive_root / run_id}")
         return
 
-    run_id = datetime.now().strftime("%Y%m%dT%H%M%S") + f"_{model_name.replace(':', '_')}"
-    archive_root = Path(__file__).resolve().parent.parent / "agent" / "runs"
     save_run(
         archive_root,
         run_id,
@@ -430,9 +457,13 @@ def run_agent_weekly_report(
     print(f"Agent run archived at {archive_root / run_id}")
     if not result.passed:
         print("Report was not sent because validation did not pass.")
+        if progress is not None:
+            progress.finish(result.metrics["status"], delivery="not_sent")
         return
     if config.get("dry_run", False):
         print("Dry run enabled; report was rendered and archived but not sent.")
+        if progress is not None:
+            progress.finish(result.metrics["status"], delivery="dry_run")
         return
 
     msg_root = build_email_message(sender, receiver_header, result.report_html, plain_text=result.plain_text)
@@ -465,7 +496,11 @@ def run_agent_weekly_report(
             result.metrics,
         )
         print(f"Email delivery failed; updated run trace archived at {archive_root / run_id}: {exc}")
+        if progress is not None:
+            progress.finish("delivery_failed", delivery="failed", error=f"{type(exc).__name__}: {exc}")
         return
+    if progress is not None:
+        progress.finish(result.metrics["status"], delivery="sent")
     memory_module = _init_memory_module(memory_schema)
     _remember_report(
         memory_module,
@@ -588,4 +623,9 @@ def run_weekly_report(config_path: Path | None = None) -> None:
 
 
 if __name__ == "__main__":
+    # Show progress lines immediately even when output is redirected to a file.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
     run_weekly_report()
