@@ -17,7 +17,7 @@
   "Monthly_budget": "your-monthly-budget",
   "Fixed_costs": "Ex. Rent: $2000, Car Loan: $500",
   "Vehicle_Info": "2017 Honda Civic LX, 2022 Honda Accord",
-  "Savings_goal": "ideally 2k per month",
+  "Savings_goal_target": 2000,
   "project_name": "your-gcp-project-id",
   "Gmail_app_credentials": "your_16_char_app_password",
   "email_listings": ["you@example.com"],

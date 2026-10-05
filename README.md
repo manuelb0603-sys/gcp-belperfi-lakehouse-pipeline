@@ -91,7 +91,7 @@ This workflow is useful for automating local CSV ingestion into GCS while keepin
 
 The report can run in two modes. `report_mode: "legacy"` preserves the original single-prompt flow. `report_mode: "agent"` uses bounded tools, an author model, and an independent validator model. The author can create a different seasonal HTML layout on each run. The validator checks current financial values, evidence, history labels, policy, required content, and HTML safety. Failed validation feeds structured feedback back to the author for a limited number of revisions. Email is sent only after validation passes.
 
-Set `dry_run` to `true` to execute the BigQuery, memory, author, validator, and rendering flow without sending email. Each run is saved under `agent/runs/<run_id>/` with its HTML report, plain text, trace, manifest, and metrics. Open `agent/runs/index.html` in a browser to view reports and compare objective metrics across models and runs. The index is regenerated automatically after each run.
+Set `dry_run` to `true` to execute the BigQuery, memory, author, validator, and rendering flow without sending email. Each run is saved under `agent/runs/<run_id>/` with its HTML report, plain text, trace, manifest, and metrics. Failures after the agent harness starts are also archived with the available trace and traceback before control returns to the email workflow. The JSONL trace records model prompts/raw responses, tool calls and errors, recovery actions, and each validation cycle's outcome. For revisions, the author receives the validator feedback plus per-category error-count changes, while the validator receives the prior review as comparison context and must independently reassess the new report. Metrics summarize model calls, rounds, tools, retries, report size, and initial-to-final validator-reported error counts. These progress counts help spot resolved or recurring findings; they are based on model findings, not a deterministic correctness score, and do not train or permanently change the model. Traces can contain financial details and transaction evidence, so keep the run archive private and do not commit or share it indiscriminately. Open `agent/runs/index.html` in a browser to view reports and compare objective metrics across models and runs. The index is regenerated automatically after each run.
 
 #### Runtime config knobs
 
@@ -123,7 +123,7 @@ The `email_weekly_report.py` script generates an intelligent weekly financial in
 
 ### Report Memory
 
-The `Scripts/memory.py` module manages the report's local SQLite memory database. The database is created automatically at `agent/memory/memory.sqlite3` when the weekly report runs. Set the `MEMORY_DB_PATH` environment variable to use a different location.
+The `Scripts/memory.py` module manages the report's local SQLite memory database. The database is created automatically at `agent/memory/<memory_schema>.sqlite3` (default `agent/memory/memory.sqlite3`) when the weekly report runs. Set the `MEMORY_DB_PATH` environment variable to use a different location; when set, it takes precedence over the `memory_schema`-derived path.
 
 Memory is organized into three tables:
 * `threads` stores stable internal identifiers for report conversations. External keys are hashed before storage.
@@ -144,7 +144,7 @@ The SQLite database and SQL scratch files are excluded from Git. Delete the loca
      "Monthly_budget": 5000,                        // Your monthly deposit amount  
      "Fixed_costs": 1500,                           // Total fixed expenses per month
      "Vehicle_Info": "Sedan - Gas & Insurance included", 
-     "Savings_goal": 1000
+   "Savings_goal_target": 1000                 // Monthly savings target in USD
    }
    ```
 

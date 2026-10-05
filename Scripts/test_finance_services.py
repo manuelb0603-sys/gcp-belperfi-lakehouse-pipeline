@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from finance import bigquery_tools
 from finance import qa, reporting
+from finance.agent_harness import RunTrace
 from report_models import ValidationDecision
 
 
@@ -76,6 +77,22 @@ class TestPeriodAwareBigQueryHelpers(unittest.TestCase):
 
 
 class TestSharedFinanceReportService(unittest.TestCase):
+    def test_semantic_memory_empty_query_returns_actionable_error(self):
+        snapshot = SimpleNamespace(latest_month="2026-02-01", previous_month="2026-01-01")
+        tools = reporting._build_tools(
+            config={},
+            project_name="project",
+            snapshot=snapshot,
+            rows=[],
+            memory_module=object(),
+            thread_key="finance:test",
+            ollama_url="http://ollama/api/generate",
+            model_name="model",
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires a non-empty 'query'"):
+            tools["get_semantic_memory"].function({})
+
     def test_period_row_selector_does_not_use_predecessor_as_selected_month(self):
         previous_only = [{"transaction_month": "2026-01-01", "category": "Groceries", "net_real_expense": 10}]
         with patch.object(
@@ -117,7 +134,11 @@ class TestSharedFinanceReportService(unittest.TestCase):
 
         with patch.object(reporting, "ReportHarness", FakeHarness):
             result = reporting.generate_finance_report(
-                config={"Monthly_budget": 8500, "Fixed_costs": 1000, "Savings_goal": 1000},
+                config={
+                    "Monthly_budget": 8500,
+                    "Fixed_costs": 1000,
+                    "Savings_goal_target": 2000,
+                },
                 project_name="project",
                 ollama_url="http://ollama/api/generate",
                 model_name="model",
@@ -129,6 +150,73 @@ class TestSharedFinanceReportService(unittest.TestCase):
         self.assertIn("February finance report", result.report_html)
         self.assertEqual(result.snapshot.latest_month, "2026-02-01")
         self.assertEqual(result.snapshot.previous_month, "2026-01-01")
+        self.assertEqual(result.snapshot.savings_goal, 2000)
+
+
+    def test_generator_reraises_harness_failure_with_trace_and_snapshot(self):
+        rows = [
+            {"transaction_month": date(2026, 2, 1), "category": "Groceries", "parent_group": "Needs", "net_real_expense": 450},
+            {"transaction_month": date(2026, 1, 1), "category": "Groceries", "parent_group": "Needs", "net_real_expense": 400},
+        ]
+
+        class FailingHarness:
+            def __init__(self, **kwargs):
+                self.trace = RunTrace()
+
+            def run(self, **kwargs):
+                self.trace.add("run_aborted", error="boom")
+                raise RuntimeError("boom")
+
+        with patch.object(reporting, "ReportHarness", FailingHarness):
+            with self.assertRaises(RuntimeError) as raised:
+                reporting.generate_finance_report(
+                    config={"Monthly_budget": 8500, "Fixed_costs": 1000},
+                    project_name="project",
+                    ollama_url="http://ollama/api/generate",
+                    model_name="model",
+                    rows=rows,
+                    selected_report_month=date(2026, 2, 1),
+                )
+
+        events = [event["event"] for event in raised.exception.run_trace.events]
+        self.assertIn("run_aborted", events)
+        self.assertEqual(events[-1], "exception")
+        self.assertEqual(raised.exception.report_snapshot.latest_month, "2026-02-01")
+
+    def test_tool_specs_use_their_registered_names(self):
+        snapshot = SimpleNamespace(latest_month="2026-02-01", previous_month="2026-01-01")
+        tools = reporting._build_tools({}, "project", snapshot, [], None, "finance:test", "url", "model")
+
+        for key, spec in tools.items():
+            self.assertEqual(spec.name, key)
+        self.assertIn("historical", tools["get_episodic_memory"].description)
+        self.assertIn("prior report", tools["get_report_history"].description)
+
+    def test_report_history_excerpts_visible_text_not_css(self):
+        class FakeMemory:
+            def get_or_create_thread(self, channel, key):
+                return "thread"
+
+            def get_short_term(self, thread_id, limit):
+                return [
+                    {
+                        "subject": "Old HTML-only report",
+                        "response_html": None,
+                        "response_text": "<html><head><style>body{color:#123}</style></head><body><h1>Hello from February</h1></body></html>",
+                    },
+                    {"subject": "Plain report", "response_html": "<p>ignored</p>", "response_text": "Plain   summary text"},
+                    {"subject": "Empty", "response_html": "<style>x{}</style>", "response_text": ""},
+                ]
+
+        snapshot = SimpleNamespace(latest_month="2026-02-01", previous_month="2026-01-01")
+        tools = reporting._build_tools({}, "project", snapshot, [], FakeMemory(), "finance:test", "url", "model")
+        reports = tools["get_report_history"].function({})["reports"]
+
+        self.assertEqual(len(reports), 2)
+        self.assertIn("Hello from February", reports[0]["excerpt"])
+        self.assertNotIn("color:#123", reports[0]["excerpt"])
+        self.assertTrue(reports[0]["excerpt"].startswith("Previous report for reference:"))
+        self.assertIn("Plain summary text", reports[1]["excerpt"])
 
 
 class TestSharedLongFactSearch(unittest.TestCase):

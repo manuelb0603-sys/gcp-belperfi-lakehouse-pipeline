@@ -14,6 +14,15 @@ class CategoryMetric:
     mom_change_percent: float | None
     goal_amount: float | None
     goal_percent: float | None
+    # Deterministic goal and chart fields; the author copies these instead of recomputing.
+    is_discretionary: bool = False
+    suggested_cap: float | None = None
+    cap_source: str | None = None
+    cap_basis: str = ""
+    percent_of_cap: float | None = None
+    bar_width_percent: float = 0.0
+    is_refund: bool = False
+    mom_direction: str = "no_prior"
 
 
 @dataclass(frozen=True)
@@ -30,6 +39,14 @@ class ReportSnapshot:
     savings_goal: float | None
     categories: list[CategoryMetric] = field(default_factory=list)
     source_tables: list[str] = field(default_factory=list)
+    projected_savings: float | None = None
+    savings_shortfall: float | None = None
+    eligible_discretionary_total: float = 0.0
+    goal_method: str = "no_savings_target"
+    discretionary_cuts_insufficient: bool = False
+    remaining_gap_after_cuts: float | None = None
+    max_positive_spend: float = 0.0
+    top_discretionary_categories: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

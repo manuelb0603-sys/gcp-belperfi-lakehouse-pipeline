@@ -2,22 +2,54 @@
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
 from .agent_harness import HarnessLimits, ReportHarness, ToolSpec
 from .bigquery_tools import (
     get_category_detail,
-    get_monthly_spending,
     get_report_period_spending,
     get_transaction_detail,
 )
 from .report_metrics import calculate_report_snapshot
 from .memory_search import search_long_facts
 from .settings import PROJECT_ROOT, parse_money
+
+
+class _HistoryTextExtractor(HTMLParser):
+    """Collect visible text from a stored report, skipping style and script blocks."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() in {"style", "script", "head", "title"}:
+            self.skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in {"style", "script", "head", "title"} and self.skip_depth:
+            self.skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self.skip_depth and data.strip():
+            self.parts.append(data.strip())
+
+
+def _history_text(entry: dict[str, Any]) -> str:
+    """Prefer stored plain text; otherwise strip markup so excerpts are not CSS boilerplate."""
+    text = str(entry.get("response_text") or "")
+    if not text.strip() or re.search(r"<\s*(html|body|style|div|table)\b", text, re.I):
+        parser = _HistoryTextExtractor()
+        parser.feed(text if text.strip() else str(entry.get("response_html") or ""))
+        text = " ".join(parser.parts)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 @dataclass
@@ -60,14 +92,6 @@ def _report_rows(config: dict[str, Any], project_name: str, year: int | None, mo
         )
         if not has_selected_month:
             return report_month, []
-    if report_month is None and rows:
-        months = sorted({
-            row.get("transaction_month") if isinstance(row, dict) else row.transaction_month
-            for row in rows
-        }, reverse=True)
-        report_month = months[0]
-        period = get_monthly_spending(project_name, report_month)
-        rows = period["rows"]
     return report_month, rows
 
 
@@ -110,7 +134,12 @@ def _build_tools(
     def semantic_memory(arguments: dict[str, Any]) -> dict[str, Any]:
         if memory_module is None:
             return {"retrieval": "unavailable", "facts": []}
-        query_text = str(arguments.get("query", "")).strip()
+        query_text = str(arguments.get("query") or "").strip()
+        if not query_text:
+            raise ValueError(
+                "get_semantic_memory requires a non-empty 'query'. Retry with a focused "
+                "natural-language query, or skip memory retrieval if none is needed."
+            )
         embedding_model = config.get("embedding_model_name", "nomic-embed-text")
         timeout = int(config.get("ollama_timeout", 600))
         limit = min(10, max(1, int(arguments.get("limit", 5))))
@@ -127,16 +156,15 @@ def _build_tools(
 
     def report_history(_: dict[str, Any]) -> dict[str, Any]:
         entries = episodic_memory({}).get("entries", [])
-        return {
-            "reports": [
-                {
+        reports = []
+        for entry in entries:
+            text = _history_text(entry)
+            if text:
+                reports.append({
                     "subject": entry.get("subject") or "Prior weekly report",
-                    "excerpt": f"Previous report for reference: {(entry.get('response_text') or entry.get('response_html') or '')[:1000]} (historical; not authoritative)",
-                }
-                for entry in entries
-                if entry.get("response_text") or entry.get("response_html")
-            ]
-        }
+                    "excerpt": f"Previous report for reference: {text[:1000]} (historical; not authoritative)",
+                })
+        return {"reports": reports}
 
     return {
         "get_spending_summary": ToolSpec(
@@ -156,11 +184,19 @@ def _build_tools(
         ),
         "get_semantic_memory": ToolSpec(
             "get_semantic_memory",
-            "Hybrid-search long-term historical facts for relevant preferences, goals, or habits. These facts are not current financial evidence. Arguments: query, optional limit.",
+            "Hybrid-search long-term historical facts for relevant preferences, goals, or habits. These facts are not current financial evidence. Requires a focused non-empty query; if no context is needed, skip this tool.",
             semantic_memory,
         ),
-        "get_episodic_memory": ToolSpec("Get recent report thread context, which is historical only.", "Historical report thread entries.", episodic_memory),
-        "get_report_history": ToolSpec("Get labeled prior report excerpts for historical style/context only.", "Historical prior reports.", report_history),
+        "get_episodic_memory": ToolSpec(
+            "get_episodic_memory",
+            "Get recent report thread context, which is historical only.",
+            episodic_memory,
+        ),
+        "get_report_history": ToolSpec(
+            "get_report_history",
+            "Get labeled prior report excerpts for historical style/context only.",
+            report_history,
+        ),
     }
 
 
@@ -185,7 +221,11 @@ def generate_finance_report(
         rows,
         monthly_deposit=parse_money(config.get("Monthly_budget")),
         fixed_costs=parse_money(config.get("Fixed_costs")),
-        savings_goal=parse_money(config.get("Savings_goal")) if config.get("Savings_goal") else None,
+        savings_goal=(
+            parse_money(config["Savings_goal_target"])
+            if config.get("Savings_goal_target") is not None
+            else None
+        ),
         category_goals=config.get("category_goals", {}),
     )
     if selected_report_month is not None and snapshot.latest_month != selected_report_month.isoformat():
@@ -212,8 +252,6 @@ def generate_finance_report(
     tools = _build_tools(config, project_name, snapshot, rows, memory_module, thread_key, ollama_url, model_name)
     selected_label = date.fromisoformat(snapshot.latest_month).strftime("%B %Y")
     started = time.perf_counter()
-    report: dict[str, Any] = {}
-    decision = None
     trace = harness.trace
     try:
         report, decision, trace = harness.run(
@@ -225,10 +263,21 @@ def generate_finance_report(
         )
     except Exception as exc:
         trace.add("exception", phase="finance_report_generation", exception_type=type(exc).__name__, error=str(exc))
+        try:
+            setattr(exc, "run_trace", trace)
+            setattr(exc, "report_snapshot", snapshot)
+        except Exception:
+            pass
         print(f"Finance report generation failed: {exc}")
+        raise
 
     report_html = str(report.get("report_html", ""))
     plain_text = str(report.get("plain_text", ""))
+    progress_events = [
+        event for event in trace.events if event.get("event") == "validation_progress"
+    ]
+    initial_validation_errors = progress_events[0]["error_count"] if progress_events else None
+    final_validation_errors = progress_events[-1]["error_count"] if progress_events else None
     metrics = {
         "model": model_name,
         "validator_model": config.get("validator_model_name", model_name),
@@ -238,6 +287,26 @@ def generate_finance_report(
         "runtime_seconds": round(time.perf_counter() - started, 3),
         "agent_rounds": sum(event.get("event") == "agent_round" for event in trace.events),
         "tool_calls": sum(event.get("event") == "tool_call" for event in trace.events),
+        "validation_cycles": sum(event.get("event") == "validation_cycle_result" for event in trace.events),
+        "validator_calls": sum(
+            event.get("event") == "model_call" and event.get("role") == "validator"
+            for event in trace.events
+        ),
+        "author_format_retries": sum(event.get("event") == "author_format_retry" for event in trace.events),
+        "validator_format_retries": sum(event.get("event") == "validator_format_retry" for event in trace.events),
+        "initial_validation_errors": initial_validation_errors,
+        "final_validation_errors": final_validation_errors,
+        "validation_error_reduction": (
+            initial_validation_errors - final_validation_errors
+            if initial_validation_errors is not None and final_validation_errors is not None
+            else None
+        ),
+        "validation_cycles_improved": sum(
+            (event.get("error_count_delta") or 0) > 0 for event in progress_events
+        ),
+        "validation_cycles_regressed": sum(
+            (event.get("error_count_delta") or 0) < 0 for event in progress_events
+        ),
         "report_bytes": len(report_html.encode("utf-8")),
     }
     return FinanceReportResult(report_html, plain_text, snapshot, decision, trace, metrics, rows)

@@ -31,7 +31,7 @@ def update_index(root: Path) -> Path:
             rows.append(item)
         except (OSError, json.JSONDecodeError):
             continue
-    headers = ["run_id", "model", "mode", "status", "validation", "runtime_seconds", "agent_rounds", "tool_calls", "report_bytes"]
+    headers = ["run_id", "model", "mode", "status", "validation", "runtime_seconds", "agent_rounds", "tool_calls", "validation_cycles", "validator_calls", "author_format_retries", "validator_format_retries", "initial_validation_errors", "final_validation_errors", "validation_error_reduction", "validation_cycles_improved", "validation_cycles_regressed", "report_bytes"]
     table_rows = []
     for item in rows:
         run_id = html.escape(str(item.get("run_id", "")))
@@ -57,7 +57,7 @@ const metrics = {json.dumps({item.get("run_id"): item for item in rows}, default
 function compareSelected() {{
     const ids = [...document.querySelectorAll('.run-select:checked')].map(item => item.value);
     if (ids.length < 2) {{ document.getElementById('comparison').textContent = 'Select at least two runs.'; return; }}
-    const keys = ['model','mode','status','validation','runtime_seconds','agent_rounds','tool_calls','report_bytes'];
+    const keys = ['model','mode','status','validation','runtime_seconds','agent_rounds','tool_calls','validation_cycles','validator_calls','author_format_retries','validator_format_retries','initial_validation_errors','final_validation_errors','validation_error_reduction','validation_cycles_improved','validation_cycles_regressed','report_bytes'];
     document.getElementById('comparison').textContent = keys.map(key => key + ': ' + ids.map(id => id + '=' + (metrics[id][key] ?? '')).join(' | ')).join('\\n');
 }}
 </script></body></html>"""

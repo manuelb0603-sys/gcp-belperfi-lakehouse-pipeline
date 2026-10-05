@@ -5,8 +5,10 @@ from email.mime.text import MIMEText
 from pathlib import Path
 import json
 import importlib.util
+import os
 import re
 import time
+import traceback
 from typing import Any
 
 from finance.ollama import embed_text, generate_text
@@ -127,16 +129,11 @@ def _memory_context_to_prompt(memory_module: Any, receiver_header: str, sender: 
 def build_ollama_prompt(config: dict, data_payload: str, memory_context: str | None = None) -> str:
     """Compose the final prompt so the model knows the objective, constraints, and data sources."""
     memory_context = memory_context or ""
-    return f"""System: You are a friendly financial assistant hungry for insights named Mogumogu-chan, writing a short, clear email. Mogumogu is the Japanese onomatopoeia for a cute, playful eating. You consumed the latest financial digest to share. Some of your playful puns are related to japanese foods. This is an automated insights weekly script about this month's expenses progress. Output a nice trendy graphical representation in HTML for the email.
-Use a soft pink page background for the whole email body.
-Place the content inside a centered white/light-pink panel with rounded corners and a thin light pink border.
-The panel should look like a lined container: subtle border, gentle shadow, and enough padding around the sections.
-Add thin pink separator lines between sections. Don't use white text.
-Percent change should be color-coded: green for positive change, red for negative change, and gray for no change.
+    return f"""System: You are Mogumogu-chan, a warm, lively personal-finance assistant. Open with a friendly greeting addressed to the reader, use natural Japanese food imagery and a few fitting food emoji (such as 🍡, 🍙, 🍵, 🍣, 🌸), and close with kind encouragement. Keep the personality personable, not childish; financial facts must stay clear and accurate.
+Create a consistent, readable HTML email using Material 3-inspired hierarchy and spacing without making it a generic gray/blue dashboard. Center one content column (about 640 px wide) on a clearly visible pale blush-pink page background (such as #FFF1F5) with a white or near-white report surface. Use dark warm charcoal or berry text and bright rose/hot-pink/coral as the primary accents; avoid dominant purple/plum tones. Carry pink through section markers, the hero, and all snapshot bars. Use one coordinated family of rose shades for positive-spend bars, never green for Needs or peach for Wants. In every chart row, align category labels left, place a proportional bar in the middle, and put the exact currency amount in a fixed-width right-aligned column sharing one right edge. Scale all positive bars against the same maximum category spend across all groups; handle negative/refund categories separately. Maintain the established 8 px spacing rhythm and readable type sizes. Keep secondary data grouped and scannable, but do not omit any required section or metric for compactness. Avoid clutter, tiny text, repeated heavy shadows, nested cards, and excessive emoji. Reserve green/red for financial direction and label trends in words. Tables should have comfortable padding, subtle separators, and clearly aligned numbers. Keep contrast strong and use email-safe HTML/inline styles.
 
 Instructions:
-- Don't mention fixed costs, insurance, uncontrollable category expenses like Health & Wellness, Payments, Bills, Utilities, Professional & Business Services and Automotive. However they are included in terms of expenses for Net Real Expense.
-- Don't mention monthly deposits, the reader already knows about them.
+- Include all available main category groups (for example Needs/Essentials and Wants/Discretionary) in the category overview. Uncontrollable/fixed categories may appear in the overview for transparency but must not be presented as discretionary targets or blamed on the reader.
 - Give a comparison of the current month to the previous month, highlighting any significant changes in spending patterns.
 - Give a brief overview of the financial health, focusing on net expenses and budget adherence.
 - Use a warm, encouraging tone, and provide actionable insights or tips for better financial management.
@@ -150,22 +147,17 @@ Context:
 - Monthly deposit: {config.get('Monthly_budget')}.
 - Monthly Fixed costs: {config.get('Fixed_costs')}.
 - Vehicles: {config.get('Vehicle_Info')}.
-- Savings goal: {config.get('Savings_goal')}.
+- Authoritative numeric monthly savings target: {config.get('Savings_goal_target', 'not configured')}.
 - This is a follow-up report; the recipient already knows the recurring details.
 {memory_context}
-Include In Order: 
-- Fun greeting
-- Monthly Snapshot including and the Month for that data and KPI Card of comparison of lifestyle net expenses accross the categories including the number (horizontal pink color  bars).
-- Spending Trends & Analysis
-- MoguMogu's Financial Health Check
-- KPI Cards (The Sushi Stack (Key Metrics)) Vertical layout of:
-  Total Net Expense Spend (Net Real Expense from all categories of the latest month)
-  Previous Month Total Net Expense Spend (Net Real Expense from all categories of the previous month)
-  Mom % Change (Net Real Expense from all categories)
-  Disposable Cash which can go negative. You must use the formula for disposable Cash: (Monthly deposit - (net real expense + Monthly fixed costs)) Explain how you got this number so I can troubleshoot your calculations.
-- KPI Card of Top 3 Discretionary Categories [Table] (total spent, previous spent, Mom% Trend with color coding, targeted goal suggestion, and percentage of goal spent).
-Explain why the goal suggestion is what it is, and how to improve the spending habits for that category.
-- Momogu's Tips for the Week.
+Include these sections in this exact order; do not omit them:
+1. Friendly Mogumogu greeting with a Japanese-inspired food emoji and brief month-specific welcome.
+2. Monthly Snapshot: label the current month and show each available lifestyle category grouped by its main Needs/Essentials or Wants/Discretionary parent group. Include a horizontal pink bar per category plus its exact spend amount; bar lengths share one scale. Do not substitute a table or prose for the bars. Keep values readable independently of bar color/length.
+3. Spending Trends & Analysis: explain the important supported month-over-month changes, including the direction and context.
+4. Mogumogu's Financial Health Check: a brief, warm summary grounded in the data.
+5. The Sushi Stack: a visibly grouped vertical KPI comparison showing latest-month total net expense, previous-month total net expense, MoM percent change, and disposable cash. Use the current and previous month labels and exact values. Disposable cash is monthly deposit - (current net expense + fixed costs); it may be negative. Add a short calculation note. Keep the current total primary and the other three subordinate, but include all four.
+6. Top 3 Discretionary Categories: a table with up to the three highest-spend eligible discretionary categories, current spend, previous spend, MoM trend, target/goal, and percentage of goal where supported. Prefer configured category goals; otherwise derive a suggested cap using the numeric savings target and spending trends, and label it as a suggestion, not a configured goal. Do not classify fixed/uncontrollable categories as discretionary or invent values; label unavailable historical/target inputs clearly. Calculate projected savings as monthly deposit - (latest total net expense + fixed costs). If below the numeric savings target, allocate that shortfall proportionally across all current discretionary/Wants spend; each cap is current category spend minus its proportional cut, floored at zero. If projected savings already meet the target, use previous-month spend as a cap for categories that increased, otherwise maintain current spend. Explain the basis, show current spend as a percentage of the cap only when the cap is positive, and note if discretionary cuts alone cannot reach the target.
+7. Mogumogu's Tips for the Week: one or two actionable, kind tips tied to the evidence, ending with a supportive sign-off and a small Japanese-food emoji.
 
 Today's date: {date.today().strftime('%Y-%m-%d')}
 Data:
@@ -188,7 +180,7 @@ def query_ollama(prompt: str, ollama_url: str, model_name: str, stream: bool = F
         return "Failed to generate report."
 
 
-def build_email_message(sender: str, receiver_header: str, report_text: str) -> MIMEMultipart:
+def build_email_message(sender: str, receiver_header: str, report_text: str, plain_text: str | None = None) -> MIMEMultipart:
     """Wrap the HTML report in a multipart email so it works in both text and HTML clients."""
     msg_root = MIMEMultipart('related')
     msg_root['From'] = sender
@@ -198,13 +190,16 @@ def build_email_message(sender: str, receiver_header: str, report_text: str) -> 
     msg_alt = MIMEMultipart('alternative')
     msg_root.attach(msg_alt)
 
-    plain_lines = [f"Weekly Financial Progress — {date.today().strftime('%B %d, %Y')}", ""]
-    rpt_first = report_text.split('\n\n')[0] if report_text else ''
-    if rpt_first:
-        plain_lines.extend([rpt_first, ""])
-
-    plain_text = "\n".join(plain_lines)
-    msg_alt.attach(MIMEText(plain_text, 'plain'))
+    if plain_text and plain_text.strip():
+        # Agent mode supplies a validated plain-text rendering of the report.
+        plain_body = plain_text.strip()
+    else:
+        plain_lines = [f"Weekly Financial Progress — {date.today().strftime('%B %d, %Y')}", ""]
+        rpt_first = report_text.split('\n\n')[0] if report_text else ''
+        if rpt_first:
+            plain_lines.extend([rpt_first, ""])
+        plain_body = "\n".join(plain_lines)
+    msg_alt.attach(MIMEText(plain_body, 'plain'))
     msg_alt.attach(MIMEText(report_text, 'html'))
 
     return msg_root
@@ -224,7 +219,12 @@ def _init_memory_module(memory_schema: str = "memory"):
             raise ValueError("memory_schema may contain only letters, numbers, and underscores")
 
         memory_path = Path(__file__).with_name("memory.py")
-        database_path = memory_path.parent.parent / "agent" / "memory" / f"{memory_schema}.sqlite3"
+        # MEMORY_DB_PATH overrides the schema-derived default database location.
+        database_path = (
+            Path(os.environ["MEMORY_DB_PATH"])
+            if os.environ.get("MEMORY_DB_PATH")
+            else memory_path.parent.parent / "agent" / "memory" / f"{memory_schema}.sqlite3"
+        )
         spec = importlib.util.spec_from_file_location("memory_module", str(memory_path))
         if spec is None or spec.loader is None:
             return None
@@ -264,8 +264,12 @@ def _ollama_embedding(text: str, ollama_url: str, model_name: str, timeout: int 
     return embed_text(text, ollama_url, model_name, timeout)
 
 
-def _remember_report(memory_module: Any, sender: str, receivers: list[str], receiver_header: str, prompt: str, report_text: str, model_name: str, ollama_url: str, config: dict) -> None:
-    """Persist the report in short-term memory and extract reusable long facts for future runs."""
+def _remember_report(memory_module: Any, sender: str, receivers: list[str], receiver_header: str, prompt: str, report_text: str, model_name: str, ollama_url: str, config: dict, report_plain_text: str | None = None) -> None:
+    """Persist the report in short-term memory and extract reusable long facts for future runs.
+
+    report_text is the report HTML. When report_plain_text is supplied (agent mode), it is
+    stored as the readable text and used for fact extraction instead of raw HTML.
+    """
     if memory_module is None:
         return
 
@@ -273,7 +277,8 @@ def _remember_report(memory_module: Any, sender: str, receivers: list[str], rece
         log_status("Starting memory persistence for this report")
         thread_id = memory_module.get_or_create_thread("email", receiver_header or sender or "email:unknown")
         # Keep the complete report available to the next run for UI and goal continuity.
-        plain_text = report_text or ""
+        has_plain_text = bool(report_plain_text and report_plain_text.strip())
+        plain_text = report_plain_text if has_plain_text else (report_text or "")
 
         st_id = memory_module.save_short_term(
             thread_internal_id=thread_id,
@@ -291,9 +296,9 @@ def _remember_report(memory_module: Any, sender: str, receivers: list[str], rece
         embedding_model = config.get("embedding_model_name", "nomic-embed-text")
         embedding_timeout = int(config.get("ollama_timeout", 600))
         fact_prompt = (
-            "Extract a JSON array of concise facts from the following HTML report. "
+            f"Extract a JSON array of concise facts from the following {'plain-text' if has_plain_text else 'HTML'} report. "
             "Each item must be an object with keys 'fact_key', 'fact_text', and optional 'weight'.\n\n"
-            f"Report:\n{report_text}\n\nReturn ONLY valid JSON."
+            f"Report:\n{plain_text}\n\nReturn ONLY valid JSON."
         )
         log_status(f"Extracting facts from completed report using model '{fact_model}'")
         fact_res = query_ollama(fact_prompt, ollama_url, fact_model, stream=False)
@@ -359,6 +364,51 @@ def run_agent_weekly_report(
         )
     except Exception as exc:
         print(f"Shared finance report generation failed: {exc}")
+        failed_trace = getattr(exc, "run_trace", None)
+        failed_snapshot = getattr(exc, "report_snapshot", None)
+        run_id = datetime.now().strftime("%Y%m%dT%H%M%S") + f"_{model_name.replace(':', '_')}_failed"
+        archive_root = Path(__file__).resolve().parent.parent / "agent" / "runs"
+        events = failed_trace.events if failed_trace is not None else []
+        events.append({
+            "event": "exception",
+            "timestamp": time.time(),
+            "phase": "finance_report_generation_unhandled",
+            "exception_type": type(exc).__name__,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        })
+        events.append({"event": "run_aborted", "timestamp": time.time(), "phase": "finance_report_generation"})
+        failed_metrics = {
+            "model": model_name,
+            "validator_model": config.get("validator_model_name", model_name),
+            "mode": "agent",
+            "status": "exception",
+            "validation": "error",
+            "exception_type": type(exc).__name__,
+            "runtime_seconds": round(time.perf_counter() - started, 3),
+            "agent_rounds": sum(event.get("event") == "agent_round" for event in events),
+            "tool_calls": sum(event.get("event") == "tool_call" for event in events),
+            "validation_cycles": sum(event.get("event") == "validation_cycle_result" for event in events),
+            "validator_calls": sum(event.get("event") == "model_call" and event.get("role") == "validator" for event in events),
+            "report_bytes": 0,
+        }
+        save_run(
+            archive_root,
+            run_id,
+            {
+                "run_id": run_id,
+                "mode": "agent",
+                "status": "exception",
+                "exception_type": type(exc).__name__,
+                "error": str(exc),
+                "snapshot": failed_snapshot.to_dict() if failed_snapshot is not None else None,
+            },
+            events,
+            "",
+            "",
+            failed_metrics,
+        )
+        print(f"Failed agent run trace archived at {archive_root / run_id}")
         return
 
     run_id = datetime.now().strftime("%Y%m%dT%H%M%S") + f"_{model_name.replace(':', '_')}"
@@ -385,8 +435,37 @@ def run_agent_weekly_report(
         print("Dry run enabled; report was rendered and archived but not sent.")
         return
 
-    msg_root = build_email_message(sender, receiver_header, result.report_html)
-    send_email(sender, receivers, password, msg_root)
+    msg_root = build_email_message(sender, receiver_header, result.report_html, plain_text=result.plain_text)
+    try:
+        send_email(sender, receivers, password, msg_root)
+    except Exception as exc:
+        result.trace.add(
+            "exception",
+            phase="email_delivery",
+            exception_type=type(exc).__name__,
+            error=str(exc),
+            traceback=traceback.format_exc(),
+        )
+        result.trace.add("run_aborted", phase="email_delivery", status="delivery_failed")
+        result.metrics["status"] = "delivery_failed"
+        result.metrics["delivery_error_type"] = type(exc).__name__
+        save_run(
+            archive_root,
+            run_id,
+            {
+                "run_id": run_id,
+                "mode": "agent",
+                "status": "delivery_failed",
+                "snapshot": result.snapshot.to_dict(),
+                "error": str(exc),
+            },
+            result.trace.events,
+            result.report_html,
+            result.plain_text,
+            result.metrics,
+        )
+        print(f"Email delivery failed; updated run trace archived at {archive_root / run_id}: {exc}")
+        return
     memory_module = _init_memory_module(memory_schema)
     _remember_report(
         memory_module,
@@ -398,6 +477,7 @@ def run_agent_weekly_report(
         model_name,
         ollama_url,
         config,
+        report_plain_text=result.plain_text,
     )
     log_status(f"Shared finance report and email workflow complete in {time.perf_counter() - started:.1f}s")
 
