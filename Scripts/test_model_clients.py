@@ -234,9 +234,9 @@ class TestOllamaClient(unittest.TestCase):
     def test_email_wrapper_returns_failure_text_on_error(self):
         import email_weekly_report as weekly
 
-        with _with_requests(FakeRequests({"response": ""})), patch.object(weekly, "log_status"):
+        with _with_requests(FakeRequests({"response": ""})), patch("finance.legacy_report.log_status"):
             self.assertEqual(weekly.query_ollama("p", "http://h", "m"), "Failed to generate report.")
-        with _with_requests(FakeRequests({"response": " report "})), patch.object(weekly, "log_status"):
+        with _with_requests(FakeRequests({"response": " report "})), patch("finance.legacy_report.log_status"):
             self.assertEqual(weekly.query_ollama("p", "http://h", "m"), "report")
 
 

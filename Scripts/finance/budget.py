@@ -116,6 +116,15 @@ class CostLedger:
         """USD recorded for one run id."""
         return round(sum(_cost(item) for item in self.entries() if item.get("run_id") == run_id), 6)
 
+    def spend_by_run(self) -> dict[str, float]:
+        """USD per run id from one read of the ledger (the run index uses it for old runs)."""
+        totals: dict[str, float] = {}
+        for item in self.entries():
+            run_id = item.get("run_id")
+            if run_id:
+                totals[str(run_id)] = totals.get(str(run_id), 0.0) + _cost(item)
+        return {run_id: round(total, 6) for run_id, total in totals.items()}
+
     def append(self, record: Mapping[str, Any]) -> None:
         """Append one record as a single write under the lock file; failures make the ledger unavailable."""
         line = (json.dumps(dict(record), default=str) + "\n").encode("utf-8")
@@ -295,6 +304,16 @@ def resolve_ledger_path(value: Any) -> Path:
 
     path = Path(str(value or DEFAULTS["anthropic_cost_ledger_path"]))
     return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def configured_ledger_path(config: Any) -> Path | None:
+    """The resolved ledger path for a config dict or ReportSettings; None if the budget settings are invalid."""
+    from .settings import budget_settings
+
+    try:
+        return resolve_ledger_path(budget_settings(config)[2])
+    except ValueError:
+        return None
 
 
 def guard_from_settings(config: Any, run_id: str | None = None) -> BudgetGuard:

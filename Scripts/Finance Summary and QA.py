@@ -24,6 +24,7 @@ from finance.chat.session import ChatSession
 from finance.model_clients import build_model_client
 from finance.memory import open_memory
 from finance.qa import answer_finance_question as shared_answer_finance_question
+from finance.report_runner import budget_stop_message
 from finance.reporting import generate_finance_report
 from finance.settings import (
     APP_FALLBACK_MODEL_NAME,
@@ -120,7 +121,7 @@ def load_finance_summary(year: int | str | None, month: int) -> tuple[str, dict[
             "plain_text": result.plain_text,
             "report_html": result.report_html,
         }
-        budget_message = result.metrics.get("budget_exceeded")
+        budget_message = budget_stop_message(result)
         if budget_message:
             # A Claude spend cap stopped the report: say so plainly instead of a validation failure.
             return "<div class='empty-state'><h3>Claude budget reached</h3></div>", report_context, budget_message

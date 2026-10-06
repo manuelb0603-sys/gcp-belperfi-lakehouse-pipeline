@@ -219,6 +219,20 @@ class TestSessionHistory(unittest.TestCase):
         self.assertIn('{"group_by": ["month"], "period": "last_quarter"}', messages[-1]["content"])
         self.assertTrue(messages[-1]["content"].endswith("USER QUESTION:\nNow only Amex"))
 
+    def test_system_prompt_limits_filter_carry_over_to_refinements(self):
+        session = ChatSession("s")
+        run(FakeChatClient(reply(calls=[call("analyze_spending", **QUARTER_SPEC)]), reply("Done: $1,262.00.")),
+            "Monthly spend last quarter", session=session)
+        client = FakeChatClient(reply("Sure."))
+        run(client, "Generate a heatmap of activity by store", session=session)
+        system = client.calls[0]["system"]
+        self.assertIn("carry over the previous analysis's filters and period only when the user is clearly refining", system)
+        self.assertIn('"now only Amex", "same but by month", "break that down by store"', system)
+        self.assertIn("A new question starts from the defaults with no earlier filters or period", system)
+        self.assertIn("say which filters and period apply", system)
+        self.assertIn("use only for follow-ups", prompts.CONTEXT_LAST_SPEC_HEADER)
+        self.assertIn(prompts.CONTEXT_LAST_SPEC_HEADER, client.calls[0]["messages"][-1]["content"])
+
     def test_history_truncation_on_undo_or_retry(self):
         session = ChatSession("s")
         session.add_turn(Turn("q1", specs=[{"metric": "refunds"}], assistant_text="a1"))

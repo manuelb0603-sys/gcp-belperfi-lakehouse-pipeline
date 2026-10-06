@@ -3,8 +3,10 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from finance.run_archive import run_role_models, trace_run_started, update_index
+from finance.budget import CostLedger, configured_ledger_path
+from finance.run_archive import metrics_from_trace, run_role_models, trace_run_started, update_index
 
 
 def _write_json(path, value):
@@ -173,6 +175,69 @@ class RunIndexModelColumnsTests(unittest.TestCase):
         self.assertEqual(entry["validator model"], "anthropic:claude-sonnet-5-5")
         self.assertEqual(entry["guidance"], "coach")
         self.assertIn("#comparison td,#comparison th{white-space:nowrap}", index)
+
+
+class RunIndexLedgerCostTests(unittest.TestCase):
+    """Runs archived before the cost was recorded take it from the Claude cost ledger."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name) / "runs"
+        self.root.mkdir()
+        self.ledger = Path(self._tmp.name) / "ledger" / "cost_ledger.jsonl"
+        self.ledger.parent.mkdir()
+        records = [
+            {"run_id": "20261005T155123_gemma4_e4b", "cost_usd": 0.1},
+            {"run_id": "20261005T155123_gemma4_e4b", "cost_usd": 0.0234},
+            {"run_id": "20261005T160000_m", "cost_usd": 0.5},
+            {"run_id": "20261005T170000_recorded", "cost_usd": 9.0},
+            {"run_id": "chat", "cost_usd": 1.0},
+        ]
+        self.ledger.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+        _write_json(self.root / "20261005T155123_gemma4_e4b" / "metrics.json", {"mode": "agent", "status": "validated"})
+        _write_json(self.root / "20261005T160000_m_failed" / "metrics.json", {"status": "exception", "anthropic_cost_usd": None})
+        _write_json(self.root / "20261005T170000_recorded" / "metrics.json", {"status": "validated", "anthropic_cost_usd": 0.25})
+        _write_json(self.root / "20261005T180000_local" / "metrics.json", {"status": "validated"})
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_missing_cost_falls_back_to_ledger_once(self):
+        with patch.object(CostLedger, "entries", autospec=True, side_effect=CostLedger.entries) as entries:
+            index = update_index(self.root, ledger_path=self.ledger).read_text(encoding="utf-8")
+        self.assertEqual(entries.call_count, 1)
+        self.assertEqual(_column(index, "20261005T155123_gemma4_e4b", "cost"), "$0.1234")
+        # A renamed failed run matches its ledger run id without the suffix.
+        self.assertEqual(_column(index, "20261005T160000_m_failed", "cost"), "$0.5000")
+        # A recorded cost wins over the ledger; runs without ledger entries stay blank.
+        self.assertEqual(_column(index, "20261005T170000_recorded", "cost"), "$0.2500")
+        self.assertEqual(_column(index, "20261005T180000_local", "cost"), "")
+
+    def test_default_ledger_is_inside_root_and_missing_or_bad_ledgers_leave_costs_blank(self):
+        index = update_index(self.root).read_text(encoding="utf-8")  # no cost_ledger.jsonl in root
+        self.assertEqual(_column(index, "20261005T155123_gemma4_e4b", "cost"), "")
+        (self.root / "cost_ledger.jsonl").write_text(self.ledger.read_text(encoding="utf-8"), encoding="utf-8")
+        index = update_index(self.root).read_text(encoding="utf-8")
+        self.assertEqual(_column(index, "20261005T155123_gemma4_e4b", "cost"), "$0.1234")
+        self.ledger.write_text("not json\n", encoding="utf-8")
+        index = update_index(self.root, ledger_path=self.ledger).read_text(encoding="utf-8")
+        self.assertEqual(_column(index, "20261005T155123_gemma4_e4b", "cost"), "")
+
+    def test_spend_by_run_and_configured_path(self):
+        self.assertEqual(CostLedger(self.ledger).spend_by_run()["20261005T155123_gemma4_e4b"], 0.1234)
+        self.assertEqual(configured_ledger_path({"anthropic_cost_ledger_path": str(self.ledger)}), self.ledger)
+        self.assertIsNone(configured_ledger_path({"anthropic_daily_budget_usd": "lots"}))
+
+
+class MetricsFromTraceTests(unittest.TestCase):
+    def test_counts(self):
+        events = [
+            {"event": "agent_round"}, {"event": "agent_round"}, {"event": "tool_call"},
+            {"event": "validation_cycle_result"}, {"event": "model_call", "role": "validator"},
+            {"event": "model_call", "role": "author"},
+        ]
+        self.assertEqual(metrics_from_trace(events), {"agent_rounds": 2, "tool_calls": 1, "validation_cycles": 1, "validator_calls": 1})
+        self.assertEqual(metrics_from_trace([]), {"agent_rounds": 0, "tool_calls": 0, "validation_cycles": 0, "validator_calls": 0})
 
 
 if __name__ == "__main__":

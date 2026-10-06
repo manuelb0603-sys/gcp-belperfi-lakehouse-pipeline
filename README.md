@@ -44,7 +44,9 @@ This pipeline implements a multi-layer Lakehouse medallion architecture designed
 │   │   │   ├── session.py         # ChatSession: turns, rolling summary, last spec, history truncation
 │   │   │   └── engine.py          # run_turn: model/tool loop, limits, narrative number guard, UI events
 │   │   ├── budget.py              # Claude spend backstop: cost ledger, BudgetGuard (daily/run caps)
+│   │   ├── email_delivery.py      # Weekly email: build_email_message (HTML + plain part) and send_email (Gmail SMTP)
 │   │   ├── html_text.py           # Shared html_to_text (report plain text, history excerpts, Q&A)
+│   │   ├── legacy_report.py       # Legacy report mode: BigQuery summary, data payload, one Ollama prompt, query_ollama
 │   │   ├── memory.py              # MemoryStore: SQLite short-term history and long-term facts (open_memory)
 │   │   ├── memory_search.py       # Hybrid (embedding + BM25) long-fact retrieval
 │   │   ├── model_clients.py       # ModelClient layer: OllamaClient, AnthropicClient, model_roles config
@@ -54,17 +56,20 @@ This pipeline implements a multi-layer Lakehouse medallion architecture designed
 │   │   ├── report_metrics.py      # Deterministic snapshot: totals, MoM, disposable cash, goal caps, bar widths
 │   │   ├── report_models.py       # Typed snapshot, validation, and finding models
 │   │   ├── report_requirements.py # Month-specific report requirements checklist built from the snapshot
+│   │   ├── report_memory.py       # After a send: open_report_memory, remember_report (short-term row + extracted facts)
+│   │   ├── report_runner.py       # Agent-mode email run: progress, generate, archive (_failed rename), budget/dry-run/send, memory
 │   │   ├── replay.py              # Replays an archived validator call against another model (validator experiments)
 │   │   ├── reporting.py           # Builds the snapshot, tools, and harness for one report
-│   │   ├── run_archive.py         # Run archive, live progress files, run metadata (git version), and the run index
+│   │   ├── run_archive.py         # Run archive, live progress files, run metadata (git version), metrics_from_trace, the run index
 │   │   ├── run_compare.py         # LLM comparison of archived runs (eval role) and Markdown-to-HTML
-│   │   └── settings.py            # Config loading, validated ReportSettings and code defaults, money parsing
+│   │   ├── settings.py            # Config loading, validated ReportSettings and code defaults, money parsing
+│   │   └── status_log.py          # log_status: timestamped console status lines
 │   ├── agent_harness.py, bigquery_tools.py, memory.py,
 │   │   report_metrics.py, report_models.py, run_archive.py
 │   │                              # Compatibility shims that re-export Scripts/finance/*
 │   ├── compare_runs.py            # CLI: compare selected runs with the eval model
 │   ├── replay_validator.py        # CLI: replay one run's validator call with another model
-│   ├── email_weekly_report.py     # Orchestrates the weekly run: legacy or agent mode, archive, email
+│   ├── email_weekly_report.py     # Entry point (scheduled task): loads config, runs agent mode or legacy mode; re-exports the moved names
 │   ├── Finance Summary and QA.py  # Gradio UI: Monthly report tab (report and Q&A) and Chat tab
 │   ├── model benchmark.py         # Quick Ollama model speed benchmark
 │   ├── upload_csv.py              # Uploads issuer-specific CSV files to GCS and archives them
@@ -303,7 +308,7 @@ Claude spend has three independent limits:
 
 Both caps are on even when `config.json` omits the keys. Only an explicit `0` or `null` disables a cap, and the program prints a warning at startup when one is disabled. Before every Claude request (including the harness's retry and format retries), `AnthropicClient` asks its `BudgetGuard` (`Scripts/finance/budget.py`, attached by `build_model_client`) for the call's worst case: the prompt at the list input price (characters / 3.5 tokens) plus `max_tokens` of output. If today's spend plus that would pass the daily cap, or the run's spend plus that would pass the run cap, the call is refused without contacting the API (`BudgetExceededError`). A report run then stops like an unavailable model: fail decision, last sanitized report or fallback, never sent; the trace records a `budget_exceeded` event with the figures, `progress.log` says `Claude budget guard refused the validator call: Claude daily budget reached: $14.85 of $15.00 spent today; ...`, and the index shows status `budget_exceeded`. The app shows the same message instead of the report. `replay_validator.py` and `compare_runs.py` print it and exit `2`. Ollama calls are never budgeted.
 
-The spend ledger `agent/runs/cost_ledger.jsonl` (`anthropic_cost_ledger_path`, relative to the project root) has one JSON line per Claude call: success, refusal, an empty answer, or a timed-out or interrupted call (estimated as its input at list price, marked `"estimated": true`). Each line holds `timestamp` (UTC), `date` (local), `run_id` (or `replay`, `compare`, `chat`, `other`), `role`, `model`, `outcome`, `usage`, and `cost_usd`. Lines are appended with a single write under a lock file, so the app and the scheduled run can share it. A missing ledger means $0 spent; older runs are not backfilled. The guard fails closed: if the ledger cannot be read (or has a corrupt line) or a spend record cannot be written, Claude calls are refused until it is fixed. Each run starts with `Claude budget: $X spent today of $Y daily; run cap $Z` in `progress.log`; Claude `model_response` events carry `cost_usd` (also shown in `progress.log`), `progress.json` and `metrics.json` record `anthropic_cost_usd`, and the index has a `cost` column (blank for runs without Claude calls).
+The spend ledger `agent/runs/cost_ledger.jsonl` (`anthropic_cost_ledger_path`, relative to the project root) has one JSON line per Claude call: success, refusal, an empty answer, or a timed-out or interrupted call (estimated as its input at list price, marked `"estimated": true`). Each line holds `timestamp` (UTC), `date` (local), `run_id` (or `replay`, `compare`, `chat`, `other`), `role`, `model`, `outcome`, `usage`, and `cost_usd`. Lines are appended with a single write under a lock file, so the app and the scheduled run can share it. A missing ledger means $0 spent. The guard fails closed: if the ledger cannot be read (or has a corrupt line) or a spend record cannot be written, Claude calls are refused until it is fixed. Each run starts with `Claude budget: $X spent today of $Y daily; run cap $Z` in `progress.log`; Claude `model_response` events carry `cost_usd` (also shown in `progress.log`), `progress.json` and `metrics.json` record `anthropic_cost_usd`, and the index has a `cost` column (blank for runs without Claude calls). For a run whose `metrics.json`/`progress.json` has no `anthropic_cost_usd` (runs from before costs were recorded), the index shows the ledger's total for that run id (a `_failed` folder also matches the id without the suffix); the ledger is read once per index build, from the configured path (the email run, replays, and comparisons pass it; otherwise `cost_ledger.jsonl` inside the runs folder).
 
 ##### Claude experiments
 
@@ -328,7 +333,7 @@ The code defaults used when a key is omitted are listed under Code defaults abov
 
 The agent's transaction-detail tool reads only from the gold `fact_transactions` table and is bounded by month, category, and row count. `get_semantic_memory` ranks a focused agent-written query with embedding cosine similarity and BM25 keyword relevance, then combines rankings with reciprocal-rank fusion and deduplicates facts. Semantic matching can catch paraphrases while BM25 matches exact terms and accounts for term frequency and document length. BM25 remains available if Ollama embeddings are unavailable. Both rankers scan the existing SQLite fact set directly; no separate search service or index is needed. Episodic memory and report history remain separate read-only tools. Previous reports and semantic facts are historical and cannot replace current gold-layer values. Existing SQLite databases are migrated in place; missing vectors are embedded lazily during semantic search.
 
-The `email_weekly_report.py` script generates an intelligent weekly financial insights email that:
+The `email_weekly_report.py` script is the entry point of the weekly email; the work lives in `finance/`: `report_runner.py` (agent mode: live progress, report generation, archive, budget/validation/dry-run outcomes, delivery, then memory), `legacy_report.py` (legacy mode's BigQuery summary, prompt, and Ollama call), `email_delivery.py` (the multipart message and Gmail send), and `report_memory.py` (saving the sent report and extracting facts). It generates an intelligent weekly financial insights email that:
 * Queries your **BigQuery Gold Layer** (`fact_monthly_spending`) to extract spending trends, category analysis, and key metrics
 * Processes data through a local **Ollama LLM** (configurable via `model_server_url` & `model_name` in config) to generate contextual insights with playful Japanese food puns from your assistant Mogumogu-chan 🍣🍤
 * Uses local SQLite memory and Ollama embeddings to retrieve relevant long-term facts on demand, alongside recent report history
@@ -361,7 +366,7 @@ How a turn works (`Scripts/finance/chat/engine.py`, `run_turn`):
 * **Tools** (`tools.py`): `analyze_spending` (parameters: the `AnalysisSpec` JSON schema, flattened), `list_values` (`field`: `category`, `parent_group`, `issuer`, or `merchant`, plus an optional `search`), and `get_month_snapshot` (`month` `YYYY-MM`; runs `report_metrics.calculate_report_snapshot` on that month and the one before it, built from the cached frame, without the report harness). Every spec goes through `validate_and_repair`; an invalid one goes back to the model as an error tool result listing the closest valid values, and the model retries.
 * **Limits**: at most `chat_max_tool_rounds` tool rounds per question and `chat_turn_seconds` per question (each model call's timeout is capped at the time left). A model that keeps calling tools, a deadline, an unreachable model, or a Claude budget refusal ends the turn with a plain message (plus the last computed result, if any), never a traceback.
 * **Narrative number guard**: every dollar amount and percentage in the answer must match a value in the tool results (`executor.check_narrative_numbers`). On a mismatch the model is asked once to rewrite with the exact figures; if it still does not match, the answer says the figures in the table are authoritative.
-* **History**: the last `chat_history_turns` turns are sent as plain text; older turns become a deterministic rolling summary, and the previous spec is included so follow-ups work. Undo, retry, or clearing the chat truncates the session to the turns still shown. The DataFrame is never stored in Gradio state; it lives in the `finance.chat.data` module cache.
+* **History**: the last `chat_history_turns` turns are sent as plain text; older turns become a deterministic rolling summary, and the previous spec is included, labeled for follow-ups only. The system prompt tells the model to carry over its filters and period only when the user is clearly refining that analysis ("now only Amex", "same but by month", "break that down by store"); a new question starts from the defaults and the answer says which filters apply. Undo, retry, or clearing the chat truncates the session to the turns still shown. The DataFrame is never stored in Gradio state; it lives in the `finance.chat.data` module cache.
 * **Ollama thinking**: if a reply hits the token limit with no text while `think` is on, the call is retried once with `think: false`.
 
 The `chat` model role (`model_roles.chat`; when absent it falls back to `model_name` with `ollama_options["chat"]`) can be local or Claude:

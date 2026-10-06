@@ -7,7 +7,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import email_weekly_report as weekly
-import run_archive
 
 
 def _plain_part(message):
@@ -55,8 +54,8 @@ class TestRememberReport(unittest.TestCase):
         memory = FakeMemory()
         prompts = []
         with (
-            patch.object(weekly, "query_ollama", side_effect=lambda prompt, *a, **k: prompts.append(prompt) or "[]"),
-            patch.object(weekly, "log_status"),
+            patch("finance.report_memory.query_ollama", side_effect=lambda prompt, *a, **k: prompts.append(prompt) or "[]"),
+            patch("finance.report_memory.log_status"),
         ):
             weekly._remember_report(
                 memory, "s", ["r"], "r", "prompt", "<html><body>HTML report</body></html>", "model", "url", {}, **kwargs
@@ -88,7 +87,7 @@ class TestAgentRunFailureArchive(unittest.TestCase):
             tempfile.TemporaryDirectory() as temp_dir,
             patch.object(weekly, "RUN_ARCHIVE_ROOT", Path(temp_dir)),
             patch("finance.reporting.generate_finance_report", side_effect=error),
-            patch.object(run_archive, "save_run", side_effect=lambda *args: saved.append(args)),
+            patch("finance.run_archive.save_run", side_effect=lambda *args, **kwargs: saved.append(args)),
             patch.object(weekly, "send_email") as send_email,
         ):
             weekly.run_agent_weekly_report(
@@ -111,7 +110,7 @@ class TestMemoryPath(unittest.TestCase):
         with (
             patch.dict(os.environ, {"MEMORY_DB_PATH": "C:/tmp/custom.sqlite3"}),
             patch("finance.memory.MemoryStore.init_db") as init_db,
-            patch.object(weekly, "log_status"),
+            patch("finance.report_memory.log_status"),
         ):
             store = weekly._init_memory_module("memory")
 

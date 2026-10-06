@@ -21,6 +21,7 @@ from .html_text import html_to_text
 from .memory_search import search_long_facts
 from .budget import LedgerUnavailableError, anthropic_cost_from_events
 from .model_clients import build_model_client
+from .run_archive import metrics_from_trace
 from .settings import PROJECT_ROOT, ReportSettings
 
 
@@ -316,13 +317,7 @@ def generate_finance_report(
         "status": "validated" if decision and decision.passed else "validation_failed",
         "validation": decision.decision if decision else "error",
         "runtime_seconds": round(time.perf_counter() - started, 3),
-        "agent_rounds": sum(event.get("event") == "agent_round" for event in trace.events),
-        "tool_calls": sum(event.get("event") == "tool_call" for event in trace.events),
-        "validation_cycles": sum(event.get("event") == "validation_cycle_result" for event in trace.events),
-        "validator_calls": sum(
-            event.get("event") == "model_call" and event.get("role") == "validator"
-            for event in trace.events
-        ),
+        **metrics_from_trace(trace.events),
         "author_format_retries": sum(event.get("event") == "author_format_retry" for event in trace.events),
         "validator_format_retries": sum(event.get("event") == "validator_format_retry" for event in trace.events),
         "initial_validation_errors": initial_validation_errors,

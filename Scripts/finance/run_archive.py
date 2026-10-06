@@ -12,8 +12,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .budget import COST_EVENTS, status_line as budget_status_line
-from .settings import PROJECT_ROOT
+from .budget import COST_EVENTS, BudgetExceededError, CostLedger, status_line as budget_status_line
+from .settings import DEFAULTS, PROJECT_ROOT
+
+# Where report runs are archived (the email workflow, replays, and comparisons default to it).
+DEFAULT_RUNS_ROOT = PROJECT_ROOT / "agent" / "runs"
 
 
 def _run_git(args: list[str], cwd: Path) -> str:
@@ -63,7 +66,30 @@ def collect_run_metadata(settings: Any, code_version: dict[str, Any] | None = No
     return metadata
 
 
-def save_run(root: Path, run_id: str, manifest: dict[str, Any], trace: list[dict[str, Any]], report_html: str, report_text: str, metrics: dict[str, Any]) -> Path:
+def metrics_from_trace(events: list[dict[str, Any]]) -> dict[str, int]:
+    """Run counts derived from trace events: agent rounds, tool calls, validation cycles, validator calls."""
+    return {
+        "agent_rounds": sum(event.get("event") == "agent_round" for event in events),
+        "tool_calls": sum(event.get("event") == "tool_call" for event in events),
+        "validation_cycles": sum(event.get("event") == "validation_cycle_result" for event in events),
+        "validator_calls": sum(
+            event.get("event") == "model_call" and event.get("role") == "validator"
+            for event in events
+        ),
+    }
+
+
+def save_run(
+    root: Path,
+    run_id: str,
+    manifest: dict[str, Any],
+    trace: list[dict[str, Any]],
+    report_html: str,
+    report_text: str,
+    metrics: dict[str, Any],
+    ledger_path: Path | None = None,
+) -> Path:
+    """Write the run's files and refresh the index (ledger_path: see update_index)."""
     run_dir = root / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "run.json").write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
@@ -71,7 +97,7 @@ def save_run(root: Path, run_id: str, manifest: dict[str, Any], trace: list[dict
     (run_dir / "trace.jsonl").write_text("".join(json.dumps(item, default=str) + "\n" for item in trace), encoding="utf-8")
     (run_dir / "final_report.html").write_text(report_html, encoding="utf-8")
     (run_dir / "final_report.txt").write_text(report_text, encoding="utf-8")
-    update_index(root)
+    update_index(root, ledger_path=ledger_path)
     return run_dir
 
 
@@ -385,8 +411,29 @@ def _guidance_label(*sources: dict[str, Any] | None) -> str:
     return ""
 
 
-def update_index(root: Path) -> Path:
+FAILED_SUFFIX = "_failed"
+
+
+def _ledger_costs(ledger_path: Path) -> dict[str, float]:
+    """Claude spend per ledger run id (one read); {} when the ledger is missing or unreadable."""
+    try:
+        return CostLedger(ledger_path).spend_by_run()
+    except BudgetExceededError:  # LedgerUnavailableError: the index just leaves those costs blank
+        return {}
+
+
+def update_index(root: Path, ledger_path: Path | None = None) -> Path:
+    """Rewrite root/index.html from the run folders, comparisons, and replays.
+
+    A run whose metrics/progress has no anthropic_cost_usd shows its spend from the Claude cost
+    ledger when the ledger has entries for that run id (a "_failed" folder also matches the id
+    without the suffix). ledger_path is the configured ledger; by default the ledger file named
+    in settings.DEFAULTS inside root. The ledger is read at most once per index build.
+    """
     root.mkdir(parents=True, exist_ok=True)
+    if ledger_path is None:
+        ledger_path = root / Path(DEFAULTS["anthropic_cost_ledger_path"]).name
+    ledger_costs: dict[str, float] | None = None
     rows: list[dict[str, Any]] = []
     titles: dict[tuple[int, str], str] = {}  # (row number, column) -> model cell tooltip
     run_dirs =(path for path in root.iterdir() if path.is_dir() and path.name not in NON_RUN_DIRS)
@@ -418,6 +465,16 @@ def update_index(root: Path) -> Path:
             cost = item.get("anthropic_cost_usd")
             if not isinstance(cost, (int, float)) and isinstance(progress, dict):
                 cost = progress.get("anthropic_cost_usd")
+            if not isinstance(cost, (int, float)):
+                # Older runs did not record their Claude cost; the ledger did.
+                if ledger_costs is None:
+                    ledger_costs = _ledger_costs(Path(ledger_path))
+                ledger_ids = [run_dir.name]
+                if run_dir.name.endswith(FAILED_SUFFIX):
+                    ledger_ids.append(run_dir.name[: -len(FAILED_SUFFIX)])
+                cost = next((ledger_costs[name] for name in ledger_ids if name in ledger_costs), None)
+                if cost is not None:
+                    item["anthropic_cost_usd"] = cost
             # Blank for runs without Claude calls.
             item["cost"] = f"${cost:.4f}" if isinstance(cost, (int, float)) else None
             run_meta = _read_json_dict(run_dir / "run.json")

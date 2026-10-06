@@ -5,8 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import email_weekly_report
 import memory
+from finance.ollama import embed_text
 
 
 class TestLongFactVectorMemory(unittest.TestCase):
@@ -213,7 +213,7 @@ class TestOllamaEmbeddingClient(unittest.TestCase):
 
         fake_requests = FakeRequests()
         with patch.dict(sys.modules, {"requests": fake_requests}):
-            vector = email_weekly_report._ollama_embedding(
+            vector = embed_text(
                 "user savings goal", "http://localhost:11434/api/generate", "nomic-embed-text", 12
             )
 

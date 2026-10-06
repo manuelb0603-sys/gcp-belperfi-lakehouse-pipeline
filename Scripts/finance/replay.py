@@ -26,7 +26,7 @@ from .harness.prompts import GUIDED_VALIDATOR_HEADER, VALIDATOR_REPORT_MARKER, P
 from .harness.protocol import VALIDATOR_RESPONSE_SCHEMA, parse_json_response
 from .model_clients import ModelClient, build_model_client, resolve_model_role
 from .run_archive import NON_RUN_DIRS, REPLAYS_DIR, update_index
-from .budget import BudgetExceededError
+from .budget import BudgetExceededError, configured_ledger_path
 from .pricing import CACHE_READ_MULTIPLIER, CACHE_WRITE_MULTIPLIER, cost_usd, worst_case_call_usd  # noqa: F401
 from .settings import PROJECT_ROOT, ReportSettings, load_config
 
@@ -411,7 +411,7 @@ def replay_validator(
         results.append(result)
     echo("\n" + tally_line(results))
     try:
-        update_index(Path(runs_root))
+        update_index(Path(runs_root), ledger_path=configured_ledger_path(config))
     except OSError as exc:  # the index is a convenience; the results are already saved
         echo(f"Warning: could not refresh the run index ({exc})")
     return results

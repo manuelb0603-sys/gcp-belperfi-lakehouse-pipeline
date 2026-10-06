@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .budget import BudgetExceededError
+from .budget import BudgetExceededError, configured_ledger_path
 from .model_clients import ModelClient, ModelReply, build_model_client
 from .pricing import price_for
 from .run_archive import COMPARISONS_DIR, INDEX_STYLE, NON_RUN_DIRS, format_local, run_times, update_index
@@ -703,7 +703,7 @@ def compare_runs(
     }
     html_path.write_text(render_page(meta, markdown_to_html(markdown)), encoding="utf-8")
     json_path.write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
-    update_index(Path(runs_root))
+    update_index(Path(runs_root), ledger_path=configured_ledger_path(settings))
     if done_reason == "length":
         echo("Warning: the eval model hit its output token limit; the comparison may be cut off.")
     if meta["estimated_cost_usd"] is not None:
