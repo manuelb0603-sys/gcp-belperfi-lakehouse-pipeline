@@ -156,5 +156,69 @@ class ReportMetricsGoalTests(unittest.TestCase):
         self.assertIn("top_discretionary_categories", payload)
 
 
+class NotableChangeTests(unittest.TestCase):
+    def notable(self, rows, **kwargs):
+        snapshot = calculate_report_snapshot(rows, 5000, 1000, savings_goal=500, **kwargs)
+        return {item.category: item for item in snapshot.notable_changes}, snapshot
+
+    def test_percent_only_change_is_notable(self):
+        # +60% but only +$60: meets the percent threshold, not the dollar threshold.
+        found, _ = self.notable([row(LATEST, "Books", "Wants", 160), row(PREVIOUS, "Books", "Wants", 100)])
+        item = found["Books"]
+        self.assertEqual((item.change_usd, item.change_pct, item.direction), (60.0, 60.0, "increase"))
+        self.assertEqual((item.current_spend, item.previous_spend, item.parent_group), (160.0, 100.0, "Wants"))
+
+    def test_dollar_only_change_is_notable(self):
+        # -$300 is only -10%: meets the dollar threshold, not the percent threshold.
+        found, _ = self.notable([row(LATEST, "Rent", "Needs", 2700), row(PREVIOUS, "Rent", "Needs", 3000)])
+        self.assertEqual((found["Rent"].change_usd, found["Rent"].change_pct, found["Rent"].direction), (-300.0, -10.0, "decrease"))
+
+    def test_change_meeting_both_thresholds_and_one_below_both(self):
+        found, _ = self.notable([
+            row(LATEST, "Groceries", "Needs", 1000), row(PREVIOUS, "Groceries", "Needs", 500),
+            row(LATEST, "Gas", "Needs", 120), row(PREVIOUS, "Gas", "Needs", 100),
+        ])
+        self.assertEqual(found["Groceries"].change_pct, 100.0)
+        self.assertNotIn("Gas", found)
+
+    def test_previous_zero_has_no_percent_and_needs_the_dollar_threshold(self):
+        found, _ = self.notable([
+            row(LATEST, "Travel", "Wants", 400), row(PREVIOUS, "Travel", "Wants", 0),
+            row(LATEST, "Gifts", "Wants", 40), row(PREVIOUS, "Gifts", "Wants", 0),
+            row(LATEST, "Rent", "Needs", 1), row(PREVIOUS, "Rent", "Needs", 1),
+        ])
+        self.assertIsNone(found["Travel"].change_pct)
+        self.assertEqual(found["Travel"].change_usd, 400.0)
+        self.assertNotIn("Gifts", found)
+
+    def test_no_previous_month_or_trivial_base_gives_no_notable_changes(self):
+        _, snapshot = self.notable([row(LATEST, "Travel", "Wants", 900)])
+        self.assertEqual(snapshot.notable_changes, [])
+        found, _ = self.notable([row(LATEST, "Refunds", "Needs", -400), row(PREVIOUS, "Refunds", "Needs", -10), row(PREVIOUS, "Rent", "Needs", 1)])
+        self.assertNotIn("Refunds", found)
+
+    def test_sorted_by_absolute_dollar_change_and_capped_at_five(self):
+        rows = []
+        for index, delta in enumerate([300, -900, 500, 260, -700, 1000, 400]):
+            rows += [row(LATEST, f"Cat{index}", "Wants", 1000 + delta), row(PREVIOUS, f"Cat{index}", "Wants", 1000)]
+        _, snapshot = self.notable(rows)
+        self.assertEqual([item.change_usd for item in snapshot.notable_changes], [1000.0, -900.0, -700.0, 500.0, 400.0])
+
+    def test_custom_thresholds(self):
+        rows = [row(LATEST, "Books", "Wants", 160), row(PREVIOUS, "Books", "Wants", 100)]
+        found, _ = self.notable(rows, notable_change_pct=75, notable_change_usd=100)
+        self.assertEqual(found, {})
+        found, _ = self.notable(rows, notable_change_pct=75, notable_change_usd=50)
+        self.assertIn("Books", found)
+
+    def test_notable_changes_are_in_the_snapshot_json(self):
+        _, snapshot = self.notable([row(LATEST, "Books", "Wants", 160), row(PREVIOUS, "Books", "Wants", 100)])
+        payload = json.loads(json.dumps(snapshot.to_dict()))
+        self.assertEqual(payload["notable_changes"][0]["category"], "Books")
+        self.assertEqual(set(payload["notable_changes"][0]), {
+            "category", "parent_group", "current_spend", "previous_spend", "change_usd", "change_pct", "direction",
+        })
+
+
 if __name__ == "__main__":
     unittest.main()

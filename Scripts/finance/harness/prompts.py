@@ -66,8 +66,8 @@ GUIDED_AUTHOR_ADDENDUM = (
     "with the snapshot: the proposed cuts add up to the savings you claim, and any remaining gap you claim equals "
     "snapshot.savings_shortfall minus those cuts. Base it only on snapshot values and tool evidence; flagging a "
     "Needs category is a suggestion to review it, not a discretionary cap.\n"
-    "- Merchant, habit, or behavior claims still need get_transaction_detail evidence, and the design, safety, and "
-    "HTML requirements are unchanged."
+    "- Merchant, habit, behavior, or change-driver claims still need explain_category_change or "
+    "get_transaction_detail evidence, and the design, safety, and HTML requirements are unchanged."
 )
 
 # First line of the guided validator addendum; finance/replay.py looks for it in traced prompts.

@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 from .harness import HarnessLimits, ReportHarness, ToolSpec
 from .bigquery_tools import (
+    explain_category_change,
     get_category_detail,
     get_report_period_spending,
     get_transaction_detail,
@@ -125,6 +126,33 @@ def _build_tools(
             int(arguments.get("limit", 25)),
         )
 
+    def category_change(arguments: dict[str, Any]) -> dict[str, Any]:
+        category = str(arguments.get("category") or "").strip()
+        if not category:
+            raise ValueError("explain_category_change requires a 'category' from the snapshot")
+        requested_month = str(arguments.get("month", selected_month))[:10]
+        if requested_month != selected_month:
+            raise ValueError("explain_category_change is restricted to the selected report month")
+        metrics = getattr(snapshot, "categories", None) or []
+        known = sorted({metric.category for metric in metrics})
+        if known and category not in known:
+            raise ValueError(f"Unknown category {category!r}; use one of: {', '.join(known)}")
+        # A category can sit under several parent groups (one snapshot row each); match one row.
+        groups = sorted({metric.parent_group for metric in metrics if metric.category == category})
+        parent_group = str(arguments.get("parent_group") or "").strip() or None
+        if parent_group is None and len(groups) == 1:
+            parent_group = groups[0]
+        elif parent_group is None and len(groups) > 1:
+            raise ValueError(
+                f"Category {category!r} appears under several parent groups ({', '.join(groups)}); "
+                "retry with parent_group set to one of them, as in the snapshot."
+            )
+        elif parent_group is not None and groups and parent_group not in groups:
+            raise ValueError(f"Category {category!r} has parent_group {', '.join(groups)} in the snapshot, not {parent_group!r}")
+        return explain_category_change(
+            project_name, category, requested_month, int(arguments.get("top_n", 5)), parent_group
+        )
+
     def semantic_memory(arguments: dict[str, Any]) -> dict[str, Any]:
         if memory_module is None:
             return {"retrieval": "unavailable", "facts": []}
@@ -180,6 +208,17 @@ def _build_tools(
             transaction_detail,
             schemas["get_transaction_detail"],
         ),
+        "explain_category_change": ToolSpec(
+            "explain_category_change",
+            "Explain what drove a category's change from the previous month to the report month: per-month "
+            "transaction count, net spend, average and largest transaction; how much of the change came from more/fewer "
+            "transactions versus a larger/smaller average amount; the biggest description-level increases and decreases; "
+            "descriptions new this month; and this month's largest transactions. Useful for notable_changes worth "
+            "explaining; attribute causes only to what it returns. Arguments: category, optional parent_group "
+            "(needed when the category appears under several parent groups), month, top_n.",
+            category_change,
+            schemas["explain_category_change"],
+        ),
         "get_semantic_memory": ToolSpec(
             "get_semantic_memory",
             "Hybrid-search long-term historical facts for relevant preferences, goals, or habits. These facts are not current financial evidence. Requires a focused non-empty query; if no context is needed, skip this tool.",
@@ -229,6 +268,24 @@ def tool_parameter_schemas(selected_month: str, previous_month: str | None) -> d
                 "category": {**category, "description": "Optional category filter, as shown in the snapshot."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Rows to return (1-100); default 25."},
             },
+        },
+        "explain_category_change": {
+            "type": "object",
+            "properties": {
+                "category": category,
+                "month": {
+                    "type": "string",
+                    "enum": [selected_month],
+                    "description": f"Report month start date (YYYY-MM-DD); default {selected_month}. Compared with the previous month.",
+                },
+                "top_n": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Items per list (1-10); default 5."},
+                "parent_group": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Parent group as shown in the snapshot; required only when the category appears under several.",
+                },
+            },
+            "required": ["category"],
         },
         "get_semantic_memory": {
             "type": "object",
@@ -305,6 +362,8 @@ def generate_finance_report(
         fixed_costs=_required_amount(settings.fixed_costs, settings.fixed_costs_raw, "Fixed_costs"),
         savings_goal=settings.savings_goal_target,
         category_goals=settings.category_goals,
+        notable_change_pct=settings.notable_change_pct,
+        notable_change_usd=settings.notable_change_usd,
     )
     if selected_report_month is not None and snapshot.latest_month != selected_report_month.isoformat():
         raise ValueError("Selected report month is missing from the fetched spending rows")

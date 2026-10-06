@@ -31,8 +31,9 @@ from tests.guidance_test_fixtures import (
 )
 from tests.guidance_test_fixtures import finding as _finding
 
-# GOLDEN_PATH holds the full strict prompts captured from HEAD 17093ab (before the guidance setting
-# existed) with guidance_test_fixtures.capture_strict_prompts(); strict must reproduce them byte for byte.
+# GOLDEN_PATH holds the full strict prompts captured with guidance_test_fixtures.capture_strict_prompts()
+# (first from HEAD 17093ab, before the guidance setting existed; regenerated with write_golden() when the
+# snapshot gained notable_changes); strict must reproduce them byte for byte.
 
 
 class StrictGoldenTests(unittest.TestCase):

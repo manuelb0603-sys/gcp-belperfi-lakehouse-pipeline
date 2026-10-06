@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import calendar
+import json
 from datetime import date
 from typing import Any
 
@@ -162,3 +163,54 @@ def get_transaction_detail(project_name: str, month: str, category: str | None =
         parameters.append(bigquery.ScalarQueryParameter("category", "STRING", category))
     config = bigquery.QueryJobConfig(query_parameters=parameters)
     return {"source": "gold.fact_transactions", "month": month, "category": category, "rows": _rows(client.query(query, job_config=config).result())}
+
+def _previous_month_start(value: date) -> date:
+    return date(value.year - (value.month == 1), 12 if value.month == 1 else value.month - 1, 1)
+
+
+def explain_category_change(
+    project_name: str, category: str, month: str, top_n: int = 5, parent_group: str | None = None
+) -> dict[str, Any]:
+    """Explain one category's change from the previous month to ``month`` (read-only, one parameterized SELECT).
+
+    Reads that category's Sale/Return/Adjustment rows (as gold.fact_monthly_spending does) for the
+    month and its predecessor (optionally only one parent_group, matching a snapshot row) from
+    gold.fact_transactions and returns the compact summary from
+    finance.category_change.explain_category_change (never raw rows).
+    """
+    from .category_change import ANALYZED_TYPES, MAX_RESULT_BYTES, TOP_N_MAX, explain_category_change as summarize
+
+    category = str(category or "").strip()
+    if not category or len(category) > 120:
+        raise ValueError("category is required and must be at most 120 characters")
+    if len(month) != 10:
+        raise ValueError("month must be an ISO date")
+    parent_group = str(parent_group).strip() if parent_group else None
+    if parent_group is not None and len(parent_group) > 120:
+        raise ValueError("parent_group must be at most 120 characters")
+    if not 1 <= int(top_n) <= TOP_N_MAX:
+        raise ValueError(f"top_n must be between 1 and {TOP_N_MAX}")
+    current = date.fromisoformat(month).replace(day=1)
+    previous = _previous_month_start(current)
+    client, bigquery = _client(project_name)
+    group_filter = "AND parent_group = @parent_group" if parent_group else ""
+    query = f"""
+        SELECT transaction_month, transaction_date, description, amount, transaction_type
+        FROM `{project_name}.gold.fact_transactions`
+        WHERE category = @category {group_filter}
+          AND transaction_month IN UNNEST(@months)
+          AND transaction_type IN UNNEST(@types)
+    """
+    parameters: list[Any] = [
+        bigquery.ScalarQueryParameter("category", "STRING", category),
+        bigquery.ArrayQueryParameter("months", "DATE", [_month_end(current), _month_end(previous)]),
+        bigquery.ArrayQueryParameter("types", "STRING", list(ANALYZED_TYPES)),
+    ]
+    if parent_group:
+        parameters.append(bigquery.ScalarQueryParameter("parent_group", "STRING", parent_group))
+    config = bigquery.QueryJobConfig(query_parameters=parameters)
+    rows = _rows(client.query(query, job_config=config).result())
+    source = {"source": "gold.fact_transactions", **({"parent_group": parent_group} if parent_group else {})}
+    # Leave room for the source key so the whole result stays within MAX_RESULT_BYTES.
+    budget = MAX_RESULT_BYTES - len(json.dumps(source, separators=(",", ":")))
+    return {**source, **summarize(rows, category, current.isoformat(), previous.isoformat(), int(top_n), budget)}

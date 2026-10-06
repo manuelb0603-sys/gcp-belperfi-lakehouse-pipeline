@@ -5,7 +5,11 @@ from datetime import date
 from decimal import Decimal
 from typing import Any, Iterable
 
-from .report_models import CategoryMetric, ReportSnapshot
+from .report_models import CategoryMetric, NotableChange, ReportSnapshot
+from .settings import DEFAULTS
+
+# At most this many notable changes are listed in the snapshot (largest absolute dollar change first).
+MAX_NOTABLE_CHANGES = 5
 
 
 def _value(row: Any, name: str, default: Any = None) -> Any:
@@ -71,6 +75,45 @@ def _suggested_cap(
     return round(current, 2), "Savings target met; maintain current spend."
 
 
+def notable_changes(
+    categories: Iterable[CategoryMetric],
+    has_previous_month: bool,
+    pct_threshold: float = DEFAULTS["notable_change_pct"],
+    usd_threshold: float = DEFAULTS["notable_change_usd"],
+    limit: int = MAX_NOTABLE_CHANGES,
+) -> list[NotableChange]:
+    """Categories whose month-over-month change is notable, largest absolute dollar change first.
+
+    A category qualifies when a previous month exists, it has a non-trivial base (previous or
+    current spend above 0), and |mom_change_percent| >= pct_threshold (only when a percentage
+    exists, i.e. previous spend is not 0) or |current - previous| >= usd_threshold. At most
+    ``limit`` entries are returned; ties sort by category name.
+    """
+    if not has_previous_month:
+        return []
+    found = []
+    for metric in categories:
+        current, previous = metric.current_spend, metric.previous_spend
+        if not (previous > 0 or current > 0):
+            continue
+        change = round(current - previous, 2)
+        if abs(change) < 0.005:
+            continue
+        pct = metric.mom_change_percent
+        if (pct is not None and abs(pct) >= pct_threshold) or abs(change) >= usd_threshold:
+            found.append(NotableChange(
+                category=metric.category,
+                parent_group=metric.parent_group,
+                current_spend=current,
+                previous_spend=previous,
+                change_usd=change,
+                change_pct=pct,
+                direction="increase" if change > 0 else "decrease",
+            ))
+    found.sort(key=lambda item: (-abs(item.change_usd), item.category))
+    return found[:limit]
+
+
 def calculate_report_snapshot(
     rows: Iterable[Any],
     monthly_deposit: float,
@@ -78,8 +121,13 @@ def calculate_report_snapshot(
     savings_goal: float | None = None,
     category_goals: dict[str, float] | None = None,
     as_of: date | None = None,
+    notable_change_pct: float = DEFAULTS["notable_change_pct"],
+    notable_change_usd: float = DEFAULTS["notable_change_usd"],
 ) -> ReportSnapshot:
-    """Calculate report facts without involving an LLM."""
+    """Calculate report facts without involving an LLM.
+
+    notable_change_pct / notable_change_usd are the thresholds for snapshot.notable_changes.
+    """
     materialized = list(rows)
     if not materialized:
         raise ValueError("Cannot calculate a report snapshot from empty data")
@@ -188,4 +236,7 @@ def calculate_report_snapshot(
         remaining_gap_after_cuts=remaining_gap,
         max_positive_spend=max_positive,
         top_discretionary_categories=top_discretionary,
+        notable_changes=notable_changes(
+            categories, previous_month is not None, notable_change_pct, notable_change_usd
+        ),
     )

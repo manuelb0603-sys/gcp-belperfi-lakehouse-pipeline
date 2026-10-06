@@ -6,6 +6,8 @@ run against older code to regenerate ``testdata/strict_prompts_golden.json``:
 """
 
 import json
+from datetime import date
+from functools import partial
 from pathlib import Path
 
 from finance.harness import HarnessLimits, ReportHarness, ToolSpec
@@ -16,6 +18,7 @@ from finance.report_requirements import build_report_requirements
 GOLDEN_PATH = Path(__file__).resolve().parent / "testdata" / "strict_prompts_golden.json"
 
 LATEST, PREVIOUS = "2026-08-01", "2026-07-01"
+AS_OF = date(2026, 9, 1)
 
 
 def _row(month, category, group, amount):
@@ -45,16 +48,17 @@ def small_rows():
 
 
 def scenarios():
-    """{name: snapshot} covering every goal method."""
+    """{name: snapshot} covering every goal method (as_of pinned so the golden does not depend on today)."""
+    snap = partial(calculate_report_snapshot, as_of=AS_OF)
     return {
-        "cuts_insufficient": calculate_report_snapshot(cuts_insufficient_rows(), 5000, 3500, savings_goal=2000),
-        "shortfall_allocation": calculate_report_snapshot(small_rows(), 3000, 1500, savings_goal=500),
-        "trend_maintenance": calculate_report_snapshot(small_rows(), 6000, 1500, savings_goal=500),
-        "no_target": calculate_report_snapshot(small_rows(), 6000, 1500, savings_goal=None),
-        "configured": calculate_report_snapshot(
+        "cuts_insufficient": snap(cuts_insufficient_rows(), 5000, 3500, savings_goal=2000),
+        "shortfall_allocation": snap(small_rows(), 3000, 1500, savings_goal=500),
+        "trend_maintenance": snap(small_rows(), 6000, 1500, savings_goal=500),
+        "no_target": snap(small_rows(), 6000, 1500, savings_goal=None),
+        "configured": snap(
             small_rows(), 6000, 1500, savings_goal=500, category_goals={"Food & Drink": 280, "Shopping": 250, "Entertainment": 0}
         ),
-        "no_eligible": calculate_report_snapshot([_row(LATEST, "Rent", "Needs", 1000)], 3000, 500, savings_goal=100),
+        "no_eligible": snap([_row(LATEST, "Rent", "Needs", 1000)], 3000, 500, savings_goal=100),
     }
 
 

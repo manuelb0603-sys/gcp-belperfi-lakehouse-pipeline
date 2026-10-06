@@ -101,12 +101,23 @@ class TestParsing(unittest.TestCase):
             ({"category_goals": ["Dining"]}, "category_goals"),
             ({"email_listings": "a@x"}, "email_listings"),
             ({"model_roles": {"author": {"provider": "other", "model": "m"}}}, "model_roles"),
+            ({"notable_change_pct": 0}, "notable_change_pct"),
+            ({"notable_change_usd": "lots"}, "notable_change_usd"),
+            ({"notable_change_usd": True}, "notable_change_usd"),
         ]
         for config, key in cases:
             with self.subTest(key=key, config=config):
                 with self.assertRaisesRegex(SettingsError, key):
                     ReportSettings.from_config(config)
         self.assertTrue(issubclass(SettingsError, ValueError))
+
+    def test_notable_change_thresholds(self):
+        s = ReportSettings.from_config({})
+        self.assertEqual((s.notable_change_pct, s.notable_change_usd), (50.0, 250.0))
+        s = ReportSettings.from_config({"notable_change_pct": "30", "notable_change_usd": 100})
+        self.assertEqual((s.notable_change_pct, s.notable_change_usd), (30.0, 100.0))
+        example = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+        self.assertEqual((example["notable_change_pct"], example["notable_change_usd"]), (50, 250))
 
     def test_repr_masks_credentials_and_hides_raw_config(self):
         s = ReportSettings.from_config({"Gmail_app_credentials": "abcd efgh ijkl mnop", "email_sender": "s@x"})

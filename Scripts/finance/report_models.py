@@ -26,6 +26,20 @@ class CategoryMetric:
 
 
 @dataclass(frozen=True)
+class NotableChange:
+    """A category whose month-over-month change meets the notable-change thresholds (report_metrics)."""
+
+    category: str
+    parent_group: str
+    current_spend: float
+    previous_spend: float
+    change_usd: float
+    # None when the previous month's spend was 0 (no percentage base).
+    change_pct: float | None
+    direction: str
+
+
+@dataclass(frozen=True)
 class ReportSnapshot:
     as_of: str
     latest_month: str
@@ -47,6 +61,8 @@ class ReportSnapshot:
     remaining_gap_after_cuts: float | None = None
     max_positive_spend: float = 0.0
     top_discretionary_categories: list[str] = field(default_factory=list)
+    # Largest month-over-month category moves (by absolute dollars); optional insight, not a checklist item.
+    notable_changes: list[NotableChange] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

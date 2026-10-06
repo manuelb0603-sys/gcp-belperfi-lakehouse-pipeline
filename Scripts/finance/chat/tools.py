@@ -303,6 +303,8 @@ def snapshot_for_month(ctx: ToolContext, month: date) -> ReportSnapshot:
         savings_goal=settings.savings_goal_target,
         category_goals=goals,
         as_of=ctx.today,
+        notable_change_pct=settings.notable_change_pct,
+        notable_change_usd=settings.notable_change_usd,
     )
 
 

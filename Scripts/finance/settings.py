@@ -51,6 +51,9 @@ DEFAULTS: dict[str, Any] = {
     "anthropic_daily_budget_usd": 15.0,
     "anthropic_run_budget_usd": 5.0,
     "anthropic_cost_ledger_path": "agent/runs/cost_ledger.jsonl",
+    # snapshot.notable_changes thresholds: |MoM %| at least this, or |dollar change| at least this.
+    "notable_change_pct": 50.0,
+    "notable_change_usd": 250.0,
 }
 
 REPORT_MODES = ("legacy", "agent")
@@ -140,6 +143,19 @@ def _int(key: str, value: Any, *, minimum: int) -> int:
     if value < minimum:
         raise SettingsError(f"{key} must be {'a positive integer' if minimum == 1 else f'at least {minimum}'}, got {value}")
     return value
+
+
+def _positive_number(key: str, value: Any) -> float:
+    """A number greater than 0 (ints, floats, or numeric strings)."""
+    if isinstance(value, bool):
+        raise SettingsError(f"{key} must be a positive number, got {value!r}")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise SettingsError(f"{key} must be a positive number, got {value!r}") from None
+    if number != number or number <= 0:
+        raise SettingsError(f"{key} must be a positive number, got {value!r}")
+    return number
 
 
 def validate_guidance(key: str, value: Any) -> str:
@@ -253,6 +269,9 @@ class ReportSettings:
     anthropic_daily_budget_usd: float | None
     anthropic_run_budget_usd: float | None
     anthropic_cost_ledger_path: str
+    # snapshot.notable_changes thresholds (report_metrics.notable_changes)
+    notable_change_pct: float = DEFAULTS["notable_change_pct"]
+    notable_change_usd: float = DEFAULTS["notable_change_usd"]
     # The source mapping (for role re-resolution with caller overrides); never shown in repr.
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
@@ -369,6 +388,8 @@ class ReportSettings:
                 ("anthropic_daily_budget_usd", "anthropic_run_budget_usd", "anthropic_cost_ledger_path"),
                 budget_settings(config),
             )),
+            notable_change_pct=_positive_number("notable_change_pct", _get(config, "notable_change_pct")),
+            notable_change_usd=_positive_number("notable_change_usd", _get(config, "notable_change_usd")),
             raw=config,
             **limits,
         )

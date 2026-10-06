@@ -31,6 +31,8 @@
   "Vehicle_Info": "2017 Honda Civic LX, 2022 Honda Accord",
   "Savings_goal_target": 2000,
   "category_goals": {},
+  "notable_change_pct": 50,
+  "notable_change_usd": 250,
   "chat_data_cache_seconds": 900,
   "merchant_aliases": {"WHOLEFDS MKT": "Whole Foods"},
   "chat_history_turns": 6,
