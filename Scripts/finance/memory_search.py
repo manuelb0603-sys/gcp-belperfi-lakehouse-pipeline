@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from .log import get_logger
 from .ollama import embed_text, embed_texts
+
+logger = get_logger(__name__)
 
 
 def search_long_facts(
@@ -41,10 +44,10 @@ def search_long_facts(
                 for fact, vector in zip(batch, vectors):
                     memory_module.set_long_fact_embedding(fact["fact_key"], vector, embedding_model)
             except Exception as exc:
-                print(f"Could not backfill a long-fact embedding batch: {exc}")
+                logger.warning(f"Could not backfill a long-fact embedding batch: {exc}")
         vector_results = memory_module.search_long_facts(query_vector, embedding_model, limit=candidate_limit)
     except Exception as exc:
-        print(f"Long-fact vector retrieval unavailable; using BM25 fallback: {exc}")
+        logger.warning(f"Long-fact vector retrieval unavailable; using BM25 fallback: {exc}")
 
     lexical_results = memory_module.search_long_facts_bm25(query_text, limit=candidate_limit)
     results = memory_module.combine_fact_search_results(vector_results, lexical_results, limit=limit)

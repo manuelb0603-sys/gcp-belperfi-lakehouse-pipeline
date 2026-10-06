@@ -11,9 +11,12 @@ from collections import OrderedDict
 from typing import Any
 
 from .html_text import html_to_text
+from .log import get_logger
 from .memory_search import search_long_facts
 from .ollama import embed_text, embed_texts, generate_text
 from .settings import ReportSettings
+
+logger = get_logger(__name__)
 
 
 def _html_to_text(markup: str) -> str:
@@ -144,14 +147,14 @@ def answer_finance_question(
     except Exception as exc:
         # If report-vector search is unavailable, retain the selected-period data directly
         # rather than losing the authoritative source from the answer context.
-        print(f"Selected-report vector search unavailable; including report data directly: {exc}")
+        logger.warning(f"Selected-report vector search unavailable; including report data directly: {exc}")
         report_passages = [json.dumps(report_context, ensure_ascii=False, default=str)[:6000]]
 
     if memory_module is None:
         try:
             memory_module = _memory_module(settings)
         except Exception as exc:
-            print(f"Finance memory unavailable; answering without it: {exc}")
+            logger.warning(f"Finance memory unavailable; answering without it: {exc}")
     try:
         long_facts, retrieval_method = search_long_facts(
             question,
@@ -162,7 +165,7 @@ def answer_finance_question(
             limit=memory_limit,
         )
     except Exception as exc:
-        print(f"Long-term finance memory unavailable: {exc}")
+        logger.warning(f"Long-term finance memory unavailable: {exc}")
         long_facts, retrieval_method = [], "unavailable"
 
     prompt = f"""You are a careful personal-finance assistant. Answer the user's question concisely using the selected-period report passages and finance data below. Selected-period BigQuery figures are the sole authority for current amounts, trends, and months. Do not invent transactions or explanations. Clearly distinguish historical preferences/goals from current financial facts. Historical memory can add context but cannot change the selected-period numbers. If the available evidence does not answer the question, say so.
@@ -200,5 +203,5 @@ USER QUESTION:
         )
     except Exception as exc:
         # Persistence is helpful for future context, but must never discard a valid answer.
-        print(f"Could not save finance Q&A exchange to memory: {exc}")
+        logger.warning(f"Could not save finance Q&A exchange to memory: {exc}")
     return answer

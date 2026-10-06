@@ -7,7 +7,7 @@ the validator instructions (system) and the cycle's review content (user) on
 in as the system part (plus today's guided addendum when the traced run was guided). replay_validator() sends it to the configured validator role, or to a
 provider:model given on the command line, with VALIDATOR_RESPONSE_SCHEMA, prints the verdict,
 and saves each result as agent/runs/replays/<stamp>_<run_id>_<model>.json.
-``Scripts/replay_validator.py`` is the CLI. Nothing here changes the archived run.
+``Scripts/reports/replay_validator.py`` is the CLI. Nothing here changes the archived run.
 """
 
 from __future__ import annotations

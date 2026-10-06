@@ -22,7 +22,10 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from .log import get_logger
 from .pricing import cost_usd, usage_tokens, worst_case_call_usd
+
+logger = get_logger(__name__)
 
 # Ledger run ids for calls that are not part of a report run. For these the run cap applies
 # to the spend of one guard (one replay, one comparison, one chat session) instead.
@@ -325,8 +328,9 @@ def guard_from_settings(config: Any, run_id: str | None = None) -> BudgetGuard:
     return BudgetGuard(CostLedger(resolve_ledger_path(ledger_path)), daily, per_run, run_id or "other")
 
 
-def warn_if_disabled(daily: float | None, per_run: float | None, echo: Callable[[str], None] = print) -> None:
-    """Print a warning (once per process) when a Claude spend cap is explicitly disabled."""
+def warn_if_disabled(daily: float | None, per_run: float | None, echo: Callable[[str], None] | None = None) -> None:
+    """Log a warning (once per process) when a Claude spend cap is explicitly disabled (echo overrides the logger)."""
+    echo = echo or logger.warning
     for name, value in (("anthropic_daily_budget_usd", daily), ("anthropic_run_budget_usd", per_run)):
         if value is None and (name,) not in _WARNED:
             _WARNED.add((name,))

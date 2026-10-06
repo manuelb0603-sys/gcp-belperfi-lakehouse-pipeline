@@ -11,9 +11,12 @@ import time
 from datetime import date
 from typing import Any
 
+from .log import get_logger
 from .ollama import generate_text
 from .settings import ReportSettings
 from .status_log import log_status
+
+logger = get_logger(__name__)
 
 # query_ollama's return value when the model call fails (callers compare against it).
 FAILED_REPORT_TEXT = "Failed to generate report."
@@ -105,7 +108,7 @@ def _memory_context_to_prompt(memory_module: Any, receiver_header: str, sender: 
                 if text:
                     lines.append(f"Previous complete report ({subject}) - use only as a historical reference for layout and goals; do not reuse its financial numbers:\n{text.strip()}")
     except Exception as exc:
-        print(f"Recent-thread memory context lookup failed: {exc}")
+        logger.warning(f"Recent-thread memory context lookup failed: {exc}")
 
     return "\n".join(lines)
 

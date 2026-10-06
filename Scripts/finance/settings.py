@@ -56,7 +56,7 @@ DEFAULTS: dict[str, Any] = {
 REPORT_MODES = ("legacy", "agent")
 GUIDANCE_MODES = ("strict", "guided")
 LIMIT_KEYS = ("max_agent_rounds", "max_tool_calls", "max_calls_per_tool", "max_validation_cycles", "max_report_bytes")
-# Fallbacks used only by the Finance Summary and QA app when the keys are missing.
+# Fallbacks used only by the finance app (Scripts/apps/finance_app.py) when the keys are missing.
 APP_FALLBACK_MODEL_SERVER_URL = "http://localhost:11434/api/generate"
 APP_FALLBACK_MODEL_NAME = "gemma4:e4b"
 # Role fields that are safe to record in run metadata (no URLs or credentials).
@@ -240,7 +240,7 @@ class ReportSettings:
     email_sender: str | None
     email_listings: list[str]
     gmail_app_credentials: str | None
-    # Finance Summary and QA app
+    # Finance app (Scripts/apps/finance_app.py)
     qa_report_context_chunks: int
     qa_long_fact_limit: int
     # Finance chat (Scripts/finance/chat/)

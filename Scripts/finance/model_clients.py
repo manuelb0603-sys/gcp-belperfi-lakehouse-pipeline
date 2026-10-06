@@ -17,7 +17,6 @@ come from the environment (ANTHROPIC_API_KEY or an ``ant auth login`` profile), 
 from __future__ import annotations
 
 import json
-import logging
 import math
 import time
 from dataclasses import dataclass, field
@@ -25,11 +24,12 @@ from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urlsplit, urlunsplit
 
 from .budget import BudgetGuard, guard_from_settings
+from .log import get_logger
 from .pricing import cost_usd, worst_case_call_usd
 from .settings import DEFAULTS, GUIDANCE_MODES
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 MODEL_ROLES = ("author", "validator", "eval", "chat")
 DEFAULT_TIMEOUT = DEFAULTS["ollama_timeout"]
@@ -247,10 +247,9 @@ class OllamaClient:
                 # The token limit was spent before any answer (often on hidden thinking); retrying the
                 # same call would fail the same way, so let the format/length handling report it.
                 thinking_chars = len(body.get("thinking") or "")
-                print(
+                logger.warning(
                     f"Ollama hit num_predict with no answer text ({thinking_chars} thinking chars); "
-                    "raise num_predict or set think=false for this role.",
-                    flush=True,
+                    "raise num_predict or set think=false for this role."
                 )
                 result = ""
             else:

@@ -329,7 +329,7 @@ def safe_profile(df: pd.DataFrame, *, today: date) -> DataProfile | None:
     try:
         return build_data_profile(df, today=today)
     except Exception:  # pragma: no cover - defensive; profiling must not break the chat
-        import logging
+        from ..log import get_logger
 
-        logging.getLogger(__name__).exception("Could not profile the chat data")
+        get_logger(__name__).exception("Could not profile the chat data")
         return None

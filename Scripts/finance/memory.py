@@ -13,7 +13,7 @@ Usage:
     store.upsert_long_fact("balance_trend", "Balance is rising", source_short_term_id=1)
 
 The module-level functions (init_db, get_or_create_thread, ...) delegate to a default store
-set by init_db(); they remain for the Scripts/memory.py shim and older callers.
+set by init_db(); they remain for older callers.
 """
 import hashlib
 import json

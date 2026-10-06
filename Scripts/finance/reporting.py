@@ -18,11 +18,14 @@ from .bigquery_tools import (
 from .report_metrics import calculate_report_snapshot
 from .report_requirements import build_report_requirements
 from .html_text import html_to_text
+from .log import get_logger
 from .memory_search import search_long_facts
 from .budget import LedgerUnavailableError, anthropic_cost_from_events
 from .model_clients import build_model_client
 from .run_archive import metrics_from_trace
 from .settings import PROJECT_ROOT, ReportSettings
+
+logger = get_logger(__name__)
 
 
 # Stored reports are excerpted without their CSS/script/head boilerplate.
@@ -157,37 +160,86 @@ def _build_tools(
                 })
         return {"reports": reports}
 
+    schemas = tool_parameter_schemas(selected_month, previous_month)
     return {
         "get_spending_summary": ToolSpec(
             "get_spending_summary",
             "Return spending rows for the selected report month and predecessor only.",
             spending_summary,
+            schemas["get_spending_summary"],
         ),
         "get_category_detail": ToolSpec(
             "get_category_detail",
             "Get category evidence from the selected report month and its predecessor. Arguments: category, optional month.",
             category_detail,
+            schemas["get_category_detail"],
         ),
         "get_transaction_detail": ToolSpec(
             "get_transaction_detail",
             "Get up to 100 transaction rows from the selected report month or its predecessor. Arguments: optional month/category/limit.",
             transaction_detail,
+            schemas["get_transaction_detail"],
         ),
         "get_semantic_memory": ToolSpec(
             "get_semantic_memory",
             "Hybrid-search long-term historical facts for relevant preferences, goals, or habits. These facts are not current financial evidence. Requires a focused non-empty query; if no context is needed, skip this tool.",
             semantic_memory,
+            schemas["get_semantic_memory"],
         ),
         "get_episodic_memory": ToolSpec(
             "get_episodic_memory",
             "Get recent report thread context, which is historical only.",
             episodic_memory,
+            schemas["get_episodic_memory"],
         ),
         "get_report_history": ToolSpec(
             "get_report_history",
             "Get labeled prior report excerpts for historical style/context only.",
             report_history,
+            schemas["get_report_history"],
         ),
+    }
+
+
+def tool_parameter_schemas(selected_month: str, previous_month: str | None) -> dict[str, dict[str, Any]]:
+    """JSON schemas for the author's tool arguments (shown in the tool list and checked before a tool runs).
+
+    Months are month-start dates (YYYY-MM-DD) limited to the selected report month and its
+    predecessor; extra keys are ignored, as before, so only the declared arguments are checked.
+    """
+    months = [month for month in (selected_month, previous_month) if month]
+    month = {
+        "type": "string",
+        "enum": months,
+        "description": f"Month start date (YYYY-MM-DD); default {selected_month} (the selected report month).",
+    }
+    category = {"type": "string", "minLength": 1, "description": "Category name as shown in the snapshot."}
+    no_arguments = {"type": "object", "properties": {}}
+    return {
+        "get_spending_summary": no_arguments,
+        "get_category_detail": {
+            "type": "object",
+            "properties": {"category": category, "month": month},
+            "required": ["category"],
+        },
+        "get_transaction_detail": {
+            "type": "object",
+            "properties": {
+                "month": month,
+                "category": {**category, "description": "Optional category filter, as shown in the snapshot."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Rows to return (1-100); default 25."},
+            },
+        },
+        "get_semantic_memory": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Focused natural-language query (required, non-empty)."},
+                "limit": {"type": "integer", "description": "Facts to return (1-10); default 5."},
+            },
+            "required": ["query"],
+        },
+        "get_episodic_memory": no_arguments,
+        "get_report_history": no_arguments,
     }
 
 
@@ -297,7 +349,7 @@ def generate_finance_report(
             setattr(exc, "report_snapshot", snapshot)
         except Exception:
             pass
-        print(f"Finance report generation failed: {exc}")
+        logger.error(f"Finance report generation failed: {exc}")
         raise
 
     report_html = str(report.get("report_html", ""))

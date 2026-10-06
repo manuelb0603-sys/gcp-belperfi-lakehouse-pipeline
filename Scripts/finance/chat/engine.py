@@ -21,7 +21,6 @@ Budget refusals, an unreachable model, and the turn deadline become friendly tex
 from __future__ import annotations
 
 import json
-import logging
 import time
 from dataclasses import dataclass, field
 from datetime import date
@@ -30,15 +29,16 @@ from typing import Any, Callable, Iterator, Mapping
 import pandas as pd
 
 from ..budget import BudgetExceededError
+from ..log import get_logger
 from ..model_clients import ChatReply, EmptyModelResponse, is_anthropic_transient, tool_message
 from ..settings import ReportSettings
 from . import prompts
 from .executor import check_narrative_numbers, display_table
 from .profile import safe_profile
-from .session import ChatSession, Turn
+from .session import ChatSession, Turn, is_follow_up
 from .tools import ToolContext, ToolOutcome, dispatch, tool_definitions
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 MAX_TABLE_ROWS = 25
 
@@ -187,7 +187,12 @@ def run_turn(
     tools = tool_definitions()
     messages = session.history_messages() + [{
         "role": "user",
-        "content": prompts.turn_prompt(question, summary=session.rolling_summary(), last_spec=session.last_spec),
+        # The previous analysis goes to the model only for follow-ups; a new question starts from defaults.
+        "content": prompts.turn_prompt(
+            question,
+            summary=session.rolling_summary(),
+            last_spec=session.last_spec if is_follow_up(question, session) else None,
+        ),
     }]
     outcomes: list[ToolOutcome] = []
     text = ""

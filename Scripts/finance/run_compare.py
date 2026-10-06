@@ -4,7 +4,7 @@ gather_run() reads one run folder (run.json, metrics.json, progress.json, trace.
 final_report.txt) into a bounded summary; build_prompt() turns several summaries into a
 system prompt (stable instructions) plus a user message (the run data as JSON);
 compare_runs() calls the eval ModelClient and saves agent/runs/comparisons/<stamp>_<n>runs.html
-with a sibling .json metadata file, then refreshes the run index. ``Scripts/compare_runs.py``
+with a sibling .json metadata file, then refreshes the run index. ``Scripts/reports/compare_runs.py``
 is the CLI. Only the standard library is used; the Markdown answer is converted to escaped HTML.
 """
 

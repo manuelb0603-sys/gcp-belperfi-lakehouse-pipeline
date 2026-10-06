@@ -48,7 +48,15 @@ from .prompts import (
     validator_prompt_parts,
 )
 from .protocol import VALIDATOR_RESPONSE_SCHEMA, parse_author_response, parse_json_response
-from .trace import HarnessLimits, RunTrace, ToolSpec, effective_limits, limits_dict
+from .trace import (
+    HarnessLimits,
+    RunTrace,
+    ToolSpec,
+    effective_limits,
+    limits_dict,
+    tool_argument_summary,
+    validate_tool_arguments,
+)
 from .transport import QueryFunctionClient, _response_meta
 
 
@@ -314,6 +322,12 @@ class ReportHarness:
     ) -> dict[str, Any]:
         """Run one tool and return failures as agent-visible evidence for recovery."""
         try:
+            schema_errors = validate_tool_arguments(tool, arguments)
+            if schema_errors:
+                raise ValueError(
+                    f"Invalid arguments for {name}: {'; '.join(schema_errors)}. "
+                    f"Expected arguments: {json.dumps(tool.parameters, sort_keys=True)}"
+                )
             result = tool.function(arguments)
         except Exception as exc:
             self._record_exception(f"{phase}_tool_call", exc, tool=name, arguments=arguments)
@@ -425,7 +439,7 @@ class ReportHarness:
         # Expose only the allowlisted tool metadata to the author model. The list is the
         # contract: the model can request these names and argument objects, nothing else.
         return json.dumps({
-            name: {"description": spec.description, "arguments": "JSON object"}
+            name: {"description": spec.description, "arguments": tool_argument_summary(spec)}
             for name, spec in tools.items()
         }, indent=2)
 

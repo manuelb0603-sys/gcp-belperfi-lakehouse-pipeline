@@ -13,7 +13,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .budget import COST_EVENTS, BudgetExceededError, CostLedger, status_line as budget_status_line
+from .log import get_logger
 from .settings import DEFAULTS, PROJECT_ROOT
+
+logger = get_logger(__name__)
 
 # Where report runs are archived (the email workflow, replays, and comparisons default to it).
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "agent" / "runs"
@@ -278,7 +281,7 @@ function compareSelected() {
     });
     target.appendChild(table);
     target.appendChild(cell('p', 'Shaded rows differ between the selected runs.')).className = 'muted';
-    document.getElementById('compare-command').value = '..\\.venv\\Scripts\\python.exe Scripts\\compare_runs.py ' + ids.map(quoteArg).join(' ');
+    document.getElementById('compare-command').value = '..\\.venv\\Scripts\\python.exe Scripts\\reports\\compare_runs.py ' + ids.map(quoteArg).join(' ');
     document.getElementById('copy-status').textContent = '';
     panel.hidden = false;
 }
@@ -542,7 +545,7 @@ def update_index(root: Path, ledger_path: Path | None = None) -> Path:
             f"<th>est. cost</th><th>result</th></tr></thead><tbody>{''.join(replay_rows)}</tbody></table>"
         )
     else:
-        replays_html = '<p class="muted">No validator replays yet (Scripts/replay_validator.py).</p>'
+        replays_html = '<p class="muted">No validator replays yet (Scripts/reports/replay_validator.py).</p>'
     generated = datetime.now(timezone.utc).isoformat()
     # "</" is escaped so run data can never close the script element.
     metrics_json = json.dumps({item.get("run_id"): item for item in rows}, default=str).replace("</", "<\\/")
@@ -643,9 +646,9 @@ class ProgressRecorder:
             with (self.run_dir / "progress.log").open("a", encoding="utf-8") as log_file:
                 log_file.write(line + "\n")
         except OSError as exc:
-            print(f"Could not write progress.log: {exc}", flush=True)
+            logger.warning(f"Could not write progress.log: {exc}")
         if self.echo:
-            print(line, flush=True)
+            logger.info(line, extra={"preformatted": True})
 
     def finish(self, status: str, **details: Any) -> None:
         """Record the final run status; never raises so archiving and delivery can continue."""
@@ -718,7 +721,7 @@ class ProgressRecorder:
                 path.write_text(payload, encoding="utf-8")
                 temp_path.unlink(missing_ok=True)
             except OSError as exc:
-                print(f"Could not write progress.json: {exc}", flush=True)
+                logger.warning(f"Could not write progress.json: {exc}")
 
 
 def _describe_event(event: dict[str, Any]) -> str | None:

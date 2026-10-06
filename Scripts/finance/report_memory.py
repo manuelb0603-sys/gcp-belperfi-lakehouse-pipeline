@@ -14,9 +14,12 @@ from typing import Any
 
 from .email_delivery import report_subject
 from .legacy_report import query_ollama
+from .log import get_logger
 from .ollama import embed_text
 from .settings import ReportSettings
 from .status_log import log_status
+
+logger = get_logger(__name__)
 
 
 def open_report_memory(memory_schema: str = "memory") -> Any:
@@ -28,7 +31,7 @@ def open_report_memory(memory_schema: str = "memory") -> Any:
         log_status(f"Using memory schema '{memory_schema}' at {store.db_path}")
         return store
     except Exception as exc:
-        print(f"Memory initialization failed: {exc}")
+        logger.warning(f"Memory initialization failed: {exc}")
         return None
 
 
@@ -123,4 +126,4 @@ def remember_report(memory_module: Any, sender: str, receivers: list[str], recei
                 continue
         log_status("Completed memory persistence and fact extraction")
     except Exception as exc:
-        print(f"Memory logging failed: {exc}")
+        logger.warning(f"Memory logging failed: {exc}")

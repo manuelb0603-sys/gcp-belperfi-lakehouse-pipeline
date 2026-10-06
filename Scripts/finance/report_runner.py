@@ -18,9 +18,12 @@ from typing import Any, Callable
 from . import run_archive
 from .budget import anthropic_cost_from_events, configured_ledger_path
 from .email_delivery import build_email_message, send_email
+from .log import get_logger
 from .report_memory import open_report_memory, remember_report
 from .settings import ReportSettings
 from .status_log import log_status
+
+logger = get_logger(__name__)
 
 MEMORY_PROMPT = "Create the validated weekly finance report."
 
@@ -51,7 +54,7 @@ def start_progress(
         log_status(f"Live run progress: {progress.run_dir / 'progress.log'}")
         return progress
     except Exception as exc:
-        print(f"Live run progress unavailable; continuing without it: {exc}", flush=True)
+        logger.warning(f"Live run progress unavailable; continuing without it: {exc}")
         return None
 
 
@@ -135,7 +138,7 @@ def run_agent_weekly_report(
             run_id=run_id,  # the Claude run cap (anthropic_run_budget_usd) is counted per run id
         )
     except Exception as exc:
-        print(f"Shared finance report generation failed: {exc}", flush=True)
+        logger.error(f"Shared finance report generation failed: {exc}")
         failed_trace = getattr(exc, "run_trace", None)
         failed_snapshot = getattr(exc, "report_snapshot", None)
         # Keep the _failed suffix by renaming the live directory; if that is not possible,
@@ -166,21 +169,21 @@ def run_agent_weekly_report(
             },
             events, "", "", failed_metrics,
         )
-        print(f"Failed agent run trace archived at {archive_root / run_id}")
+        logger.info(f"Failed agent run trace archived at {archive_root / run_id}")
         return
 
     archive(
         {"status": result.metrics["status"], **run_metadata, "snapshot": result.snapshot.to_dict()},
         result.trace.events, result.report_html, result.plain_text, result.metrics,
     )
-    print(f"Agent run archived at {archive_root / run_id}")
+    logger.info(f"Agent run archived at {archive_root / run_id}")
     if not result.passed:
         budget_message = budget_stop_message(result)
         if budget_message:
             # A Claude spend cap stopped the run: fail decision, nothing is sent.
-            print(f"Report was not sent: {budget_message}")
+            logger.warning(f"Report was not sent: {budget_message}")
         else:
-            print("Report was not sent because validation did not pass.")
+            logger.warning("Report was not sent because validation did not pass.")
         if progress is not None:
             details = {"delivery": "not_sent"}
             if budget_message:
@@ -188,7 +191,7 @@ def run_agent_weekly_report(
             progress.finish(result.metrics["status"], **details)
         return
     if settings.dry_run:
-        print("Dry run enabled; report was rendered and archived but not sent.")
+        logger.info("Dry run enabled; report was rendered and archived but not sent.")
         if progress is not None:
             progress.finish(result.metrics["status"], delivery="dry_run")
         return
@@ -211,7 +214,7 @@ def run_agent_weekly_report(
             {"status": "delivery_failed", **run_metadata, "snapshot": result.snapshot.to_dict(), "error": str(exc)},
             result.trace.events, result.report_html, result.plain_text, result.metrics,
         )
-        print(f"Email delivery failed; updated run trace archived at {archive_root / run_id}: {exc}")
+        logger.error(f"Email delivery failed; updated run trace archived at {archive_root / run_id}: {exc}")
         if progress is not None:
             progress.finish("delivery_failed", delivery="failed", error=f"{type(exc).__name__}: {exc}")
         return

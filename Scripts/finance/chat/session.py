@@ -3,12 +3,14 @@
 A ``ChatSession`` keeps each turn's user text, the specs it ran, the compact summaries the model
 saw, and the assistant's answer. The last ``history_turns`` turns are replayed verbatim; older
 turns are folded into a deterministic rolling summary. ``last_spec`` lets follow-ups ("now by
-month") start from the previous analysis. ``sync_history`` drops turns the UI no longer shows
-(undo, retry, or clear).
+month") start from the previous analysis; ``is_follow_up`` decides whether a message is one, so a
+new question starts from the defaults instead of inheriting the previous filters and period.
+``sync_history`` drops turns the UI no longer shows (undo, retry, or clear).
 """
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import date
@@ -16,6 +18,18 @@ from typing import Any, Iterable
 
 ROLLING_SUMMARY_MAX_CHARS = 1200
 NO_ANSWER = "(no answer)"
+
+# Follow-up cues: refinement words ("now only Amex", "same but by month", "also by issuer",
+# "by month instead", "and by store"), references to the previous result ("break that down",
+# "what about August", "compare that", "show it", "those"), and chart switches ("as a pie
+# chart", "switch to a line"). Whole words only, case-insensitive. A message without a cue is
+# a new question and gets no previous analysis.
+FOLLOW_UP_CUES = (
+    r"now", r"same", r"also", r"only", r"instead", r"and by", r"break (?:that|this|it|those) down",
+    r"what about", r"how about", r"that", r"it", r"those", r"compare that", r"switch to",
+    r"as an? (?:[\w-]+ ){0,2}chart",
+)
+_FOLLOW_UP_PATTERN = re.compile(r"\b(?:" + "|".join(FOLLOW_UP_CUES) + r")\b", re.IGNORECASE)
 
 
 @dataclass
@@ -36,6 +50,20 @@ def _role(message: Any) -> str | None:
     if isinstance(message, dict):
         return message.get("role")
     return getattr(message, "role", None)
+
+
+def is_follow_up(text: str, session: "ChatSession | None") -> bool:
+    """True when the message refines the previous analysis, so the model should see ``last_spec``.
+
+    Needs a previous analysis and one of ``FOLLOW_UP_CUES`` in the message (after normalizing
+    whitespace and curly apostrophes). "Which weekday do I spend the most?" after "How much did
+    I spend this month?" is a new question; "Now only Amex" or "Show that as a pie chart" are
+    follow-ups.
+    """
+    if session is None or not session.last_spec:
+        return False
+    normalized = " ".join(str(text or "").replace("\u2019", "'").split())
+    return bool(normalized) and _FOLLOW_UP_PATTERN.search(normalized) is not None
 
 
 class ChatSession:
