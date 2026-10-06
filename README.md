@@ -33,12 +33,16 @@ This pipeline implements a multi-layer Lakehouse medallion architecture designed
 │   │   │   ├── transport.py       # Legacy query_ollama and the query-callable adapter used by tests
 │   │   │   └── fallback.py        # Deterministic fallback report
 │   │   ├── bigquery_tools.py      # Read-only tools for gold-layer spending and transaction evidence
-│   │   ├── chat/                  # Finance chat (in progress): deterministic data, analysis, and charts
+│   │   ├── chat/                  # Finance chat: deterministic data, analysis, charts, tools, and the chat engine
 │   │   │   ├── data.py            # Gold transactions query, TTL cache, refresh(), and the data catalog
 │   │   │   ├── merchants.py       # normalize_merchant: descriptor cleanup, payments/credits, aliases
 │   │   │   ├── analysis_spec.py   # AnalysisSpec (pydantic), period resolution, validate_and_repair
 │   │   │   ├── executor.py        # run_analysis -> table, summary, caption; narrative number check
-│   │   │   └── charts.py          # build_figure: plotly line/bar/heatmap/pie/treemap with escaped labels
+│   │   │   ├── charts.py          # build_figure: plotly line/bar/heatmap/pie/treemap with escaped labels
+│   │   │   ├── tools.py           # Model tools (analyze_spending, list_values, get_month_snapshot), dispatch, compact results
+│   │   │   ├── prompts.py         # Chat system prompt, catalog block, tool descriptions, user-facing messages
+│   │   │   ├── session.py         # ChatSession: turns, rolling summary, last spec, history truncation
+│   │   │   └── engine.py          # run_turn: model/tool loop, limits, narrative number guard, UI events
 │   │   ├── budget.py              # Claude spend backstop: cost ledger, BudgetGuard (daily/run caps)
 │   │   ├── html_text.py           # Shared html_to_text (report plain text, history excerpts, Q&A)
 │   │   ├── memory.py              # MemoryStore: SQLite short-term history and long-term facts (open_memory)
@@ -61,13 +65,14 @@ This pipeline implements a multi-layer Lakehouse medallion architecture designed
 │   ├── compare_runs.py            # CLI: compare selected runs with the eval model
 │   ├── replay_validator.py        # CLI: replay one run's validator call with another model
 │   ├── email_weekly_report.py     # Orchestrates the weekly run: legacy or agent mode, archive, email
-│   ├── Finance Summary and QA.py  # Gradio UI for month reports and finance Q&A
+│   ├── Finance Summary and QA.py  # Gradio UI: Monthly report tab (report and Q&A) and Chat tab
 │   ├── model benchmark.py         # Quick Ollama model speed benchmark
 │   ├── upload_csv.py              # Uploads issuer-specific CSV files to GCS and archives them
 │   ├── run_all_issuers.py         # Runs the uploader for every issuer in config.json
 │   ├── generate_mock_cd.py        # Generates mock Chase and Amex CSVs with recurring merchants (--records, --seed)
 │   ├── chat_test_fixtures.py      # Hand-built transaction fixture shared by the finance chat tests
-│   ├── test_chat_*.py             # Finance chat: merchants, spec/periods, executor golden tables, charts, data/cache/catalog
+│   ├── test_chat_*.py             # Finance chat: merchants, spec/periods, executor golden tables, charts, data/cache/catalog,
+│   │                              #   tools, engine (scripted fake chat client), app import smoke test
 │   ├── test_agent_harness.py      # Harness protocol, parsing, sanitization, retries, and feedback tests
 │   ├── test_budget.py             # Claude pricing, cost ledger, budget guard, harness/app/CLI refusals, no unguarded calls
 │   ├── test_finance_services.py   # Shared reporting/tool wiring tests
@@ -201,7 +206,7 @@ The live project configuration is read from `config.json` (not `config.example.j
 * `report_mode`: set to `"agent"` to use the structured author/validator flow. `"legacy"` (the default when the key is omitted) keeps the original one-shot report generation flow. Other values are rejected (case is ignored).
 * `guidance`: `"strict"` (default) or `"guided"`; how tightly agent mode prescribes the report's wording and structure (see Guidance modes). `model_roles.author.guidance` overrides it for the author (it is not accepted on other roles). Other values are rejected (case is ignored).
 * `dry_run`: when `true`, the project runs the full BigQuery + prompt + validation + archive flow without sending email. This is recommended while tuning the model or validating report quality. Default `false`. Only agent mode honors it; legacy mode currently sends regardless.
-* `model_roles`: the primary way to configure the models. Each role (`author`, `validator`, `eval`) names its provider (`"ollama"` or `"anthropic"`; any role may use either) and model, plus its own options; see Model providers below. `eval` is optional and falls back to the validator.
+* `model_roles`: the primary way to configure the models. Each role (`author`, `validator`, `eval`, `chat`) names its provider (`"ollama"` or `"anthropic"`; any role may use either) and model, plus its own options; see Model providers below. `eval` is optional and falls back to the validator; `chat` (the app's finance chat) is optional and falls back to `model_name` (see Finance chat).
 * `model_server_url`: the shared Ollama server for every Ollama role (and embeddings), either the base URL (`http://your-host:11434`) or the full endpoint (`http://your-host:11434/api/generate`); the generate and embed endpoints are derived from it. A role may override it with its own `base_url`.
 * `model_name`: an Ollama model, still required: legacy mode, long-term fact extraction (unless `fact_model_name` is set), and the Finance Summary and QA app's Q&A use it, and it is the author model when `model_roles.author` is absent. Keep it set to an Ollama model even when the author role runs on Claude.
 * Legacy fallbacks, still read when `model_roles` (or one of its roles) is absent: `validator_model_name` (validator model; defaults to `model_name`) and `ollama_options` (per-role Ollama settings, `{"author": {...}, "validator": {...}}`, with the same fields as a role's `options` plus `think`). A role present in `model_roles` ignores both.
@@ -222,6 +227,9 @@ The live project configuration is read from `config.json` (not `config.example.j
 * `category_goals`: optional `{"Category": amount}` monthly goals. A configured goal replaces the suggested cap for that category and is labeled as configured.
 * `chat_data_cache_seconds`: how long the finance chat keeps the loaded transactions in memory before querying BigQuery again (default `900`; `0` disables the cache).
 * `merchant_aliases`: optional `{"CLEANED NAME": "Display name"}` map applied by the finance chat after merchant normalization (keys match the cleaned upper-case name exactly or as a word prefix, for example `"WHOLEFDS MKT": "Whole Foods"`).
+* `chat_history_turns`: how many recent chat turns are sent to the chat model verbatim; older turns are folded into a rolling summary (default `6`).
+* `chat_max_tool_rounds`: tool-call rounds the chat model may use for one question before it must answer (default `3`).
+* `chat_turn_seconds`: time limit for answering one chat question, in seconds (default `120`).
 * `project_name`, `email_sender`, `email_listings`, `Gmail_app_credentials`: GCP project and email delivery settings (see Setup Instructions).
 
 Optional keys not in `config.example.json`: `fact_model_name` (model for extracting long-term facts after a sent report; defaults to `model_name`), and `qa_report_context_chunks` / `qa_long_fact_limit` (context sizes for the Finance Summary and QA app; default 5 each, capped at 8 and 10). If `model_server_url` or `model_name` is missing, the Finance Summary and QA app falls back to `http://localhost:11434/api/generate` and `gemma4:e4b`.
@@ -252,6 +260,9 @@ These are the values used when a key is omitted. They are defined only in `DEFAU
 | `qa_long_fact_limit` | `5` |
 | `chat_data_cache_seconds` | `900` |
 | `merchant_aliases` | `{}` |
+| `chat_history_turns` | `6` |
+| `chat_max_tool_rounds` | `3` |
+| `chat_turn_seconds` | `120` |
 | `anthropic_daily_budget_usd` | `15.0` |
 | `anthropic_run_budget_usd` | `5.0` |
 | `anthropic_cost_ledger_path` | `"agent/runs/cost_ledger.jsonl"` |
@@ -272,7 +283,7 @@ Every model call goes through one client layer, `Scripts/finance/model_clients.p
 
 For a fully local setup, use an Ollama eval model instead, for example `"eval": {"provider": "ollama", "model": "gemma4:12b", "think": false}`, or leave `eval` out to reuse the validator. Any role can switch provider by changing its entry.
 
-* **Roles.** `author` writes the report and `validator` reviews it. `eval` writes the run comparisons from `Scripts\compare_runs.py` (see Comparing runs); it is optional and when unset it falls back to the validator's settings. `model_roles` is authoritative: a role present there ignores the legacy keys. A role missing from `model_roles` (or the whole key missing) falls back to the legacy keys: `model_name` / `validator_model_name`, `ollama_options[role]`, and `model_server_url`, so older configs keep working unchanged. Roles are resolved once when the config is loaded (`ReportSettings`), so an unknown provider is reported at startup.
+* **Roles.** `author` writes the report and `validator` reviews it. `eval` writes the run comparisons from `Scripts\compare_runs.py` (see Comparing runs); it is optional and when unset it falls back to the validator's settings. `chat` answers questions in the app's Chat tab (see Finance chat); when unset it uses `model_name` with `ollama_options["chat"]`. `model_roles` is authoritative: a role present there ignores the legacy keys. A role missing from `model_roles` (or the whole key missing) falls back to the legacy keys: `model_name` / `validator_model_name`, `ollama_options[role]`, and `model_server_url`, so older configs keep working unchanged. Roles are resolved once when the config is loaded (`ReportSettings`), so an unknown provider is reported at startup.
 * **Ollama role fields.** `model`, optional `options` and `think` (when neither is given, `ollama_options[role]` applies), optional `base_url` (default `model_server_url`) and `timeout` (default `ollama_timeout`). Requests are identical to before: one prompt, `format` for the validator's JSON schema, `options` and `think` only when set.
 * **Claude role fields.** `model`, optional `max_tokens` (default `16000`, at most `64000`; thinking tokens count toward it), `effort` (`low`/`medium`/`high`/`xhigh`/`max`; omit it for `claude-haiku-4-5`, which does not support effort), `cache_system` (default `true`), `stream` (default automatic: stream when `max_tokens` is above `16000`; `true`/`false` force it), and `thinking` (only `"adaptive"`, sent as `{"type": "adaptive"}`, for models where thinking is off by default). Claude Opus 5.5 and Sonnet 5.5 think adaptively by default and `effort` controls how deeply; thinking cannot be disabled, so `thinking: {"type": "disabled"}`, `budget_tokens`, and sampling parameters (temperature etc.) are never sent, and the thinking display stays at the API default. `ollama_options`, `options`, and `think` do not apply. The validator uses structured output (`output_config.format` with the same JSON schema). A refusal is recorded with `done_reason: "refusal"` and its `stop_details`; a `max_tokens` stop is treated like Ollama's `length`. The SDK is created with `max_retries=1`, and its timeout, connection, 429, and 5xx errors count as model-call failures for the harness's single retry. A 4xx error such as a bad request (for example an invalid model ID) is not retried: it is raised, the run aborts and is archived with a `_failed` suffix, and nothing is sent.
 * **Switching a role to Claude.** Install the SDK into the workspace venv (`..\.venv\Scripts\python.exe -m pip install anthropic`; Ollama-only setups do not need it), set the role to `{"provider": "anthropic", "model": "claude-sonnet-5-5"}`, and provide credentials through the environment: the `ANTHROPIC_API_KEY` environment variable or an `ant auth login` profile. Never put an API key in `config.json`.
@@ -324,17 +335,49 @@ The `email_weekly_report.py` script generates an intelligent weekly financial in
 * Saves each completed report and extracts reusable financial facts for future reports
 * Outputs an attractive HTML report styled for email readability
 
-### Finance chat (in progress)
+### Finance chat
 
-`Scripts/finance/chat/` is the deterministic layer of a planned finance chat. The model will only fill in a declarative `AnalysisSpec` (metric, up to two dimensions, period, filters, top N, transform, comparison, chart); Python resolves the dates, repairs or rejects the spec against the data catalog, runs it with pandas, and draws the chart. The model never writes code and never sees transaction rows, only the catalog, the compact result summary (at most about 1.5 KB), and the caption.
+The **Chat** tab of the Finance Summary and QA app answers free-form questions about your card spending with a chart, a table, and a short Mogumogu-style explanation. The model only routes and narrates: it picks a tool and fills in a declarative `AnalysisSpec` (metric, up to two dimensions, period, filters, top N, transform, comparison, chart); Python resolves the dates, repairs or rejects the spec against the data catalog, runs it with pandas, and draws the chart. The model never writes code and never sees transaction rows, only the catalog, the compact tool results (at most about 1.5 KB each), and the captions.
+
+Run the app from the project root (it serves on `http://127.0.0.1:7860` only; there is no public share link):
+
+```powershell
+& "..\.venv\Scripts\python.exe" "Scripts\Finance Summary and QA.py"
+```
+
+The **Monthly report** tab is the original month report and Q&A. In the **Chat** tab, type a question or click an example:
+
+* "Monthly spend by category this year"
+* "Heatmap of activity by store"
+* "Top 5 grocery merchants last quarter"
+* "Compare Amex vs Chase by month"
+* Follow-ups such as "now only Amex" or "same thing by week" start from the previous analysis.
+* "How was September?" uses the monthly-report snapshot (total, change from the prior month, disposable cash, savings shortfall, top discretionary categories).
+
+Each answer shows a collapsible **How I computed this** message (the plain-language caption, any repairs such as "Interpreted category 'Shoping' as 'Shopping'", and the spec), the narrative, the plotly chart, and the aggregated table (at most 25 rows). **Focus month** sets the month used by the `focus_month` period and the snapshot tool (default: the latest month with data). **Refresh data** drops the cached transactions and queries BigQuery again (otherwise the frame is reused for `chat_data_cache_seconds`).
+
+How a turn works (`Scripts/finance/chat/engine.py`, `run_turn`):
+
+* **Tools** (`tools.py`): `analyze_spending` (parameters: the `AnalysisSpec` JSON schema, flattened), `list_values` (`field`: `category`, `parent_group`, `issuer`, or `merchant`, plus an optional `search`), and `get_month_snapshot` (`month` `YYYY-MM`; runs `report_metrics.calculate_report_snapshot` on that month and the one before it, built from the cached frame, without the report harness). Every spec goes through `validate_and_repair`; an invalid one goes back to the model as an error tool result listing the closest valid values, and the model retries.
+* **Limits**: at most `chat_max_tool_rounds` tool rounds per question and `chat_turn_seconds` per question (each model call's timeout is capped at the time left). A model that keeps calling tools, a deadline, an unreachable model, or a Claude budget refusal ends the turn with a plain message (plus the last computed result, if any), never a traceback.
+* **Narrative number guard**: every dollar amount and percentage in the answer must match a value in the tool results (`executor.check_narrative_numbers`). On a mismatch the model is asked once to rewrite with the exact figures; if it still does not match, the answer says the figures in the table are authoritative.
+* **History**: the last `chat_history_turns` turns are sent as plain text; older turns become a deterministic rolling summary, and the previous spec is included so follow-ups work. Undo, retry, or clearing the chat truncates the session to the turns still shown. The DataFrame is never stored in Gradio state; it lives in the `finance.chat.data` module cache.
+* **Ollama thinking**: if a reply hits the token limit with no text while `think` is on, the call is retried once with `think: false`.
+
+The `chat` model role (`model_roles.chat`; when absent it falls back to `model_name` with `ollama_options["chat"]`) can be local or Claude:
+
+* **Local (recommended)**: `{"provider": "ollama", "model": "gemma4:12b", "think": false, "options": {"temperature": 0.15, "num_predict": 1500, "num_ctx": 16384}}` (as in `config.example.json`). It uses Ollama's `/api/chat` with tools.
+* **Claude**: for example `{"provider": "anthropic", "model": "claude-sonnet-5-5", "effort": "low", "max_tokens": 4000}`. Tools go through the Messages API (`tool_choice` auto; the system prompt and tool definitions are prompt-cached). Every call goes through the budget guard with run id `chat` (the run cap applies to one chat session) and is recorded in the cost ledger; a refused call shows the budget message in the chat.
+* **Privacy**: with a Claude chat role, your question, the catalog (category, group, card, and merchant names, the date range, and transaction counts), the conversation, and the aggregated tool results (totals, top groups and merchants, monthly figures) are sent to the Claude API. Transaction rows, descriptions, and dates of individual purchases never leave the machine. Keep the chat role on Ollama if even names and totals must stay local.
+
+Data layer details:
 
 * `data.load_transactions(settings, start=None, client=None)` runs one parameterized query on `gold.fact_transactions` (default: the last 24 months) and caches the frame for `chat_data_cache_seconds`; `data.refresh()` clears it. `build_catalog(frame)` lists the date range, issuers, categories with their groups, the top 30 merchants, and the metric definitions.
 * Metrics mirror `gold.fact_monthly_spending` exactly (Sale, Return, and Adjustment rows only, so card payments are excluded): `net_spend` (net_real_expense), `gross_spend`, `refunds`, `transaction_count`, `avg_transaction`, and `share_of_total`.
 * Merchants are normalized from card descriptors (store numbers, phone numbers, states, `SQ *`/`TST*` prefixes, Amazon variants; payments become `Card Payment` and statement credits `Card Credit`) with optional `merchant_aliases`, and URL/markup characters are stripped.
-* `executor.check_narrative_numbers(text, summary)` flags dollar amounts and percentages in model text that match no summary value within rounding, for a later guard.
 * Charts use plotly (`..\.venv\Scripts\python.exe -m pip install plotly`); every label is HTML-escaped.
 
-Not built yet: the chat engine and model tool calls, and the UI. There is no entry point to run yet; the tests (`test_chat_*.py`) cover the layer with fixtures and a fake BigQuery client.
+The tests (`test_chat_*.py`) use a fixture frame, a fake BigQuery client, and a scripted fake chat client; they never call BigQuery or a model.
 
 ### Report Memory
 

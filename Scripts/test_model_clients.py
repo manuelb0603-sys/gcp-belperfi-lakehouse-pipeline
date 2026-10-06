@@ -731,5 +731,215 @@ class TestHtmlToTextParity(unittest.TestCase):
             self.assertEqual(qa._html_to_text(sample), _legacy_qa(sample), sample)
 
 
+# ----- chat(): provider-neutral tool calling -----
+
+CHAT_TOOLS = [{"name": "list_values", "description": "List names.",
+               "parameters": {"type": "object", "properties": {"field": {"type": "string"}}, "required": ["field"]}},
+              {"name": "get_month_snapshot", "description": "Snapshot.",
+               "parameters": {"type": "object", "properties": {"month": {"type": "string"}}}}]
+
+
+class TestOllamaChat(unittest.TestCase):
+    def test_api_chat_payload_and_tool_call_parsing(self):
+        from finance.model_clients import tool_message
+
+        fake = FakeRequests({
+            "message": {"role": "assistant", "content": "", "thinking": "hmm",
+                        "tool_calls": [{"function": {"name": "list_values", "arguments": {"field": "merchant"}}},
+                                       {"function": {"name": "get_month_snapshot", "arguments": '{"month": "2026-09"}'}}]},
+            "done_reason": "stop", "prompt_eval_count": 900, "eval_count": 40,
+        })
+        client = OllamaClient("http://host:11434/api/generate", "gemma4:12b", options={"num_ctx": 16384}, think=True)
+        history = [
+            {"role": "user", "content": "Top merchants?"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "name": "list_values", "arguments": {"field": "category"}}]},
+            tool_message("call_1", "list_values", {"ok": True, "values": ["Groceries"]}),
+        ]
+        with _with_requests(fake):
+            reply = client.chat(history, system="SYSTEM", tools=CHAT_TOOLS, timeout=30, think=False)
+        post = fake.posts[0]
+        self.assertEqual(post["url"], "http://host:11434/api/chat")
+        self.assertEqual(post["timeout"], 30)
+        payload = post["json"]
+        self.assertEqual((payload["model"], payload["stream"], payload["think"], payload["options"]),
+                         ("gemma4:12b", False, False, {"num_ctx": 16384}))
+        self.assertNotIn("format", payload)
+        self.assertEqual(payload["messages"], [
+            {"role": "system", "content": "SYSTEM"},
+            {"role": "user", "content": "Top merchants?"},
+            {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "list_values", "arguments": {"field": "category"}}}]},
+            {"role": "tool", "tool_name": "list_values", "content": '{"ok": true, "values": ["Groceries"]}'},
+        ])
+        self.assertEqual(payload["tools"][0], {"type": "function", "function": {
+            "name": "list_values", "description": "List names.", "parameters": CHAT_TOOLS[0]["parameters"]}})
+        self.assertEqual(reply.tool_calls, [
+            {"id": "call_1", "name": "list_values", "arguments": {"field": "merchant"}},
+            {"id": "call_2", "name": "get_month_snapshot", "arguments": {"month": "2026-09"}},
+        ])
+        self.assertEqual((reply.done_reason, reply.provider, reply.metadata["thinking_chars"]), ("tool_use", "ollama", 3))
+        self.assertEqual(reply.assistant_message()["tool_calls"], reply.tool_calls)
+
+    def test_role_think_flag_format_and_length_reply(self):
+        fake = FakeRequests({"message": {"role": "assistant", "content": "", "thinking": "x" * 50}, "done_reason": "length"})
+        client = OllamaClient("http://host:11434", "gemma4:12b", think=True)
+        with _with_requests(fake):
+            reply = client.chat([{"role": "user", "content": "hi"}], json_schema={"type": "object"})
+        payload = fake.posts[0]["json"]
+        self.assertIs(payload["think"], True)
+        self.assertEqual(payload["format"], {"type": "object"})
+        self.assertNotIn("tools", payload)
+        self.assertEqual((reply.text, reply.tool_calls, reply.done_reason), ("", [], "length"))
+
+
+def _tool_use_message():
+    return SimpleNamespace(
+        id="msg_chat",
+        content=[
+            SimpleNamespace(type="thinking", thinking="", signature="sig-1"),
+            SimpleNamespace(type="text", text="Let me check."),
+            SimpleNamespace(type="tool_use", id="toolu_01", name="get_month_snapshot", input={"month": "2026-09"}),
+        ],
+        stop_reason="tool_use", stop_details=None,
+        usage=SimpleNamespace(input_tokens=2000, output_tokens=80, cache_read_input_tokens=0, cache_creation_input_tokens=1500),
+    )
+
+
+class TestAnthropicChat(unittest.TestCase):
+    def test_tool_use_and_tool_result_round_trip(self):
+        from finance.model_clients import tool_message
+
+        sdk = FakeAnthropic(_tool_use_message(), _message("September was $470.00."))
+        client = AnthropicClient("claude-sonnet-5-5", max_tokens=4000, effort="low", client=sdk, role="chat")
+        messages = [{"role": "user", "content": "How was September?"}]
+        first = client.chat(messages, system="SYSTEM", tools=CHAT_TOOLS)
+        self.assertEqual(first.tool_calls, [{"id": "toolu_01", "name": "get_month_snapshot", "arguments": {"month": "2026-09"}}])
+        self.assertEqual((first.text, first.done_reason), ("Let me check.", "tool_use"))
+        request = sdk.calls[0]
+        self.assertEqual(request["system"], [{"type": "text", "text": "SYSTEM", "cache_control": {"type": "ephemeral"}}])
+        self.assertEqual(request["tool_choice"], {"type": "auto"})
+        self.assertEqual([tool["name"] for tool in request["tools"]], ["list_values", "get_month_snapshot"])
+        self.assertEqual(request["tools"][0]["input_schema"], CHAT_TOOLS[0]["parameters"])
+        self.assertNotIn("cache_control", request["tools"][0])
+        self.assertEqual(request["tools"][-1]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(request["output_config"], {"effort": "low"})
+        self.assertEqual(request["messages"], [{"role": "user", "content": "How was September?"}])
+        self.assertNotIn("temperature", request)
+
+        messages += [first.assistant_message(), tool_message("toolu_01", "get_month_snapshot", {"ok": True, "total": 470.0}),
+                     {"role": "user", "content": "Answer now."}]
+        second = client.chat(messages, system="SYSTEM", tools=CHAT_TOOLS)
+        self.assertEqual(second.text, "September was $470.00.")
+        replayed = sdk.calls[1]["messages"]
+        self.assertEqual(replayed[1], {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "", "signature": "sig-1"},  # sent back unchanged
+            {"type": "text", "text": "Let me check."},
+            {"type": "tool_use", "id": "toolu_01", "name": "get_month_snapshot", "input": {"month": "2026-09"}},
+        ]})
+        self.assertEqual(replayed[2], {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_01", "content": '{"ok": true, "total": 470.0}'},
+            {"type": "text", "text": "Answer now."},
+        ]})
+        self.assertEqual(len(replayed), 3)
+
+    def test_blocks_from_another_model_are_rebuilt_without_thinking_and_errors_are_flagged(self):
+        from finance.model_clients import tool_message
+
+        sdk = FakeAnthropic(_message("ok"))
+        client = AnthropicClient("claude-opus-5-5", client=sdk)
+        other = {"role": "assistant", "content": "", "tool_calls": [{"id": "t1", "name": "list_values", "arguments": {}}],
+                 "provider_content": {"provider": "anthropic", "model": "claude-sonnet-5-5",
+                                      "blocks": [{"type": "thinking", "thinking": "", "signature": "s"}]}}
+        client.chat([{"role": "user", "content": "q"}, other, tool_message("t1", "list_values", "bad", is_error=True)])
+        sent = sdk.calls[0]["messages"]
+        self.assertEqual(sent[1]["content"], [{"type": "tool_use", "id": "t1", "name": "list_values", "input": {}}])
+        self.assertEqual(sent[2]["content"], [{"type": "tool_result", "tool_use_id": "t1", "content": "bad", "is_error": True}])
+
+    def test_refusal_and_max_tokens(self):
+        refusal = _message("", stop_reason="refusal", stop_details={"type": "refusal", "category": "cyber"})
+        client = AnthropicClient("claude-sonnet-5-5", client=FakeAnthropic(refusal))
+        reply = client.chat([{"role": "user", "content": "q"}], tools=CHAT_TOOLS)
+        self.assertEqual((reply.text, reply.tool_calls, reply.done_reason), ("", [], "refusal"))
+        self.assertEqual(reply.metadata["stop_details"]["category"], "cyber")
+        self.assertNotIn("provider_content", reply.assistant_message())
+        truncated = _tool_use_message()
+        truncated.stop_reason = "max_tokens"
+        reply = AnthropicClient("claude-sonnet-5-5", client=FakeAnthropic(truncated)).chat([{"role": "user", "content": "q"}], tools=CHAT_TOOLS)
+        self.assertEqual((reply.done_reason, reply.tool_calls, reply.metadata["dropped_tool_calls"]), ("length", [], 1))
+
+    def test_streamed_chat_uses_the_same_reply(self):
+        sdk = FakeAnthropic(_tool_use_message())
+        client = AnthropicClient("claude-opus-5-5", max_tokens=32000, client=sdk)
+        reply = client.chat([{"role": "user", "content": "q"}], tools=CHAT_TOOLS)
+        self.assertEqual(len(sdk.stream_calls), 1)
+        self.assertEqual(sdk.calls, [])
+        self.assertTrue(reply.metadata["streamed"])
+        self.assertEqual(reply.tool_calls[0]["id"], "toolu_01")
+
+
+class TestChatRole(unittest.TestCase):
+    def test_chat_role_falls_back_to_model_name_and_chat_options(self):
+        config = {**TestModelRoles.LEGACY, "ollama_options": {"chat": {"think": False, "num_ctx": 16384}}}
+        spec = resolve_model_role(config, "chat")
+        self.assertEqual((spec["role"], spec["provider"], spec["model"], spec["think"], spec["options"], spec["timeout"]),
+                         ("chat", "ollama", "gemma4:e4b", False, {"num_ctx": 16384}, 900))
+        self.assertEqual(spec["base_url"], TestModelRoles.LEGACY["model_server_url"])
+        self.assertEqual(resolve_model_role(TestModelRoles.LEGACY, "chat")["options"], None)
+        claude = {**config, "model_roles": {"chat": {"provider": "anthropic", "model": "claude-sonnet-5-5", "effort": "low", "max_tokens": 4000}}}
+        client = build_model_client(claude, "chat", anthropic_client=FakeAnthropic(_message()), run_id="chat")
+        self.assertIsInstance(client, AnthropicClient)
+        self.assertEqual((client.role, client.max_tokens, client.budget_guard.run_id), ("chat", 4000, "chat"))
+
+    def test_settings_and_example_config_resolve_the_chat_role(self):
+        from finance.settings import ReportSettings
+
+        settings = ReportSettings.from_config({**TestModelRoles.LEGACY})
+        self.assertEqual(settings.role("chat")["model"], "gemma4:e4b")
+        self.assertEqual(resolve_model_role(settings, "chat"), settings.role("chat"))
+        example = json.loads((Path(__file__).resolve().parent.parent / "config.example.json").read_text(encoding="utf-8"))
+        chat = ReportSettings.from_config(example).role("chat")
+        self.assertEqual((chat["provider"], chat["model"], chat["think"]), ("ollama", "gemma4:12b", False))
+        self.assertEqual(chat["options"], {"temperature": 0.15, "num_predict": 1500, "num_ctx": 16384})
+
+
+class TestChatBudget(unittest.TestCase):
+    def setUp(self):
+        from finance import budget
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.ledger = Path(self.temp.name) / "cost_ledger.jsonl"
+        budget._FAILED_LEDGERS.clear()
+        self.config = {"model_roles": {"chat": {"provider": "anthropic", "model": "claude-haiku-4-5", "max_tokens": 2000}},
+                       "anthropic_cost_ledger_path": str(self.ledger)}
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def lines(self):
+        return [json.loads(line) for line in self.ledger.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    def test_chat_call_is_recorded_in_the_ledger_as_chat(self):
+        sdk = FakeAnthropic(_tool_use_message())
+        client = build_model_client(self.config, "chat", anthropic_client=sdk, run_id="chat")
+        reply = client.chat([{"role": "user", "content": "q"}], system="S", tools=CHAT_TOOLS)
+        [record] = self.lines()
+        self.assertEqual((record["run_id"], record["role"], record["model"], record["outcome"]), ("chat", "chat", "claude-haiku-4-5", "tool_use"))
+        self.assertEqual(record["cost_usd"], reply.metadata["cost_usd"])
+        self.assertGreater(record["cost_usd"], 0)
+
+    def test_over_budget_chat_call_is_refused_without_calling_the_sdk(self):
+        from finance.budget import BudgetExceededError
+
+        today = date.today().isoformat()
+        self.ledger.write_text(json.dumps({"date": today, "run_id": "x", "cost_usd": 14.999}) + "\n", encoding="utf-8")
+        sdk = FakeAnthropic(_message())
+        client = build_model_client(self.config, "chat", anthropic_client=sdk, run_id="chat")
+        with self.assertRaises(BudgetExceededError) as caught:
+            client.chat([{"role": "user", "content": "q"}], tools=CHAT_TOOLS)
+        self.assertIn("Claude daily budget reached", str(caught.exception))
+        self.assertIn("chat call to claude-haiku-4-5", str(caught.exception))
+        self.assertEqual(sdk.calls, [])
+        self.assertEqual(len(self.lines()), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -43,6 +43,10 @@ DEFAULTS: dict[str, Any] = {
     "qa_long_fact_limit": 5,
     "chat_data_cache_seconds": 900,
     "merchant_aliases": {},
+    # Finance chat engine: recent turns sent verbatim, tool rounds per turn, seconds per turn.
+    "chat_history_turns": 6,
+    "chat_max_tool_rounds": 3,
+    "chat_turn_seconds": 120,
     # Claude spend backstop (finance/budget.py): 0 or null disables a cap.
     "anthropic_daily_budget_usd": 15.0,
     "anthropic_run_budget_usd": 5.0,
@@ -213,6 +217,7 @@ class ReportSettings:
     author_role: dict[str, Any]
     validator_role: dict[str, Any]
     eval_role: dict[str, Any]
+    chat_role: dict[str, Any]
     # Harness limits
     max_agent_rounds: int
     max_tool_calls: int
@@ -241,6 +246,9 @@ class ReportSettings:
     # Finance chat (Scripts/finance/chat/)
     chat_data_cache_seconds: int
     merchant_aliases: dict[str, str]
+    chat_history_turns: int
+    chat_max_tool_rounds: int
+    chat_turn_seconds: int
     # Claude spend backstop (None = cap disabled); see finance/budget.py
     anthropic_daily_budget_usd: float | None
     anthropic_run_budget_usd: float | None
@@ -312,7 +320,7 @@ class ReportSettings:
             if role_name != "author" and isinstance(entry, dict) and "guidance" in entry:
                 raise SettingsError(f"model_roles.{role_name}.guidance is not supported; set model_roles.author.guidance or top-level guidance")
         try:
-            roles = {role: resolve_model_role(config, role) for role in ("author", "validator", "eval")}
+            roles = {role: resolve_model_role(config, role) for role in ("author", "validator", "eval", "chat")}
         except (TypeError, ValueError) as exc:
             raise SettingsError(f"model_roles: {exc}") from exc
         if "guidance" in roles["author"]:
@@ -336,6 +344,7 @@ class ReportSettings:
             author_role=roles["author"],
             validator_role=roles["validator"],
             eval_role=roles["eval"],
+            chat_role=roles["chat"],
             max_run_seconds=run_seconds,
             memory_schema=_validate_schema(_get(config, "memory_schema")),
             monthly_budget=_optional_money(config.get("Monthly_budget")),
@@ -353,6 +362,9 @@ class ReportSettings:
             qa_long_fact_limit=_int("qa_long_fact_limit", _get(config, "qa_long_fact_limit"), minimum=1),
             chat_data_cache_seconds=_int("chat_data_cache_seconds", _get(config, "chat_data_cache_seconds"), minimum=0),
             merchant_aliases=merchant_aliases,
+            chat_history_turns=_int("chat_history_turns", _get(config, "chat_history_turns"), minimum=1),
+            chat_max_tool_rounds=_int("chat_max_tool_rounds", _get(config, "chat_max_tool_rounds"), minimum=1),
+            chat_turn_seconds=_int("chat_turn_seconds", _get(config, "chat_turn_seconds"), minimum=1),
             **dict(zip(
                 ("anthropic_daily_budget_usd", "anthropic_run_budget_usd", "anthropic_cost_ledger_path"),
                 budget_settings(config),
@@ -384,8 +396,10 @@ class ReportSettings:
         return memory_db_path(self.memory_schema)
 
     def role(self, role: str) -> dict[str, Any]:
-        """Resolved settings for "author", "validator", or "eval" (a copy)."""
-        resolved = {"author": self.author_role, "validator": self.validator_role, "eval": self.eval_role}.get(role)
+        """Resolved settings for "author", "validator", "eval", or "chat" (a copy)."""
+        resolved = {
+            "author": self.author_role, "validator": self.validator_role, "eval": self.eval_role, "chat": self.chat_role,
+        }.get(role)
         if resolved is None:
             raise ValueError(f"Unknown model role {role!r}")
         return copy.deepcopy(resolved)

@@ -1,6 +1,8 @@
 """One model-client layer for every text-generation call: Ollama (local) and Anthropic (Claude).
 
 Every client exposes ``generate(prompt, *, system=None, json_schema=None, timeout=None) -> ModelReply``.
+Chat-capable clients also expose ``chat(messages, *, system=None, tools=None, json_schema=None,
+timeout=None) -> ChatReply`` (provider-neutral messages and tool calls; used by the finance chat).
 ``ModelReply`` is a str (so parsers keep working) carrying normalized generation metadata:
 ``done_reason`` is "stop", "length" (token limit), "refusal" (Claude declined), or None.
 
@@ -14,9 +16,11 @@ come from the environment (ANTHROPIC_API_KEY or an ``ant auth login`` profile), 
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
+from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urlsplit, urlunsplit
 
@@ -27,7 +31,7 @@ from .settings import DEFAULTS, GUIDANCE_MODES
 
 logger = logging.getLogger(__name__)
 
-MODEL_ROLES = ("author", "validator", "eval")
+MODEL_ROLES = ("author", "validator", "eval", "chat")
 DEFAULT_TIMEOUT = DEFAULTS["ollama_timeout"]
 DEFAULT_ANTHROPIC_MAX_TOKENS = 16000
 # Upper bound accepted for model_roles.<role>.max_tokens (thinking tokens count toward it).
@@ -100,6 +104,75 @@ class ModelClient(Protocol):
     ) -> ModelReply:
         """Generate one reply. system is the stable instruction text; prompt the per-call content."""
         ...
+
+
+# ----- chat (tool calling) -----
+
+
+@dataclass
+class ChatReply:
+    """One chat-model turn, normalized across providers.
+
+    tool_calls is ``[{"id", "name", "arguments": dict}]``; done_reason is "stop", "tool_use",
+    "length" (token limit), "refusal" (Claude declined), or None. provider_content keeps the
+    provider's own assistant blocks (Claude thinking and tool_use blocks) so the turn can be sent
+    back unchanged within the same conversation.
+    """
+
+    text: str
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    done_reason: str | None = None
+    usage: dict[str, Any] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    provider: str | None = None
+    model: str | None = None
+    provider_content: list[dict[str, Any]] | None = None
+
+    def assistant_message(self) -> dict[str, Any]:
+        """The provider-neutral assistant message to append to the conversation."""
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": self.text,
+            "tool_calls": [dict(call) for call in self.tool_calls],
+        }
+        if self.provider_content is not None:
+            message["provider_content"] = {"provider": self.provider, "model": self.model, "blocks": self.provider_content}
+        return message
+
+
+def tool_message(call_id: str | None, name: str, content: Any, *, is_error: bool = False) -> dict[str, Any]:
+    """A provider-neutral tool-result message (content is sent as JSON text)."""
+    text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False, default=str)
+    message: dict[str, Any] = {"role": "tool", "tool_call_id": call_id, "name": name, "content": text}
+    if is_error:
+        message["is_error"] = True
+    return message
+
+
+def _content_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _tool_arguments(value: Any) -> dict[str, Any]:
+    """Tool-call arguments as a dict; JSON text is parsed, anything else becomes an invalid marker."""
+    if isinstance(value, dict):
+        return dict(value)
+    if value is None or value == "":
+        return {}
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+        return {"__invalid_arguments__": value[:200]}
+    plain = _plain(value)
+    if isinstance(plain, dict):
+        return dict(plain)
+    return {"__invalid_arguments__": str(value)[:200]}
 
 
 # ----- Ollama -----
@@ -197,6 +270,78 @@ class OllamaClient:
             metadata=metadata,
         )
 
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        system: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        json_schema: dict[str, Any] | str | None = None,
+        timeout: float | None = None,
+        think: bool | None = None,
+    ) -> ChatReply:
+        """Call /api/chat with provider-neutral messages and tools (``{name, description, parameters}``).
+
+        Tool results go back as ``{"role": "tool", "tool_name": ..., "content": json}``. ``think``
+        overrides the role's think flag for this call (the chat engine retries once with think off
+        when thinking spent the whole token budget). An empty answer is returned, not raised.
+        """
+        import requests
+
+        payload: dict[str, Any] = {"model": self.model, "messages": _ollama_messages(messages, system), "stream": False}
+        if tools:
+            payload["tools"] = [
+                {"type": "function", "function": {
+                    "name": tool["name"], "description": tool.get("description", ""), "parameters": tool["parameters"],
+                }}
+                for tool in tools
+            ]
+        if json_schema is not None:
+            payload["format"] = json_schema
+        if self.options:
+            payload["options"] = self.options
+        effective_think = self.think if think is None else think
+        if effective_think is not None:
+            payload["think"] = effective_think
+        response = requests.post(
+            api_url(self.base_url, "chat"),
+            json=payload,
+            timeout=self.default_timeout if timeout is None else timeout,
+        )
+        response.raise_for_status()
+        body = response.json()
+        message = body.get("message") if isinstance(body.get("message"), dict) else {}
+        text = message.get("content") if isinstance(message.get("content"), str) else ""
+        calls = []
+        for index, call in enumerate(message.get("tool_calls") or []):
+            function = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(function, dict) or not function.get("name"):
+                continue
+            calls.append({
+                "id": str(call.get("id") or f"call_{index + 1}"),
+                "name": str(function["name"]),
+                "arguments": _tool_arguments(function.get("arguments")),
+            })
+        done_reason = body.get("done_reason")
+        if calls and done_reason in (None, "stop"):
+            done_reason = "tool_use"
+        metadata: dict[str, Any] = {
+            key: body[key]
+            for key in ("total_duration", "load_duration", "prompt_eval_duration", "eval_duration")
+            if key in body
+        }
+        metadata["think"] = effective_think
+        metadata["thinking_chars"] = len(message.get("thinking") or "")
+        return ChatReply(
+            text,
+            calls,
+            done_reason=done_reason,
+            usage={"prompt_eval_count": body.get("prompt_eval_count"), "eval_count": body.get("eval_count")},
+            metadata=metadata,
+            provider=self.provider,
+            model=self.model,
+        )
+
     def embed(self, text: str, timeout: float | None = None) -> list[float]:
         """Request and validate a single vector from /api/embed."""
         import requests
@@ -243,6 +388,26 @@ class OllamaClient:
         if any(not vector or not all(math.isfinite(value) for value in vector) for vector in vectors):
             raise ValueError("Ollama embedding response contained an invalid vector")
         return vectors
+
+
+def _ollama_messages(messages: list[dict[str, Any]], system: str | None) -> list[dict[str, Any]]:
+    """Provider-neutral messages -> Ollama /api/chat messages (system first)."""
+    out: list[dict[str, Any]] = [{"role": "system", "content": system}] if system else []
+    for message in messages:
+        role = message.get("role") or "user"
+        if role == "tool":
+            out.append({"role": "tool", "tool_name": message.get("name"), "content": _content_text(message.get("content"))})
+        elif role == "assistant":
+            item: dict[str, Any] = {"role": "assistant", "content": _content_text(message.get("content"))}
+            if message.get("tool_calls"):
+                item["tool_calls"] = [
+                    {"function": {"name": call["name"], "arguments": call.get("arguments") or {}}}
+                    for call in message["tool_calls"]
+                ]
+            out.append(item)
+        else:
+            out.append({"role": role, "content": _content_text(message.get("content"))})
+    return out
 
 
 # ----- Anthropic (Claude) -----
@@ -495,6 +660,202 @@ class AnthropicClient:
             metadata=metadata,
         )
 
+    def chat_request_kwargs(
+        self,
+        messages: list[dict[str, Any]],
+        system: str | None,
+        tools: list[dict[str, Any]] | None,
+        json_schema: Any,
+    ) -> dict[str, Any]:
+        """The messages.create arguments for one chat call (exposed for tests and debugging).
+
+        The system block is cached and the last tool carries cache_control (with cache_system), so
+        repeated rounds read the instructions and tool definitions from the prompt cache.
+        """
+        kwargs = self.request_kwargs("", system, json_schema)
+        kwargs["messages"] = _anthropic_messages(messages, self.model)
+        if tools:
+            definitions = [
+                {"name": tool["name"], "description": tool.get("description", ""), "input_schema": tool["parameters"]}
+                for tool in tools
+            ]
+            if self.cache_system:
+                definitions[-1]["cache_control"] = {"type": "ephemeral"}
+            kwargs["tools"] = definitions
+            kwargs["tool_choice"] = {"type": "auto"}
+        return kwargs
+
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        system: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        json_schema: dict[str, Any] | str | None = None,
+        timeout: float | None = None,
+        think: bool | None = None,
+    ) -> ChatReply:
+        """One Messages API call with tools (tool_choice auto), through the BudgetGuard like generate().
+
+        tool_use blocks become tool_calls with their ids; send results back as tool messages (they
+        become one user message of tool_result blocks). The assistant's own blocks (including
+        thinking) are kept in provider_content and replayed unchanged. A refusal returns empty text
+        with stop_details; a max_tokens stop returns done_reason "length" and drops any tool calls.
+        ``think`` is accepted for interface parity and ignored (Claude thinking cannot be disabled).
+        """
+        return _anthropic_chat(self, messages, system, tools, json_schema, timeout)
+
+
+def _anthropic_blocks_from_message(message: dict[str, Any], model: str) -> list[dict[str, Any]]:
+    """Assistant content blocks: the provider's own blocks when they came from this model, else rebuilt."""
+    stored = message.get("provider_content")
+    if isinstance(stored, dict) and stored.get("provider") == "anthropic" and stored.get("model") == model and stored.get("blocks"):
+        return [dict(block) for block in stored["blocks"]]
+    blocks: list[dict[str, Any]] = []
+    text = _content_text(message.get("content"))
+    if text.strip():
+        blocks.append({"type": "text", "text": text})
+    for call in message.get("tool_calls") or []:
+        blocks.append({"type": "tool_use", "id": call.get("id"), "name": call["name"], "input": call.get("arguments") or {}})
+    return blocks
+
+
+def _anthropic_messages(messages: list[dict[str, Any]], model: str) -> list[dict[str, Any]]:
+    """Provider-neutral messages -> Messages API messages.
+
+    Consecutive tool results become one user message of tool_result blocks (matching tool_use_id);
+    a user note that directly follows them joins the same message after the results.
+    """
+    out: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        if results:
+            out.append({"role": "user", "content": list(results)})
+            results.clear()
+
+    for message in messages:
+        role = message.get("role") or "user"
+        if role == "tool":
+            block: dict[str, Any] = {
+                "type": "tool_result", "tool_use_id": message.get("tool_call_id"),
+                "content": _content_text(message.get("content")),
+            }
+            if message.get("is_error"):
+                block["is_error"] = True
+            results.append(block)
+            continue
+        if role == "user" and results:
+            text = _content_text(message.get("content"))
+            if text.strip():
+                results.append({"type": "text", "text": text})
+            flush()
+            continue
+        flush()
+        if role == "assistant":
+            blocks = _anthropic_blocks_from_message(message, model)
+            if blocks:
+                out.append({"role": "assistant", "content": blocks})
+        else:
+            text = _content_text(message.get("content"))
+            out.append({"role": "user", "content": text if text.strip() else EMPTY_USER_MESSAGE})
+    flush()
+    return out
+
+
+def _anthropic_block_param(block: Any) -> dict[str, Any] | None:
+    """A response content block as a request param, so the assistant turn can be sent back unchanged."""
+    kind = _field(block, "type")
+    if kind == "text":
+        return {"type": "text", "text": str(_field(block, "text") or "")}
+    if kind == "tool_use":
+        return {"type": "tool_use", "id": _field(block, "id"), "name": _field(block, "name"),
+                "input": _tool_arguments(_field(block, "input"))}
+    if kind == "thinking":
+        param = {"type": "thinking", "thinking": _field(block, "thinking") or ""}
+        if _field(block, "signature") is not None:
+            param["signature"] = _field(block, "signature")
+        return param
+    if kind == "redacted_thinking":
+        return {"type": "redacted_thinking", "data": _field(block, "data")}
+    plain = _plain(block)
+    return {key: value for key, value in plain.items() if value is not None} if isinstance(plain, dict) else None
+
+
+def _anthropic_chat(client_obj: "AnthropicClient", messages: list[dict[str, Any]], system: str | None,
+                    tools: list[dict[str, Any]] | None, json_schema: Any, timeout: float | None) -> ChatReply:
+    """AnthropicClient.chat: one guarded Messages API call with tools (see AnthropicClient.chat)."""
+    self = client_obj
+    call_timeout = self.default_timeout if timeout is None else timeout
+    kwargs = self.chat_request_kwargs(messages, system, tools, json_schema)
+    prompt_chars = (
+        len(system or "")
+        + len(json.dumps(kwargs["messages"], ensure_ascii=False, default=str))
+        + len(json.dumps(kwargs.get("tools") or [], ensure_ascii=False, default=str))
+    )
+    if self.budget_guard is not None:
+        # Raises BudgetExceededError (nothing is sent) when this call's worst case could pass a cap.
+        self.budget_guard.check(self.model, prompt_chars, self.max_tokens, role=self.role)
+    sdk = self._sdk_client().with_options(timeout=call_timeout)
+    streamed = self.uses_streaming()
+    try:
+        if streamed:
+            message = self._streamed_message(sdk, kwargs, call_timeout)
+        else:
+            message = sdk.messages.create(**kwargs)
+    except Exception as exc:
+        self._record_failed_call(exc, prompt_chars)
+        raise
+    stop_reason = _field(message, "stop_reason")
+    done_reason = _ANTHROPIC_STOP_REASONS.get(stop_reason, stop_reason)
+    usage_obj = _field(message, "usage")
+    usage = {
+        key: _field(usage_obj, key)
+        for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+    } if usage_obj is not None else None
+    call_cost = cost_usd(self.model, usage)
+    metadata: dict[str, Any] = {"stop_reason": stop_reason, "streamed": streamed, "cost_usd": call_cost}
+    message_id = _field(message, "id")
+    if message_id:
+        metadata["message_id"] = message_id
+    texts: list[str] = []
+    calls: list[dict[str, Any]] = []
+    blocks: list[dict[str, Any]] = []
+    for block in _field(message, "content") or []:
+        param = _anthropic_block_param(block)
+        if param is None:
+            continue
+        blocks.append(param)
+        if param["type"] == "text":
+            texts.append(param["text"])
+        elif param["type"] == "tool_use":
+            calls.append({"id": param["id"], "name": param["name"], "arguments": dict(param["input"])})
+    text = "".join(texts)
+    provider_content: list[dict[str, Any]] | None = blocks
+    if done_reason == "refusal":
+        metadata["stop_details"] = _plain(_field(message, "stop_details"))
+        text, calls, provider_content = "", [], None
+    elif done_reason == "length":
+        if calls:
+            metadata["dropped_tool_calls"] = len(calls)  # inputs may be cut off at max_tokens
+        calls, provider_content = [], None
+    empty = not text.strip() and not calls and done_reason not in ("refusal", "length")
+    if self.budget_guard is not None:
+        # Every billed call is recorded, including refusals and empty answers; a failed write raises.
+        self.budget_guard.record(
+            self.model, usage, role=self.role, outcome="empty" if empty else (done_reason or "ok"), cost=call_cost
+        )
+    return ChatReply(
+        text,
+        calls,
+        done_reason=done_reason,
+        usage=usage,
+        metadata=metadata,
+        provider=self.provider,
+        model=self.model,
+        provider_content=provider_content,
+    )
+
 
 # ----- per-role configuration -----
 
@@ -520,6 +881,7 @@ def resolve_model_role(config: Any, role: str) -> dict[str, Any]:
     model_roles[role] wins when present; otherwise the legacy keys apply (author: model_name;
     validator: validator_model_name, else model_name; ollama_options[role]; model_server_url).
     The "eval" role falls back to the validator's settings when it is not configured.
+    The "chat" role (finance chat) falls back to model_name with ollama_options["chat"].
     model_roles.author.guidance ("strict" or "guided") is kept as the author's "guidance" key
     (it overrides the top-level guidance; see finance.settings), even when the entry has no model.
     """
@@ -537,7 +899,7 @@ def resolve_model_role(config: Any, role: str) -> dict[str, Any]:
     if not isinstance(entry, dict) or not entry.get("model"):
         if role == "eval":
             return {**resolve_model_role(config, "validator"), "role": "eval"}
-        if role == "author":
+        if role in ("author", "chat"):
             model = config.get("model_name")
         else:
             model = config.get("validator_model_name") or config.get("model_name")
@@ -598,7 +960,7 @@ def build_model_client(
     run_id: str | None = None,
     budget_guard: BudgetGuard | None = None,
 ) -> ModelClient:
-    """Create the ModelClient for a role ("author", "validator", or "eval") from a config dict or ReportSettings.
+    """Create the ModelClient for a role ("author", "validator", "eval", or "chat") from a config dict or ReportSettings.
 
     anthropic_client lets tests inject a fake SDK client; real runs build anthropic.Anthropic().
     Claude clients always get a BudgetGuard: budget_guard when given, else one built from the

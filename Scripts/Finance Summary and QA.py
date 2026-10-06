@@ -1,15 +1,27 @@
-"""Gradio finance summary and Q&A backed by the gold monthly spending table."""
+"""Gradio finance app: the monthly report and Q&A tab, and the finance chat tab.
+
+The chat keeps its transaction frame in the finance.chat.data module cache (never in gr.State)
+and one small ChatSession per browser session.
+"""
 
 from __future__ import annotations
 
 import calendar
+import threading
+from collections import OrderedDict
+from datetime import date
 from decimal import Decimal
-from typing import Any
+from typing import Any, Iterator
 
 import gradio as gr
 
 from finance.bigquery_tools import get_report_period_spending, get_spending_years
 from finance.budget import BudgetExceededError
+from finance.chat import data as chat_data
+from finance.chat import prompts as chat_prompts
+from finance.chat.engine import ChatEvent, run_turn
+from finance.chat.session import ChatSession
+from finance.model_clients import build_model_client
 from finance.memory import open_memory
 from finance.qa import answer_finance_question as shared_answer_finance_question
 from finance.reporting import generate_finance_report
@@ -181,53 +193,193 @@ APP_CSS = """
 """
 
 
-with gr.Blocks(title="Finance Summary & QA") as app:
-    gr.Markdown("# Finance Summary & QA\nChoose a year and month to view an authoritative spending summary, then ask questions about that selection.")
-    with gr.Row():
-        year_dropdown = gr.Dropdown(
-            label="Year",
-            choices=INITIAL_YEARS,
-            value=INITIAL_YEARS[0] if INITIAL_YEARS else None,
-            interactive=True,
-            scale=3,
-        )
-        refresh_years_button = gr.Button("Refresh years", scale=1)
-    gr.Markdown("### Select a month")
-    month_buttons = []
-    for offset in (0, 6):
-        with gr.Row():
-            for month_label, month_number in MONTHS[offset : offset + 6]:
-                month_button = gr.Button(month_label, elem_classes=["month-button"])
-                month_buttons.append((month_button, month_number))
+# ----- finance chat -----
 
-    gr.Markdown("### Financial summary")
-    summary_panel = gr.HTML(value="<div class='empty-state'>Select a year and month to load your summary.</div>")
-    selected_report = gr.State(value=None)
-    status_message = gr.Markdown(INITIAL_STATUS)
-    for month_button, month_number in month_buttons:
-        month_button.click(
-            fn=lambda year, selected_month=month_number: load_finance_summary(year, selected_month),
-            inputs=[year_dropdown],
-            outputs=[summary_panel, selected_report, status_message],
-        )
-    with gr.Row():
-        question_input = gr.Textbox(
-            label="Ask a question about the Financial Summary",
-            placeholder="For example: Which categories changed most compared with the prior month?",
-            lines=2,
-            scale=5,
-        )
-        question_button = gr.Button("Ask", variant="primary", scale=1)
-    answer_output = gr.Markdown(label="Answer")
-    question_button.click(
-        answer_finance_question,
-        inputs=[question_input, selected_report],
-        outputs=answer_output,
+CHAT_EXAMPLES = [
+    "Monthly spend by category this year",
+    "Heatmap of activity by store",
+    "Top 5 grocery merchants last quarter",
+    "Compare Amex vs Chase by month",
+]
+LATEST_MONTH = "Latest month"
+MAX_CHAT_SESSIONS = 32
+_CHAT_SESSIONS: "OrderedDict[str, ChatSession]" = OrderedDict()
+_CHAT_FOCUS: dict[str, date | None] = {}
+_CHAT_LOCK = threading.Lock()
+
+
+def _session_key(request: Any) -> str:
+    return str(getattr(request, "session_hash", None) or "default")
+
+
+def chat_session(request: Any = None) -> ChatSession:
+    """The ChatSession for this browser session (bounded LRU; the frame is never stored in it)."""
+    key = _session_key(request)
+    with _CHAT_LOCK:
+        session = _CHAT_SESSIONS.get(key)
+        if session is None:
+            session = ChatSession(key, history_turns=SETTINGS.chat_history_turns)
+            _CHAT_SESSIONS[key] = session
+            while len(_CHAT_SESSIONS) > MAX_CHAT_SESSIONS:
+                _CHAT_SESSIONS.popitem(last=False)
+        _CHAT_SESSIONS.move_to_end(key)
+        session.focus_month = _CHAT_FOCUS.get(key, session.focus_month)
+        return session
+
+
+def _parse_focus(value: Any) -> date | None:
+    text = str(value or "").strip()
+    if len(text) == 7 and text[4] == "-":
+        try:
+            return date(int(text[:4]), int(text[5:7]), 1)
+        except ValueError:
+            return None
+    return None
+
+
+def focus_month_choices(frame: Any = None, today: date | None = None) -> list[str]:
+    """"Latest month" plus YYYY-MM months, newest first (from the data when loaded, else the last 24)."""
+    if frame is not None and len(frame):
+        months = sorted({str(period) for period in frame["month"].unique()}, reverse=True)
+    else:
+        today = today or date.today()
+        start = chat_data.default_start(today)
+        months = []
+        current = date(today.year, today.month, 1)
+        while current >= start:
+            months.append(f"{current:%Y-%m}")
+            current = date(current.year - 1, 12, 1) if current.month == 1 else date(current.year, current.month - 1, 1)
+    return [LATEST_MONTH] + months
+
+
+def set_focus_month(value: Any, request: gr.Request = None) -> None:
+    key = _session_key(request)
+    with _CHAT_LOCK:
+        _CHAT_FOCUS[key] = _parse_focus(value)
+        if key in _CHAT_SESSIONS:
+            _CHAT_SESSIONS[key].focus_month = _CHAT_FOCUS[key]
+
+
+def refresh_chat_data() -> tuple[Any, str]:
+    """Drop the cached transactions and reload them (one BigQuery query)."""
+    try:
+        chat_data.refresh(PROJECT_NAME)
+        frame = chat_data.load_transactions(SETTINGS)
+    except Exception as exc:
+        return gr.update(), chat_prompts.DATA_ERROR_MESSAGE.format(reason=exc)
+    catalog = chat_data.build_catalog(frame)
+    dates = catalog["date_range"]
+    return (
+        gr.update(choices=focus_month_choices(frame)),
+        f"Loaded {catalog['transactions']} transactions from {dates['min']} to {dates['max']}.",
     )
-    refresh_years_button.click(
-        refresh_year_choices,
-        outputs=[year_dropdown, status_message],
-    )
+
+
+def _event_message(event: ChatEvent) -> Any:
+    if event.kind == "explanation":
+        return gr.ChatMessage(
+            role="assistant", content=event.content,
+            metadata={"title": "How I computed this", "status": event.status or "done"},
+        )
+    if event.kind == "figure":
+        return gr.ChatMessage(role="assistant", content=gr.Plot(event.content))
+    if event.kind == "table":
+        return gr.ChatMessage(role="assistant", content=gr.Dataframe(event.content, interactive=False))
+    return gr.ChatMessage(role="assistant", content=str(event.content))
+
+
+def chat_respond(message: str, history: list[Any], request: gr.Request = None) -> Iterator[list[Any]]:
+    """ChatInterface generator: yields the assistant messages for this turn as they are ready."""
+    session = chat_session(request)
+    session.sync_history(history)
+    try:
+        frame = chat_data.load_transactions(SETTINGS)
+        catalog = chat_data.build_catalog(frame)
+    except Exception as exc:
+        yield [gr.ChatMessage(role="assistant", content=chat_prompts.DATA_ERROR_MESSAGE.format(reason=exc))]
+        return
+    if session.client is None:
+        try:
+            # One guarded client per chat session: Claude calls are recorded with run_id "chat".
+            session.client = build_model_client(SETTINGS, "chat", run_id="chat")
+        except Exception as exc:
+            yield [gr.ChatMessage(role="assistant", content=chat_prompts.MODEL_SETUP_MESSAGE.format(reason=exc))]
+            return
+    messages: list[Any] = []
+    for event in run_turn(session, message, client=session.client, df=frame, catalog=catalog, settings=SETTINGS):
+        rendered = _event_message(event)
+        if event.kind == "explanation" and messages:
+            messages[0] = rendered  # update the "How I computed this" message in place
+        else:
+            messages.append(rendered)
+        yield list(messages)
+
+
+with gr.Blocks(title="Finance Summary & QA") as app:
+    with gr.Tabs():
+        with gr.Tab("Monthly report"):
+            gr.Markdown("# Finance Summary & QA\nChoose a year and month to view an authoritative spending summary, then ask questions about that selection.")
+            with gr.Row():
+                year_dropdown = gr.Dropdown(
+                    label="Year",
+                    choices=INITIAL_YEARS,
+                    value=INITIAL_YEARS[0] if INITIAL_YEARS else None,
+                    interactive=True,
+                    scale=3,
+                )
+                refresh_years_button = gr.Button("Refresh years", scale=1)
+            gr.Markdown("### Select a month")
+            month_buttons = []
+            for offset in (0, 6):
+                with gr.Row():
+                    for month_label, month_number in MONTHS[offset : offset + 6]:
+                        month_button = gr.Button(month_label, elem_classes=["month-button"])
+                        month_buttons.append((month_button, month_number))
+
+            gr.Markdown("### Financial summary")
+            summary_panel = gr.HTML(value="<div class='empty-state'>Select a year and month to load your summary.</div>")
+            selected_report = gr.State(value=None)
+            status_message = gr.Markdown(INITIAL_STATUS)
+            for month_button, month_number in month_buttons:
+                month_button.click(
+                    fn=lambda year, selected_month=month_number: load_finance_summary(year, selected_month),
+                    inputs=[year_dropdown],
+                    outputs=[summary_panel, selected_report, status_message],
+                )
+            with gr.Row():
+                question_input = gr.Textbox(
+                    label="Ask a question about the Financial Summary",
+                    placeholder="For example: Which categories changed most compared with the prior month?",
+                    lines=2,
+                    scale=5,
+                )
+                question_button = gr.Button("Ask", variant="primary", scale=1)
+            answer_output = gr.Markdown(label="Answer")
+            question_button.click(
+                answer_finance_question,
+                inputs=[question_input, selected_report],
+                outputs=answer_output,
+            )
+            refresh_years_button.click(
+                refresh_year_choices,
+                outputs=[year_dropdown, status_message],
+            )
+        with gr.Tab("Chat"):
+            gr.Markdown("Ask about your spending. Answers are computed from your transactions; the model only picks the analysis and explains it.")
+            with gr.Row():
+                focus_dropdown = gr.Dropdown(
+                    label="Focus month", choices=focus_month_choices(), value=LATEST_MONTH, interactive=True, scale=3,
+                )
+                refresh_data_button = gr.Button("Refresh data", scale=1)
+            chat_status = gr.Markdown("")
+            gr.ChatInterface(
+                fn=chat_respond,
+                chatbot=gr.Chatbot(height=620, label="Finance chat"),
+                examples=CHAT_EXAMPLES,
+                concurrency_limit=1,
+            )
+            focus_dropdown.change(set_focus_month, inputs=[focus_dropdown], outputs=None)
+            refresh_data_button.click(refresh_chat_data, outputs=[focus_dropdown, chat_status])
 
 
 if __name__ == "__main__":
