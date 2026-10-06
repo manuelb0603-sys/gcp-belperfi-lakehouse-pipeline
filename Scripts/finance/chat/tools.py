@@ -116,6 +116,7 @@ class ToolContext:
     settings: ReportSettings
     today: date
     focus_month: date | None = None
+    profile: Any = None  # profile.DataProfile; drives dimension repairs and the auto chart
 
     @cached_property
     def rows(self) -> pd.DataFrame:
@@ -181,6 +182,7 @@ def compact(payload: dict[str, Any], limit: int = MAX_RESULT_BYTES) -> dict[str,
         lambda: summary.pop("top", None),
         lambda: shorten("caption", 80),
         lambda: shorten("error", 400),
+        lambda: summary.get("limitations") and summary.__setitem__("limitations", summary["limitations"][:1]),
     ]
     for step in steps:
         if _size(payload) <= limit:
@@ -215,7 +217,8 @@ def analyze_spending(arguments: dict[str, Any], ctx: ToolContext) -> ToolOutcome
         return _error("analyze_spending", arguments, "The arguments were not a valid JSON object matching the analysis spec.")
     try:
         spec, notes = validate_and_repair(
-            args, ctx.catalog, known_merchants=ctx.merchants, today=ctx.today, focus_month=ctx.focus_month
+            args, ctx.catalog, known_merchants=ctx.merchants, today=ctx.today, focus_month=ctx.focus_month,
+            profile=ctx.profile,
         )
     except ValidationError as exc:
         return _error("analyze_spending", arguments, _validation_message(exc))
@@ -224,7 +227,8 @@ def analyze_spending(arguments: dict[str, Any], ctx: ToolContext) -> ToolOutcome
     data_min, data_max = ctx.data_bounds()
     result = run_analysis(
         ctx.frame, spec,
-        AnalysisContext(today=ctx.today, focus_month=ctx.focus_month, data_min=data_min, data_max=data_max, notes=notes),
+        AnalysisContext(today=ctx.today, focus_month=ctx.focus_month, data_min=data_min, data_max=data_max, notes=notes,
+                        profile=ctx.profile),
     )
     payload = compact({"ok": True, "caption": result.caption, "chart": result.chart, "summary": dict(result.summary)})
     return ToolOutcome("analyze_spending", arguments, True, payload, result=result, spec=spec, notes=list(result.notes))

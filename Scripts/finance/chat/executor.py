@@ -20,13 +20,17 @@ import pandas as pd
 from .analysis_spec import (
     CATEGORICAL_DIMENSIONS,
     DIMENSION_LABELS,
+    LINE_MIN_POINTS,
     METRIC_DEFINITIONS,
     METRIC_LABELS,
     ORDERED_DIMENSIONS,
+    PIE_MAX_SLICES,
     TIME_DIMENSIONS,
     AnalysisSpec,
+    Limitation,
     ResolvedPeriod,
     comparison_period,
+    heatmap_fits,
     resolve_period,
 )
 from .data import WEEKDAYS, analysis_rows
@@ -46,6 +50,7 @@ class AnalysisContext:
     data_min: date | None = None
     data_max: date | None = None
     notes: Sequence[str] = ()  # repair notes from validate_and_repair, carried into the result
+    profile: Any = None  # profile.DataProfile: the auto chart avoids heatmaps on limited dimensions
 
 
 @dataclass
@@ -259,26 +264,36 @@ def _sort(table: pd.DataFrame, spec: AnalysisSpec, dims: list[str], column: str)
     return table.assign(_o=other_last, _v=-table[column].fillna(-np.inf)).sort_values(["_o", "_v"], kind="stable").drop(columns=["_o", "_v"])
 
 
-def _auto_chart(spec: AnalysisSpec, dims: list[str], table: pd.DataFrame, column: str) -> str:
+def _auto_chart(spec: AnalysisSpec, dims: list[str], table: pd.DataFrame, column: str, profile: Any = None) -> str:
+    """Pick a readable chart: a line needs at least LINE_MIN_POINTS time points, a heatmap two
+    usable dimensions within HEATMAP_MAX_ROWS x HEATMAP_MAX_COLUMNS, a pie at most PIE_MAX_SLICES
+    non-negative slices; otherwise bars."""
     if not dims or table.empty:
         return "table"
+    time_dim = next((dim for dim in dims if dim in TIME_DIMENSIONS), None)
+    enough_points = time_dim is not None and table[time_dim].nunique() >= LINE_MIN_POINTS
     if spec.compare_to != "none":
-        return "table" if len(dims) > 1 else ("line" if dims[0] in TIME_DIMENSIONS else "bar")
+        return "table" if len(dims) > 1 else ("line" if dims[0] in TIME_DIMENSIONS and enough_points else "bar")
     if len(dims) == 1:
         dim = dims[0]
         if dim in TIME_DIMENSIONS:
-            return "bar" if spec.top_n else "line"
-        if dim in CATEGORICAL_DIMENSIONS and spec.metric == "share_of_total" and len(table) <= 6 and (table[column] >= 0).all():
+            return "bar" if spec.top_n or not enough_points else "line"
+        if (dim in CATEGORICAL_DIMENSIONS and spec.metric == "share_of_total" and len(table) <= PIE_MAX_SLICES
+                and (table[column] >= 0).all()):
             return "pie"
         return "bar"
+    bars = "stacked_bar" if (table[column].fillna(0) >= 0).all() else "grouped_bar"
     ordered = [dim for dim in dims if dim in ORDERED_DIMENSIONS]
     if len(ordered) == 2 or "weekday" in dims or "day_of_month" in dims:
-        return "heatmap"
-    if any(dim in TIME_DIMENSIONS for dim in dims):
-        if spec.metric not in ADDITIVE_METRICS or spec.transform != "none":
+        usable = profile is None or all(profile.is_usable(dim) for dim in dims)
+        if usable and heatmap_fits([table[dim].nunique() for dim in dims]):
+            return "heatmap"
+        return bars
+    if time_dim is not None:
+        if (spec.metric not in ADDITIVE_METRICS or spec.transform != "none") and enough_points:
             return "line"
-        return "stacked_bar" if (table[column].fillna(0) >= 0).all() else "grouped_bar"
-    return "stacked_bar" if (table[column].fillna(0) >= 0).all() else "grouped_bar"
+        return bars
+    return bars
 
 
 # ----- main entry -----
@@ -386,9 +401,9 @@ def run_analysis(df: pd.DataFrame, spec: AnalysisSpec, ctx: AnalysisContext | No
         table[column] = _round(table[column].astype(float), col_unit)
     table = table.reset_index(drop=True)
 
-    chart = spec.chart if spec.chart != "auto" else _auto_chart(spec, dims, table, value_column)
+    chart = spec.chart if spec.chart != "auto" else _auto_chart(spec, dims, table, value_column, ctx.profile)
     if chart == "pie":
-        if len(table) > 6:
+        if len(table) > PIE_MAX_SLICES:
             chart = "bar"
             notes.append("A pie chart with more than 6 slices is hard to read; showing a bar chart instead.")
         elif (table[value_column].fillna(0) < 0).any():
@@ -468,8 +483,13 @@ def _summary(
             "change": _scalar(delta, unit if unit != "count" else "count"),
             "change_pct": _scalar(delta / abs(comp_total) * 100, "pct") if delta is not None and comp_total else None,
         }
-    if notes:
-        summary["notes"] = [note[:160] for note in notes[:4]]
+    limitations = [note for note in notes if isinstance(note, Limitation)]
+    others = [note for note in notes if not isinstance(note, Limitation)]
+    if limitations:
+        # Profile repairs and data-end anchoring: the answer must mention these.
+        summary["limitations"] = [str(note)[:240] for note in limitations[:3]]
+    if others:
+        summary["notes"] = [note[:160] for note in others[:4]]
     return _fit(summary)
 
 
@@ -522,6 +542,7 @@ def _fit(summary: dict[str, Any]) -> dict[str, Any]:
         lambda s: s.pop("notes", None),
         lambda s: s.pop("lowest", None),
         lambda s: s.get("top") and s.__setitem__("top", [[label[:20], value] for label, value in s["top"]]),
+        lambda s: s.get("limitations") and s.__setitem__("limitations", s["limitations"][:1]),
     ]
     for step in steps:
         if _size(summary) <= SUMMARY_MAX_BYTES:
@@ -564,6 +585,64 @@ def _caption(
     if comp is not None:
         text.append(f"Compared with {comp.label}.")
     return " ".join(text)
+
+
+# ----- user-facing table -----
+
+DISPLAY_COLUMNS = {
+    "month": "Month", "quarter": "Quarter", "week": "Week of", "weekday": "Weekday", "day_of_month": "Day of month",
+    "category": "Category", "parent_group": "Group", "issuer": "Card", "merchant": "Merchant",
+}
+WEEKDAY_NAMES = dict(zip(WEEKDAYS, ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")))
+UNIT_SUFFIX = {"usd": " ($)", "pct": " (%)", "count": ""}
+
+
+def _display_label(dim: str, value: Any) -> Any:
+    text = str(value)
+    try:
+        if dim == "month":
+            return pd.Period(text, freq="M").strftime("%b %Y")
+        if dim == "quarter":
+            year, quarter = text.split("-")
+            return f"{quarter} {year}"
+        if dim == "week":
+            day = pd.Timestamp(text)
+            return f"{day:%b} {day.day}, {day.year}"
+    except (ValueError, TypeError):
+        return text
+    if dim == "weekday":
+        return WEEKDAY_NAMES.get(text, text)
+    return value
+
+
+def display_table(result: AnalysisResult) -> pd.DataFrame:
+    """The result table with friendly column names and units ("Month", "Net spend ($)", "Transactions"),
+    months as "Aug 2026" and full weekday names. ``result.table`` (what the summary is built from)
+    is not changed."""
+    table = result.table.copy()
+    metric = result.spec.metric
+    base_unit = _unit(metric)
+    names: dict[str, str] = {}
+    for dim in result.dimensions:
+        table[dim] = table[dim].map(lambda value, dim=dim: _display_label(dim, value))
+        names[dim] = DISPLAY_COLUMNS[dim]
+    for column in table.columns:
+        if column in names:
+            continue
+        if column == metric:
+            names[column] = METRIC_LABELS[metric] + UNIT_SUFFIX[base_unit]
+        elif column.startswith(metric + "_") and column[len(metric) + 1:] in TRANSFORM_LABELS:
+            transform = column[len(metric) + 1:]
+            unit = "pct" if transform == "pct_change" else base_unit
+            names[column] = f"{METRIC_LABELS[metric]}, {TRANSFORM_LABELS[transform]}{UNIT_SUFFIX[unit]}"
+        elif column == "comparison":
+            label = result.comparison.label if result.comparison else "Comparison"
+            names[column] = f"{label[:1].upper()}{label[1:]}{UNIT_SUFFIX[base_unit]}"
+        elif column == "change":
+            names[column] = "Change (pts)" if base_unit == "pct" else f"Change{UNIT_SUFFIX[base_unit]}"
+        elif column == "change_pct":
+            names[column] = "Change (%)"
+    return table.rename(columns=names)
 
 
 # ----- narrative guard -----

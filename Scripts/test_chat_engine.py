@@ -85,8 +85,9 @@ class TestToolLoop(unittest.TestCase):
         explanation = events[2].content
         self.assertIn("Net spend by month, Jul–Sep 2026 (last quarter).", explanation)
         self.assertIn('Spec: `{"group_by": ["month"], "period": "last_quarter"}`', explanation)
-        table = events[-1].content
-        self.assertEqual(table["month"].tolist(), ["2026-07", "2026-08", "2026-09"])
+        table = events[-1].content  # user-facing table: friendly columns and month names
+        self.assertEqual(list(table.columns), ["Month", "Net spend ($)"])
+        self.assertEqual(table["Month"].tolist(), ["Jul 2026", "Aug 2026", "Sep 2026"])
         # The second call carries the tool result: compact JSON summary, no transaction rows.
         tool_messages = [m for m in client.calls[1]["messages"] if m["role"] == "tool"]
         self.assertEqual(len(tool_messages), 1)
@@ -115,7 +116,7 @@ class TestToolLoop(unittest.TestCase):
         self.assertEqual(text_of(events), "You spent $21.50 at Starbucks last quarter.")
         done = next(event for event in events if event.status == "done")
         self.assertIn("rejected and corrected", done.content)
-        self.assertEqual(events[-1].content["net_spend"].tolist(), [21.5])
+        self.assertEqual(events[-1].content["Net spend ($)"].tolist(), [21.5])
 
     def test_direct_answer_without_tools(self):
         client = FakeChatClient(reply("I can answer questions about your card spending, like monthly totals by category."))

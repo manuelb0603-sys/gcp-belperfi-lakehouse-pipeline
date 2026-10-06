@@ -34,10 +34,11 @@ This pipeline implements a multi-layer Lakehouse medallion architecture designed
 │   │   │   └── fallback.py        # Deterministic fallback report
 │   │   ├── bigquery_tools.py      # Read-only tools for gold-layer spending and transaction evidence
 │   │   ├── chat/                  # Finance chat: deterministic data, analysis, charts, tools, and the chat engine
-│   │   │   ├── data.py            # Gold transactions query, TTL cache, refresh(), and the data catalog
+│   │   │   ├── data.py            # Gold transactions query, TTL cache, refresh(), the data catalog, load_chat_data
+│   │   │   ├── profile.py         # Data profile: schema, date coverage, usable/limited dimensions, example questions
 │   │   │   ├── merchants.py       # normalize_merchant: descriptor cleanup, payments/credits, aliases
 │   │   │   ├── analysis_spec.py   # AnalysisSpec (pydantic), period resolution, validate_and_repair
-│   │   │   ├── executor.py        # run_analysis -> table, summary, caption; narrative number check
+│   │   │   ├── executor.py        # run_analysis -> table, summary, caption; display_table; narrative number check
 │   │   │   ├── charts.py          # build_figure: plotly line/bar/heatmap/pie/treemap with escaped labels
 │   │   │   ├── tools.py           # Model tools (analyze_spending, list_values, get_month_snapshot), dispatch, compact results
 │   │   │   ├── prompts.py         # Chat system prompt, catalog block, tool descriptions, user-facing messages
@@ -75,9 +76,9 @@ This pipeline implements a multi-layer Lakehouse medallion architecture designed
 │   ├── upload_csv.py              # Uploads issuer-specific CSV files to GCS and archives them
 │   ├── run_all_issuers.py         # Runs the uploader for every issuer in config.json
 │   ├── generate_mock_cd.py        # Generates mock Chase and Amex CSVs with recurring merchants (--records, --seed)
-│   ├── chat_test_fixtures.py      # Hand-built transaction fixture shared by the finance chat tests
+│   ├── chat_test_fixtures.py      # Hand-built transaction fixture plus sparse- and repeating-merchant profile fixtures
 │   ├── test_chat_*.py             # Finance chat: merchants, spec/periods, executor golden tables, charts, data/cache/catalog,
-│   │                              #   tools, engine (scripted fake chat client), app import smoke test
+│   │                              #   data profile, tools, engine (scripted fake chat client), app import smoke test
 │   ├── test_agent_harness.py      # Harness protocol, parsing, sanitization, retries, and feedback tests
 │   ├── test_budget.py             # Claude pricing, cost ledger, budget guard, harness/app/CLI refusals, no unguarded calls
 │   ├── test_finance_services.py   # Shared reporting/tool wiring tests
@@ -350,16 +351,44 @@ Run the app from the project root (it serves on `http://127.0.0.1:7860` only; th
 & "..\.venv\Scripts\python.exe" "Scripts\Finance Summary and QA.py"
 ```
 
-The **Monthly report** tab is the original month report and Q&A. In the **Chat** tab, type a question or click an example:
+The **Monthly report** tab is the original month report and Q&A. In the **Chat** tab, type a question or click an example. The example chips are generated from the data profile when the page loads (and on **Refresh data**), so they only use dimensions and dates the data supports, for example:
 
-* "Monthly spend by category this year"
-* "Heatmap of activity by store"
-* "Top 5 grocery merchants last quarter"
+* "Monthly net spend by category, last 6 months of data"
 * "Compare Amex vs Chase by month"
+* "Which weekday do I spend the most?"
+* "Top categories in Wants vs Needs"
+* "Top 5 merchants in Sep 2026" (only when merchants repeat enough to group by; see Data profile)
 * Follow-ups such as "now only Amex" or "same thing by week" start from the previous analysis.
 * "How was September?" uses the monthly-report snapshot (total, change from the prior month, disposable cash, savings shortfall, top discretionary categories).
 
-Each answer shows a collapsible **How I computed this** message (the plain-language caption, any repairs such as "Interpreted category 'Shoping' as 'Shopping'", and the spec), the narrative, the plotly chart, and the aggregated table (at most 25 rows). **Focus month** sets the month used by the `focus_month` period and the snapshot tool (default: the latest month with data). **Refresh data** drops the cached transactions and queries BigQuery again (otherwise the frame is reused for `chat_data_cache_seconds`).
+If the data cannot be loaded or profiled, safe static examples are shown (`prompts.STATIC_EXAMPLES`).
+
+Each answer shows a collapsible **How I computed this** message (the plain-language caption, any repairs such as "Interpreted category 'Shoping' as 'Shopping'", and the spec), the narrative, the plotly chart, and the aggregated table (at most 25 rows) with friendly column names and units ("Month", "Category", "Net spend ($)", "Transactions"), months as "Aug 2026", and full weekday names (`executor.display_table`; the model's summary still uses the raw table). **Focus month** sets the month used by the `focus_month` period and the snapshot tool (default: the latest month with data). **Refresh data** drops the cached transactions and queries BigQuery again (otherwise the frame is reused for `chat_data_cache_seconds`).
+
+#### Data profile
+
+`profile.build_data_profile(frame, today=...)` describes what the loaded data can support. It is built once per data load next to the catalog (`data.load_chat_data` returns the frame, catalog, and profile and caches the last two with the frame) and holds:
+
+* **Schema**: the gold `fact_transactions` columns the chat uses (issuer, transaction_date, description (normalized into merchant), amount, transaction_type, category, parent_group) with their types and meaning.
+* **Date coverage**: first and last date, complete and partial months, the latest complete month, and how many days the data ends before today. A month is complete when the data reaches within 2 days of both its first and last day and the month is over.
+* **Transaction types** present (only Sale, Return, and Adjustment are analyzed, as in gold `fact_monthly_spending`).
+* **Per dimension** (category, parent_group, issuer, merchant, weekday, day_of_month, month, quarter, week): the number of values, the median and minimum transactions per value, the share of transactions and gross spend in the top 10 values, and a status with a plain-language reason:
+
+| Dimension | Usable when | Limited when | Unusable when |
+| --- | --- | --- | --- |
+| category, parent_group, issuer, merchant | otherwise | the median value has fewer than 3 transactions, or there are more than 10 values and the top 10 cover less than 40% of transactions | fewer than 2 values |
+| weekday | otherwise | the median weekday has fewer than 3 transactions | fewer than 2 weekdays |
+| day_of_month | otherwise | the median day has fewer than 2 transactions | |
+| month | at least 2 complete months | 1 complete month, or only partial months | a single month |
+| quarter / week | at least 2 quarters / 4 weeks | (week) 2 or 3 weeks | a single quarter / week |
+
+The profile drives the chat:
+
+* **Prompt**: the system prompt gets a DATA PROFILE block (coverage, latest complete month, usable dimensions, limited/unusable ones with reasons, transaction types; no amounts or percentages) and a rule not to offer analyses on limited or unusable dimensions unless the user explicitly asks, and then to explain the limitation. When merchant is limited, the catalog shows only the merchant count instead of the top 30 names.
+* **Repairs**: `validate_and_repair(..., profile=...)` replaces a limited or unusable group-by dimension with the best usable alternative (merchant to category or group, category and group to each other, day of month to weekday), so "heatmap of activity by store" becomes category by weekday; an unusable dimension without an alternative (for example a single card) is dropped. Grouping by merchant is kept when the user filters to specific merchants (`merchant` or `merchant_contains`). Time dimensions are kept with a note.
+* **Relative periods** anchor to the end of the data when it ends before the current month: "this month", "this quarter", and "year to date" end at the last data date, "last month" is the latest complete month, and "last N months"/"last quarter" end with it (for example "Data ends Aug 19, 2026; 'this month' = Aug 2026 (partial)."). Explicit custom dates are kept as given (clamped to the data).
+* **Charts**: `auto` draws a line only with at least 3 time points, a heatmap only when both dimensions are usable and the grid is at most 15 x 12, a pie only with at most 6 non-negative slices, and bars otherwise; explicit chart requests are repaired with the same limits.
+* **Narrative**: profile repairs and period anchoring are `Limitation` notes; the tool result summary carries them as `limitations` (kept when other detail is trimmed), and the system prompt tells the model to mention each one in plain words.
 
 How a turn works (`Scripts/finance/chat/engine.py`, `run_turn`):
 
@@ -377,12 +406,12 @@ The `chat` model role (`model_roles.chat`; when absent it falls back to `model_n
 
 Data layer details:
 
-* `data.load_transactions(settings, start=None, client=None)` runs one parameterized query on `gold.fact_transactions` (default: the last 24 months) and caches the frame for `chat_data_cache_seconds`; `data.refresh()` clears it. `build_catalog(frame)` lists the date range, issuers, categories with their groups, the top 30 merchants, and the metric definitions.
+* `data.load_transactions(settings, start=None, client=None)` runs one parameterized query on `gold.fact_transactions` (default: the last 24 months) and caches the frame for `chat_data_cache_seconds`; `data.refresh()` clears it (and the cached catalog and profile). `build_catalog(frame)` lists the date range, issuers, categories with their groups, the top 30 merchants, and the metric definitions. `data.load_chat_data(settings)` returns `ChatData(frame, catalog, profile)`, building the catalog and profile once per load; the app uses it for every chat turn and the example chips.
 * Metrics mirror `gold.fact_monthly_spending` exactly (Sale, Return, and Adjustment rows only, so card payments are excluded): `net_spend` (net_real_expense), `gross_spend`, `refunds`, `transaction_count`, `avg_transaction`, and `share_of_total`.
 * Merchants are normalized from card descriptors (store numbers, phone numbers, states, `SQ *`/`TST*` prefixes, Amazon variants; payments become `Card Payment` and statement credits `Card Credit`) with optional `merchant_aliases`, and URL/markup characters are stripped.
 * Charts use plotly (`..\.venv\Scripts\python.exe -m pip install plotly`); every label is HTML-escaped.
 
-The tests (`test_chat_*.py`) use a fixture frame, a fake BigQuery client, and a scripted fake chat client; they never call BigQuery or a model.
+The tests (`test_chat_*.py`) use a fixture frame, a fake BigQuery client, and a scripted fake chat client; they never call BigQuery or a model. `test_chat_profile.py` uses two generated fixtures from `chat_test_fixtures.py`: sparse merchants shaped like the mock gold data (531 nearly unique merchants, data ending 2026-08-19, today 2026-10-06) and realistic repeating merchants.
 
 ### Report Memory
 

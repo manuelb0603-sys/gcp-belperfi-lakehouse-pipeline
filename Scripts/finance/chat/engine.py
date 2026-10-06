@@ -9,7 +9,11 @@ UI events in order:
    with the plain-language caption, repair notes, and the spec;
 2. ``text``: the narrative;
 3. ``figure``: the plotly figure of the last analysis (when it has a chart);
-4. ``table``: its aggregated table (at most ``MAX_TABLE_ROWS`` rows).
+4. ``table``: its aggregated table with friendly column names (``executor.display_table``; at most
+   ``MAX_TABLE_ROWS`` rows).
+
+The data profile (``profile.DataProfile``) goes into the system prompt (DATA PROFILE block) and the
+tool context, so limited dimensions are repaired and the answer mentions the limitation.
 
 Budget refusals, an unreachable model, and the turn deadline become friendly text, never a traceback.
 """
@@ -29,7 +33,8 @@ from ..budget import BudgetExceededError
 from ..model_clients import ChatReply, EmptyModelResponse, is_anthropic_transient, tool_message
 from ..settings import ReportSettings
 from . import prompts
-from .executor import check_narrative_numbers
+from .executor import check_narrative_numbers, display_table
+from .profile import safe_profile
 from .session import ChatSession, Turn
 from .tools import ToolContext, ToolOutcome, dispatch, tool_definitions
 
@@ -157,8 +162,12 @@ def run_turn(
     settings: ReportSettings | Mapping[str, Any],
     today: date | None = None,
     clock: Callable[[], float] = time.monotonic,
+    profile: Any = None,
 ) -> Iterator[ChatEvent]:
-    """Answer one user message; yields ChatEvents and records the turn in ``session``."""
+    """Answer one user message; yields ChatEvents and records the turn in ``session``.
+
+    ``profile`` is the cached data profile (``data.load_chat_data``); it is built from ``df`` when omitted.
+    """
     settings = ReportSettings.coerce(settings)
     today = today or date.today()
     question = (user_text or "").strip()
@@ -171,8 +180,10 @@ def run_turn(
 
     deadline = clock() + settings.chat_turn_seconds
     max_rounds = settings.chat_max_tool_rounds
-    ctx = ToolContext(df, catalog, settings, today, session.focus_month)
-    system = prompts.build_system_prompt(catalog, today=today, focus_month=session.focus_month)
+    if profile is None:
+        profile = safe_profile(df, today=today)
+    ctx = ToolContext(df, catalog, settings, today, session.focus_month, profile)
+    system = prompts.build_system_prompt(catalog, today=today, focus_month=session.focus_month, profile=profile)
     tools = tool_definitions()
     messages = session.history_messages() + [{
         "role": "user",
@@ -247,7 +258,7 @@ def run_turn(
         if figure is not None:
             yield ChatEvent("figure", figure, metadata={"chart": result.chart})
         if not result.table.empty:
-            yield ChatEvent("table", result.table.head(MAX_TABLE_ROWS).copy(), metadata={"rows": int(len(result.table))})
+            yield ChatEvent("table", display_table(result).head(MAX_TABLE_ROWS), metadata={"rows": int(len(result.table))})
 
 
 def _with_fallback(message: str, outcomes: list[ToolOutcome]) -> str:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Callable, Iterable, Mapping
@@ -36,7 +37,18 @@ QUERY = """
 # Monotonic clock; tests replace it to exercise the TTL.
 clock: Callable[[], float] = time.monotonic
 _CACHE: dict[tuple[Any, ...], tuple[float, pd.DataFrame]] = {}
+# Catalog and data profile per cached frame (cache key, load time, today): built once per load.
+_DERIVED: dict[tuple[Any, ...], tuple[dict[str, Any], Any]] = {}
 _LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class ChatData:
+    """The frame plus what is derived from it once per load: the catalog and the data profile."""
+
+    frame: pd.DataFrame
+    catalog: dict[str, Any]
+    profile: Any  # profile.DataProfile, or None if profiling failed
 
 
 def default_start(today: date | None = None, months_back: int = DEFAULT_MONTHS_BACK) -> date:
@@ -98,15 +110,10 @@ def load_transactions(
     ``result()`` yields mapping-like rows (tests inject a fake).
     """
     settings = ReportSettings.coerce(settings)
-    project = settings.project_name
-    if not project:
-        raise ValueError("project_name is required to load transactions")
-    start_date = date.fromisoformat(start) if isinstance(start, str) else (start or default_start(today))
-    if isinstance(start_date, datetime):
-        start_date = start_date.date()
-    aliases = settings.merchant_aliases
-    key = (project, start_date, tuple(sorted(aliases.items())))
+    key = _cache_key(settings, start, today)
     ttl = settings.chat_data_cache_seconds
+    project, aliases = key[0], settings.merchant_aliases
+    start_date = key[1]
 
     if use_cache and ttl > 0:
         with _LOCK:
@@ -124,12 +131,51 @@ def load_transactions(
     return frame.copy()
 
 
+def _cache_key(settings: ReportSettings, start: date | str | None, today: date | None) -> tuple[Any, ...]:
+    project = settings.project_name
+    if not project:
+        raise ValueError("project_name is required to load transactions")
+    start_date = date.fromisoformat(start) if isinstance(start, str) else (start or default_start(today))
+    if isinstance(start_date, datetime):
+        start_date = start_date.date()
+    return (project, start_date, tuple(sorted(settings.merchant_aliases.items())))
+
+
+def load_chat_data(
+    settings: ReportSettings | Mapping[str, Any],
+    start: date | str | None = None,
+    *,
+    client: Any = None,
+    today: date | None = None,
+    use_cache: bool = True,
+) -> ChatData:
+    """``load_transactions`` plus the catalog and data profile, computed once per cached load."""
+    from .profile import safe_profile
+
+    settings = ReportSettings.coerce(settings)
+    today = today or date.today()
+    frame = load_transactions(settings, start, client=client, today=today, use_cache=use_cache)
+    key = _cache_key(settings, start, today)
+    with _LOCK:
+        loaded = _CACHE.get(key)
+        derived_key = (key, loaded[0], today) if loaded is not None and use_cache else None
+        derived = _DERIVED.get(derived_key) if derived_key else None
+    if derived is None:
+        derived = (build_catalog(frame), safe_profile(frame, today=today))
+        if derived_key:
+            with _LOCK:
+                _DERIVED.clear()  # only the latest load's derivations are worth keeping
+                _DERIVED[derived_key] = derived
+    return ChatData(frame, derived[0], derived[1])
+
+
 def refresh(project: str | None = None) -> int:
     """Drop cached frames (all, or one project's); returns how many were dropped."""
     with _LOCK:
         keys = [key for key in _CACHE if project is None or key[0] == project]
         for key in keys:
             del _CACHE[key]
+        _DERIVED.clear()
     return len(keys)
 
 

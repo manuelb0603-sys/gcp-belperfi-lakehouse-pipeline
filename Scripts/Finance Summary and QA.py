@@ -20,6 +20,7 @@ from finance.budget import BudgetExceededError
 from finance.chat import data as chat_data
 from finance.chat import prompts as chat_prompts
 from finance.chat.engine import ChatEvent, run_turn
+from finance.chat.profile import suggest_examples
 from finance.chat.session import ChatSession
 from finance.model_clients import build_model_client
 from finance.memory import open_memory
@@ -196,12 +197,8 @@ APP_CSS = """
 
 # ----- finance chat -----
 
-CHAT_EXAMPLES = [
-    "Monthly spend by category this year",
-    "Heatmap of activity by store",
-    "Top 5 grocery merchants last quarter",
-    "Compare Amex vs Chase by month",
-]
+# Safe placeholders; replaced on page load (and on Refresh data) by questions that fit the data profile.
+CHAT_EXAMPLES = list(chat_prompts.STATIC_EXAMPLES)
 LATEST_MONTH = "Latest month"
 MAX_CHAT_SESSIONS = 32
 _CHAT_SESSIONS: "OrderedDict[str, ChatSession]" = OrderedDict()
@@ -261,18 +258,36 @@ def set_focus_month(value: Any, request: gr.Request = None) -> None:
             _CHAT_SESSIONS[key].focus_month = _CHAT_FOCUS[key]
 
 
-def refresh_chat_data() -> tuple[Any, str]:
-    """Drop the cached transactions and reload them (one BigQuery query)."""
+def chat_examples(loaded: Any = None) -> list[str]:
+    """Example questions generated from the data profile; the static examples if loading or profiling fails."""
+    try:
+        loaded = loaded or chat_data.load_chat_data(SETTINGS)
+        return suggest_examples(loaded.profile)
+    except Exception:
+        return list(chat_prompts.STATIC_EXAMPLES)
+
+
+def _examples_update(examples: list[str]) -> Any:
+    return gr.update(examples=[{"text": text} for text in examples])
+
+
+def load_chat_examples() -> Any:
+    """Page-load handler: show example chips that fit the loaded data (uses the cached frame)."""
+    return _examples_update(chat_examples())
+
+
+def refresh_chat_data() -> tuple[Any, str, Any]:
+    """Drop the cached transactions and reload them (one BigQuery query); refresh the example chips."""
     try:
         chat_data.refresh(PROJECT_NAME)
-        frame = chat_data.load_transactions(SETTINGS)
+        loaded = chat_data.load_chat_data(SETTINGS)
     except Exception as exc:
-        return gr.update(), chat_prompts.DATA_ERROR_MESSAGE.format(reason=exc)
-    catalog = chat_data.build_catalog(frame)
-    dates = catalog["date_range"]
+        return gr.update(), chat_prompts.DATA_ERROR_MESSAGE.format(reason=exc), gr.update()
+    dates = loaded.catalog["date_range"]
     return (
-        gr.update(choices=focus_month_choices(frame)),
-        f"Loaded {catalog['transactions']} transactions from {dates['min']} to {dates['max']}.",
+        gr.update(choices=focus_month_choices(loaded.frame)),
+        f"Loaded {loaded.catalog['transactions']} transactions from {dates['min']} to {dates['max']}.",
+        _examples_update(chat_examples(loaded)),
     )
 
 
@@ -294,8 +309,7 @@ def chat_respond(message: str, history: list[Any], request: gr.Request = None) -
     session = chat_session(request)
     session.sync_history(history)
     try:
-        frame = chat_data.load_transactions(SETTINGS)
-        catalog = chat_data.build_catalog(frame)
+        loaded = chat_data.load_chat_data(SETTINGS)
     except Exception as exc:
         yield [gr.ChatMessage(role="assistant", content=chat_prompts.DATA_ERROR_MESSAGE.format(reason=exc))]
         return
@@ -307,7 +321,8 @@ def chat_respond(message: str, history: list[Any], request: gr.Request = None) -
             yield [gr.ChatMessage(role="assistant", content=chat_prompts.MODEL_SETUP_MESSAGE.format(reason=exc))]
             return
     messages: list[Any] = []
-    for event in run_turn(session, message, client=session.client, df=frame, catalog=catalog, settings=SETTINGS):
+    for event in run_turn(session, message, client=session.client, df=loaded.frame, catalog=loaded.catalog,
+                          settings=SETTINGS, profile=loaded.profile):
         rendered = _event_message(event)
         if event.kind == "explanation" and messages:
             messages[0] = rendered  # update the "How I computed this" message in place
@@ -373,14 +388,16 @@ with gr.Blocks(title="Finance Summary & QA") as app:
                 )
                 refresh_data_button = gr.Button("Refresh data", scale=1)
             chat_status = gr.Markdown("")
+            chatbot = gr.Chatbot(height=620, label="Finance chat")
             gr.ChatInterface(
                 fn=chat_respond,
-                chatbot=gr.Chatbot(height=620, label="Finance chat"),
+                chatbot=chatbot,
                 examples=CHAT_EXAMPLES,
                 concurrency_limit=1,
             )
             focus_dropdown.change(set_focus_month, inputs=[focus_dropdown], outputs=None)
-            refresh_data_button.click(refresh_chat_data, outputs=[focus_dropdown, chat_status])
+            refresh_data_button.click(refresh_chat_data, outputs=[focus_dropdown, chat_status, chatbot])
+    app.load(load_chat_examples, outputs=[chatbot])
 
 
 if __name__ == "__main__":

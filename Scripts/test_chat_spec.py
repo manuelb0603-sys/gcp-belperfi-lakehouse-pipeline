@@ -84,8 +84,15 @@ class TestResolvePeriod(unittest.TestCase):
         self.assertTrue(any("swapped" in note for note in swapped.notes))
 
     def test_period_without_data_is_noted(self):
-        resolved = resolve_period(AnalysisSpec(period="last_month"), TODAY, DATA_MIN, date(2026, 8, 20))
+        resolved = resolve_period(AnalysisSpec(period="last_year"), TODAY, date(2026, 6, 15), date(2026, 8, 20))
         self.assertTrue(any("No data" in note for note in resolved.notes))
+
+    def test_stale_data_anchors_last_month_to_latest_complete_month(self):
+        # Data ending before this month: "last month" is the latest complete month, not an empty September.
+        resolved = resolve_period(AnalysisSpec(period="last_month"), TODAY, DATA_MIN, date(2026, 8, 20))
+        self.assertEqual((resolved.start, resolved.end), (date(2026, 7, 1), date(2026, 7, 31)))
+        self.assertIn("Data ends Aug 20, 2026; 'last month' = Jul 2026 (the latest complete month).", resolved.notes)
+        self.assertFalse(any("No data" in note for note in resolved.notes))
 
     def test_comparison_periods(self):
         current = period(period="last_quarter")

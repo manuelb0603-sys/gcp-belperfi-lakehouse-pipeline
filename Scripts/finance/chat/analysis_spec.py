@@ -61,11 +61,34 @@ DIMENSION_LABELS: dict[str, str] = {
     "issuer": "card", "merchant": "merchant",
 }
 
+# Chart readability limits shared by validate_and_repair and the executor's auto chart.
+LINE_MIN_POINTS = 3
+HEATMAP_MAX_ROWS = 15
+HEATMAP_MAX_COLUMNS = 12
+PIE_MAX_SLICES = 6
+# Usable substitutes for a dimension the data profile marks limited or unusable, in order.
+DIMENSION_ALTERNATIVES: dict[str, tuple[str, ...]] = {
+    "merchant": ("category", "parent_group"),
+    "category": ("parent_group",),
+    "parent_group": ("category",),
+    "issuer": (),
+    "day_of_month": ("weekday",),
+    "weekday": (),
+}
+
 _DATE_TEXT = re.compile(r"^\d{4}-\d{2}(?:-\d{2})?$")
 
 
 class SpecError(ValueError):
     """The spec cannot be executed; the message says why and lists valid alternatives."""
+
+
+class Limitation(str):
+    """A note about a data limitation or a profile-driven repair that the answer must mention.
+
+    It is a plain ``str`` everywhere (lists, JSON); the executor copies these notes into the
+    summary's ``limitations`` field, which compaction keeps as long as possible.
+    """
 
 
 def _as_list(value: Any) -> Any:
@@ -217,6 +240,36 @@ def _fmt_day(value: date) -> str:
     return f"{value:%b} {value.day}, {value.year}"
 
 
+# A month counts as complete when the data starts at most this many days after its first day
+# and ends at most this many days before its last day (and the month is over).
+COMPLETE_EDGE_DAYS = 2
+RELATIVE_PERIODS = (
+    "this_month", "last_month", "last_3_months", "last_6_months", "last_12_months",
+    "year_to_date", "this_quarter", "last_quarter",
+)
+
+
+def month_coverage(data_min: date, data_max: date, today: date) -> tuple[list[date], list[date]]:
+    """(complete, partial) first days of the months touched by [data_min, data_max]."""
+    complete: list[date] = []
+    partial: list[date] = []
+    if data_min > data_max:
+        return complete, partial
+    month = _month_start(data_min)
+    while month <= data_max:
+        end = month_end(month)
+        starts = data_min <= month + timedelta(days=COMPLETE_EDGE_DAYS)
+        ends = data_max >= end - timedelta(days=COMPLETE_EDGE_DAYS) and today > end
+        (complete if starts and ends else partial).append(month)
+        month = shift_months(month, 1)
+    return complete, partial
+
+
+def latest_complete_month(data_min: date, data_max: date, today: date) -> date | None:
+    complete, _ = month_coverage(data_min, data_max, today)
+    return complete[-1] if complete else None
+
+
 def period_label(start: date, end: date) -> str:
     """Readable label: 'September 2026', 'Jul–Sep 2026', 'Jan 2025–Dec 2025', or day ranges."""
     if start > end:
@@ -307,11 +360,75 @@ def resolve_period(
                 )
                 start, end = clamped
 
+    if period in RELATIVE_PERIODS and data_max < this_month and end > data_max:
+        anchored = _anchor_to_data_end(period, data_min, data_max, today)
+        if anchored is not None:
+            start, end, name, note = anchored
+            notes.append(note)
+
     if end < data_min or start > data_max:
         notes.append(f"No data in this period; available data covers {_fmt_day(data_min)} – {_fmt_day(data_max)}.")
-    elif end > data_max and period not in ("all",):
-        notes.append(f"Data currently ends {_fmt_day(data_max)}, so this period is incomplete.")
+    else:
+        if end > data_max and period not in ("all",):
+            notes.append(f"Data currently ends {_fmt_day(data_max)}, so this period is incomplete.")
+        if start < data_min and period not in ("all", "custom"):
+            notes.append(f"Data starts {_fmt_day(data_min)}, so the start of this period is partial.")
     return _period(start, end, name, notes)
+
+
+def _anchor_to_data_end(
+    period: str, data_min: date, data_max: date, today: date
+) -> tuple[date, date, str, Limitation] | None:
+    """Re-anchor a relative period to the end of the data when the data stops before this month.
+
+    "this month", "this quarter", and "year to date" end at the last data date; "last month" is
+    the latest complete month and "last N months"/"last quarter" end with it.
+    """
+    latest = latest_complete_month(data_min, data_max, today)
+    anchor = _month_start(data_max)
+    ends = f"Data ends {_fmt_day(data_max)}"
+
+    def whole(month: date) -> tuple[date, date]:
+        return month, (month_end(month) if month == latest else min(month_end(month), data_max))
+
+    if period == "this_month":
+        start, end = whole(anchor)
+        state = "complete" if anchor == latest else "partial"
+        return start, end, "latest month with data", Limitation(f"{ends}; 'this month' = {anchor:%b %Y} ({state}).")
+    if period == "last_month":
+        month = latest or anchor
+        start, end = whole(month)
+        state = "the latest complete month" if month == latest else "partial; no complete month yet"
+        return start, end, None, Limitation(f"{ends}; 'last month' = {month:%b %Y} ({state}).")
+    if period in ("last_3_months", "last_6_months", "last_12_months"):
+        count = int(period.split("_")[1])
+        last = latest or anchor
+        start, end = shift_months(last, -(count - 1)), whole(last)[1]
+        label = period_label(start, end) if end == month_end(end) else f"{start:%b %Y}–{_fmt_day(end)}"
+        return start, end, f"last {count} months", Limitation(
+            f"{ends}; 'last {count} months' = {label} "
+            f"({'ending with the latest complete month' if last == latest else 'no complete month yet'})."
+        )
+    if period == "year_to_date":
+        start = date(data_max.year, 1, 1)
+        return start, data_max, "year to date", Limitation(f"{ends}; 'year to date' = Jan 1 – {_fmt_day(data_max)}.")
+    if period == "this_quarter":
+        start = _quarter_start(data_max)
+        return start, data_max, "latest quarter with data", Limitation(
+            f"{ends}; 'this quarter' = {_fmt_day(start)} – {_fmt_day(data_max)} (partial)."
+        )
+    if period == "last_quarter" and latest is not None:
+        last = latest
+        while last.month % 3:
+            last = shift_months(last, -1)
+        start = shift_months(last, -2)
+        complete, _ = month_coverage(data_min, data_max, today)
+        if start not in complete or last not in complete:
+            return None
+        return start, month_end(last), "last quarter", Limitation(
+            f"{ends}; 'last quarter' = {start:%b}–{last:%b %Y} (the latest complete quarter)."
+        )
+    return None
 
 
 def comparison_period(current: ResolvedPeriod, compare_to: str) -> tuple[ResolvedPeriod, int, int] | None:
@@ -382,9 +499,79 @@ def _catalog_dates(catalog: Mapping[str, Any]) -> tuple[date | None, date | None
     return to_date(dates.get("min")), to_date(dates.get("max"))
 
 
-def _estimated_slices(spec: AnalysisSpec, dimension: str, catalog: Mapping[str, Any], months: int) -> int:
+def _profile_dimension(profile: Any, dimension: str) -> Any:
+    dimensions = getattr(profile, "dimensions", None) or {}
+    return dimensions.get(dimension)
+
+
+def _status(profile: Any, dimension: str) -> tuple[str, str]:
+    """(status, reason) from the data profile; everything is usable without a profile."""
+    info = _profile_dimension(profile, dimension)
+    return (info.status, info.reason) if info is not None else ("usable", "")
+
+
+def heatmap_fits(sizes: Sequence[int]) -> bool:
+    """A heatmap stays readable up to HEATMAP_MAX_ROWS x HEATMAP_MAX_COLUMNS cells (either way round)."""
+    large, small = max(sizes), min(sizes)
+    return large <= HEATMAP_MAX_ROWS and small <= HEATMAP_MAX_COLUMNS
+
+
+def time_points(dimension: str, start: date, end: date) -> int:
+    """Number of points a time dimension has over [start, end]."""
+    if dimension == "quarter":
+        return (end.year * 4 + (end.month - 1) // 3) - (start.year * 4 + (start.month - 1) // 3) + 1
+    if dimension == "week":
+        return ((end - start).days + start.weekday()) // 7 + 1
+    return months_between(start, end)
+
+
+def _repair_dimensions(group_by: list[str], filters: Mapping[str, Any], profile: Any, notes: list[str]) -> list[str]:
+    """Swap dimensions the data profile marks limited/unusable for the best usable alternative.
+
+    Merchant grouping is kept when the user filters to specific merchants. Time dimensions are
+    kept (with a note): a month table is still correct, only thin.
+    """
+    if profile is None:
+        return group_by
+    repaired: list[str] = []
+    for dim in group_by:
+        status, reason = _status(profile, dim)
+        if status == "usable":
+            repaired.append(dim)
+            continue
+        label = DIMENSION_LABELS[dim]
+        if dim == "merchant" and (filters.get("merchant") or filters.get("merchant_contains")):
+            repaired.append(dim)
+            continue
+        if dim in TIME_DIMENSIONS:
+            repaired.append(dim)
+            notes.append(Limitation(f"Results by {label} are limited: {reason}."))
+            continue
+        alternative = next(
+            (alt for alt in DIMENSION_ALTERNATIVES.get(dim, ())
+             if alt not in group_by and alt not in repaired and _status(profile, alt)[0] == "usable"),
+            None,
+        )
+        if alternative:
+            repaired.append(alternative)
+            notes.append(Limitation(
+                f"Grouping by {label} isn't meaningful for this data ({reason}), so I grouped by "
+                f"{DIMENSION_LABELS[alternative]} instead."
+            ))
+        elif status == "unusable":
+            notes.append(Limitation(f"Grouping by {label} isn't possible with this data ({reason}), so it was left out."))
+        else:
+            repaired.append(dim)
+            notes.append(Limitation(f"Results by {label} are limited: {reason}."))
+    return repaired
+
+
+def _estimated_slices(
+    spec: AnalysisSpec, dimension: str, catalog: Mapping[str, Any], months: int, profile: Any = None
+) -> int:
     filters = spec.filters
-    if spec.top_n:
+    folds = dimension in CATEGORICAL_DIMENSIONS or not any(dim in CATEGORICAL_DIMENSIONS for dim in spec.group_by)
+    if spec.top_n and folds:  # top_n folds the first categorical dimension (else it keeps the top rows)
         return spec.top_n + 1
     if dimension == "category":
         return len(filters.category) or len(catalog.get("categories") or {}) - len(filters.exclude_category)
@@ -393,7 +580,8 @@ def _estimated_slices(spec: AnalysisSpec, dimension: str, catalog: Mapping[str, 
     if dimension == "issuer":
         return len(filters.issuer) or len(catalog.get("issuers") or [])
     if dimension == "merchant":
-        return len(filters.merchant) or 99
+        info = _profile_dimension(profile, "merchant")
+        return len(filters.merchant) or (info.distinct if info is not None else 99)
     return {"weekday": 7, "month": months, "quarter": max(1, months // 3), "week": months * 4, "day_of_month": 31}.get(dimension, 99)
 
 
@@ -404,8 +592,13 @@ def validate_and_repair(
     known_merchants: Sequence[str] | None = None,
     today: date | None = None,
     focus_month: date | None = None,
+    profile: Any = None,
 ) -> tuple[AnalysisSpec, list[str]]:
     """Return a runnable copy of the spec plus notes describing every repair.
+
+    With a data ``profile`` (``profile.DataProfile``), group-by dimensions the profile marks
+    limited or unusable are swapped for usable ones (merchant -> category) unless the user
+    filtered to specific merchants; those notes are ``Limitation`` strings the answer must mention.
 
     Raises SpecError (a ValueError) when a filter value matches nothing in the catalog;
     the message lists the closest valid values so the model can retry.
@@ -461,7 +654,8 @@ def validate_and_repair(
             notes.append(f"Custom dates were limited to the available data ({data_min.isoformat()} to {data_max.isoformat()}).")
         data["date_from"], data["date_to"] = start.isoformat(), end.isoformat()
 
-    group_by: list[str] = data["group_by"]
+    group_by: list[str] = _repair_dimensions(list(data["group_by"]), filters, profile, notes)
+    data["group_by"] = group_by
     if "merchant" in group_by and not data["top_n"]:
         data["top_n"] = 10
         notes.append("Showing the top 10 merchants; the rest are grouped as Other.")
@@ -486,7 +680,8 @@ def validate_and_repair(
         else:
             order = ["weekday", "month"] if data["metric"] == "transaction_count" else ["month", "weekday"]
             extra = next(
-                (dim for dim in order if dim not in group_by and (dim != "month" or months >= 3) and not (dim == "month" and has_time)),
+                (dim for dim in order if dim not in group_by and (dim != "month" or months >= 3)
+                 and not (dim == "month" and has_time) and _status(profile, dim)[0] == "usable"),
                 None,
             )
             if extra:
@@ -495,9 +690,22 @@ def validate_and_repair(
             else:
                 chart = "bar"
                 notes.append("A heatmap needs two dimensions; showing a bar chart instead.")
+    if chart == "heatmap" and len(group_by) == 2:
+        sizes = [_estimated_slices(candidate, dim, catalog, months, profile) for dim in group_by]
+        if not heatmap_fits(sizes):
+            chart = "auto"
+            notes.append(
+                f"A heatmap of about {sizes[0]} x {sizes[1]} cells is hard to read (at most "
+                f"{HEATMAP_MAX_ROWS} x {HEATMAP_MAX_COLUMNS}), so a simpler chart was chosen."
+            )
     if chart == "line" and not has_time:
         chart = "bar"
         notes.append("A line chart needs a month, quarter, or week dimension; showing a bar chart instead.")
+    elif chart == "line" and len(group_by) == 1:
+        points = time_points(group_by[0], period.start, period.end)
+        if points < LINE_MIN_POINTS:
+            chart = "bar"
+            notes.append(f"A line chart needs at least {LINE_MIN_POINTS} points and this period has {points}; showing bars instead.")
     if chart in ("stacked_bar", "grouped_bar") and len(group_by) < 2:
         chart = "bar"
         notes.append("Stacked and grouped bars need two dimensions; showing a bar chart instead.")
@@ -505,7 +713,7 @@ def validate_and_repair(
         if len(group_by) != 1:
             chart = "bar"
             notes.append("A pie chart needs exactly one dimension; showing a bar chart instead.")
-        elif _estimated_slices(candidate, group_by[0], catalog, months) > 6:
+        elif _estimated_slices(candidate, group_by[0], catalog, months, profile) > PIE_MAX_SLICES:
             chart = "bar"
             notes.append("A pie chart with more than 6 slices is hard to read; showing a bar chart instead.")
     data["chart"] = chart

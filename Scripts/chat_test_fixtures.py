@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 TODAY = date(2026, 10, 5)
@@ -70,3 +70,93 @@ def fixture_frame():
     from finance.chat.data import frame_from_rows
 
     return frame_from_rows(raw_rows())
+
+
+# ----- profile fixtures -----
+
+CATEGORY_GROUPS = (
+    ("Groceries", "Needs"), ("Food & Drink", "Wants"), ("Shopping", "Wants"), ("Automotive", "Needs"),
+    ("Bills & Utilities", "Needs"), ("Health & Wellness", "Needs"), ("Travel", "Wants"), ("Entertainment", "Wants"),
+    ("Professional & Business Services", "Payments & Others"), ("Gifts & Donations", "Wants"), ("Other", "Payments & Others"),
+)
+_SURNAMES = (
+    "Adams Baker Carter Davis Ellis Foster Garcia Harris Irwin Jensen Keller Lopez Morris Nolan Owens Parker Quinn "
+    "Reyes Sanders Turner Underwood Vargas Walker Young Zimmerman Brooks Collins Dawson Fleming Grant Hughes Ingram "
+    "Jordan Knight Lawson Mason Norris Ortiz Porter Russell"
+).split()
+_SUFFIXES = ("LLC", "Inc", "Group", "PLC", "Ltd", "and Sons")
+
+SPARSE_TODAY = date(2026, 10, 6)
+SPARSE_START, SPARSE_END = date(2025, 8, 20), date(2026, 8, 19)
+SPARSE_MERCHANTS = 531
+
+
+def _company_names(count: int, rng) -> list[str]:
+    names = [f"{a} {b} {suffix}" for a in _SURNAMES for b in _SURNAMES if a != b for suffix in _SUFFIXES[:1]]
+    names += [f"{a}-{b} {suffix}" for a in _SURNAMES for b in _SURNAMES if a != b for suffix in _SUFFIXES[1:2]]
+    rng.shuffle(names)
+    return names[:count]
+
+
+def _row(day, issuer, description, amount, kind, category, group) -> dict:
+    return {"transaction_date": day, "issuer": issuer, "description": description, "amount": Decimal(f"{amount:.2f}"),
+            "transaction_type": kind, "category": category, "parent_group": group}
+
+
+def sparse_merchant_rows(seed: int = 42) -> list[dict]:
+    """Shaped like the mock gold data: 600 purchases/returns from 2025-08-20 to 2026-08-19 at 531 nearly
+    unique (Faker-style company) merchants, plus monthly card payments."""
+    import random
+
+    rng = random.Random(seed)
+    names = _company_names(SPARSE_MERCHANTS, rng)
+    merchants = names + [rng.choice(names) for _ in range(600 - len(names))]
+    rng.shuffle(merchants)
+    span = (SPARSE_END - SPARSE_START).days
+    rows = []
+    for index, name in enumerate(merchants):
+        day = SPARSE_START + timedelta(days=0 if index == 0 else span if index == 1 else rng.randint(0, span))
+        category, group = CATEGORY_GROUPS[index % len(CATEGORY_GROUPS)]
+        returned = index % 30 == 29
+        amount = rng.uniform(5, 300) * (1 if returned else -1)
+        rows.append(_row(day, rng.choice(("Amex", "Chase")), name.upper(), amount, "Return" if returned else "Sale",
+                         category, group))
+    month = date(2025, 9, 1)
+    while month <= SPARSE_END:
+        rows.append(_row(month + timedelta(days=4), "Chase", "AUTOMATIC PAYMENT - THANK", 900, "Payment",
+                         "Payments", "Payments & Others"))
+        month = date(month.year + month.month // 12, month.month % 12 + 1, 1)
+    return rows
+
+
+REPEATING_TODAY = date(2026, 10, 6)
+REPEATING_START, REPEATING_END = date(2026, 3, 1), date(2026, 10, 3)
+REPEATING_MERCHANTS = (
+    ("WHOLEFDS MKT #10234", "Groceries", "Needs"), ("TRADER JOE S #552", "Groceries", "Needs"),
+    ("SAFEWAY #1188", "Groceries", "Needs"), ("STARBUCKS STORE 12345", "Food & Drink", "Wants"),
+    ("SQ *BLUE BOTTLE COFFEE", "Food & Drink", "Wants"), ("TST* SUSHI ZEN", "Food & Drink", "Wants"),
+    ("CHIPOTLE 0456", "Food & Drink", "Wants"), ("AMZN Mktp US*2K3LM1", "Shopping", "Wants"),
+    ("TARGET 00012345", "Shopping", "Wants"), ("SHELL OIL 57444", "Automotive", "Needs"),
+    ("CHEVRON 0012", "Automotive", "Needs"), ("COMCAST CABLE", "Bills & Utilities", "Needs"),
+    ("CVS PHARMACY #0789", "Health & Wellness", "Needs"), ("NETFLIX.COM", "Entertainment", "Wants"),
+)
+
+
+def repeating_merchant_rows(seed: int = 7) -> list[dict]:
+    """Realistic recurring merchants: 14 merchants, about 20 visits each, 2026-03-01 to 2026-10-03."""
+    import random
+
+    rng = random.Random(seed)
+    span = (REPEATING_END - REPEATING_START).days
+    rows = []
+    for index in range(280):
+        description, category, group = REPEATING_MERCHANTS[index % len(REPEATING_MERCHANTS)]
+        day = REPEATING_START + timedelta(days=0 if index == 0 else span if index == 1 else rng.randint(0, span))
+        rows.append(_row(day, "Amex" if index % 3 else "Chase", description, -rng.uniform(4, 180), "Sale", category, group))
+    return rows
+
+
+def frame_of(rows):
+    from finance.chat.data import frame_from_rows
+
+    return frame_from_rows(rows)

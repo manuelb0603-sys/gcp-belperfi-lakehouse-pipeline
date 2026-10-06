@@ -89,6 +89,26 @@ class TestChatApp(unittest.TestCase):
             [[message]] = list(self.app.chat_respond("hi", [], request))
         self.assertIn("No model configured", message.content)
 
+    def test_example_chips_come_from_the_data_profile(self):
+        from chat_test_fixtures import SPARSE_TODAY, frame_of, sparse_merchant_rows
+        from finance.chat.data import ChatData, build_catalog
+        from finance.chat.profile import build_data_profile
+
+        frame = frame_of(sparse_merchant_rows())
+        loaded = ChatData(frame, build_catalog(frame), build_data_profile(frame, today=SPARSE_TODAY))
+        self.assertEqual(self.app.CHAT_EXAMPLES, list(self.app.chat_prompts.STATIC_EXAMPLES))
+        with patch.object(self.app.chat_data, "load_chat_data", return_value=loaded):
+            update = self.app.load_chat_examples()
+            focus, status, chips = self.app.refresh_chat_data()
+        texts = [example["text"] for example in update["examples"]]
+        self.assertIn("Compare Amex vs Chase by month", texts)
+        self.assertFalse(any("merchant" in text.lower() or "store" in text.lower() for text in texts))
+        self.assertEqual(chips, update)
+        self.assertIn("Loaded 600 transactions from 2025-08-20 to 2026-08-19.", status)
+        with patch.object(self.app.chat_data, "load_chat_data", side_effect=RuntimeError("bigquery down")):
+            fallback = self.app.load_chat_examples()
+        self.assertEqual([e["text"] for e in fallback["examples"]], list(self.app.chat_prompts.STATIC_EXAMPLES))
+
     def test_focus_month_is_per_session(self):
         request = SimpleNamespace(session_hash="focus")
         self.app.set_focus_month("2026-08", request)
