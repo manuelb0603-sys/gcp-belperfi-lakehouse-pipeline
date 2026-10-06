@@ -267,6 +267,7 @@ def generate_finance_report(
         timeout=settings.ollama_timeout,
         author_client=author_client,
         validator_client=validator_client,
+        guidance=settings.guidance,
     )
     if trace_listeners:
         harness.trace.listeners.extend(trace_listeners)
@@ -286,7 +287,7 @@ def generate_finance_report(
             prompt_context=prompt_context,
             validator_context=validator_context,
             tools=tools,
-            report_requirements=build_report_requirements(snapshot),
+            report_requirements=build_report_requirements(snapshot, settings.guidance),
         )
     except Exception as exc:
         trace.add("exception", phase="finance_report_generation", exception_type=type(exc).__name__, error=str(exc))
@@ -311,6 +312,7 @@ def generate_finance_report(
         "author_provider": author_client.provider,
         "validator_provider": validator_client.provider,
         "mode": "agent",
+        "guidance": settings.guidance,
         "status": "validated" if decision and decision.passed else "validation_failed",
         "validation": decision.decision if decision else "error",
         "runtime_seconds": round(time.perf_counter() - started, 3),

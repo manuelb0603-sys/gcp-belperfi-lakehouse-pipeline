@@ -46,12 +46,17 @@ def _authoritative_values(text: str, snapshot: ReportSnapshot) -> dict[str, Any]
     return values
 
 
-def focused_feedback(decision: ValidationDecision, snapshot: ReportSnapshot) -> dict[str, Any]:
-    """Top-priority error findings for the next revision, with the exact snapshot values they concern."""
+def focused_feedback(
+    decision: ValidationDecision, snapshot: ReportSnapshot, max_findings: int | None = MAX_REVISION_FINDINGS
+) -> dict[str, Any]:
+    """Prioritized error findings for the next revision, with the exact snapshot values they concern.
+
+    Strict guidance sends the top MAX_REVISION_FINDINGS; max_findings=None (guided) sends every error.
+    """
     errors = [finding for finding in decision.findings if finding.severity.lower() == "error"]
     rank = {category: index for index, category in enumerate(FEEDBACK_PRIORITY)}
     ordered = sorted(enumerate(errors), key=lambda item: (rank.get(item[1].category, len(rank)), item[0]))
-    selected = [finding for _, finding in ordered[:MAX_REVISION_FINDINGS]]
+    selected = [finding for _, finding in (ordered if max_findings is None else ordered[:max_findings])]
     fixes = []
     for finding in selected:
         item: dict[str, Any] = {

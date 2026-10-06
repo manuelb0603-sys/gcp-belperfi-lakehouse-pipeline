@@ -22,7 +22,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .budget import BudgetGuard, guard_from_settings
 from .pricing import cost_usd, worst_case_call_usd
-from .settings import DEFAULTS
+from .settings import DEFAULTS, GUIDANCE_MODES
 
 
 logger = logging.getLogger(__name__)
@@ -520,6 +520,8 @@ def resolve_model_role(config: Any, role: str) -> dict[str, Any]:
     model_roles[role] wins when present; otherwise the legacy keys apply (author: model_name;
     validator: validator_model_name, else model_name; ollama_options[role]; model_server_url).
     The "eval" role falls back to the validator's settings when it is not configured.
+    model_roles.author.guidance ("strict" or "guided") is kept as the author's "guidance" key
+    (it overrides the top-level guidance; see finance.settings), even when the entry has no model.
     """
     if role not in MODEL_ROLES:
         raise ValueError(f"Unknown model role {role!r}; expected one of {', '.join(MODEL_ROLES)}")
@@ -527,6 +529,11 @@ def resolve_model_role(config: Any, role: str) -> dict[str, Any]:
         return config.role(role)  # a ReportSettings: roles were resolved once when it was built
     roles = config.get("model_roles")
     entry = roles.get(role) if isinstance(roles, dict) else None
+    guidance = entry.get("guidance") if role == "author" and isinstance(entry, dict) else None
+    if guidance is not None:
+        if not isinstance(guidance, str) or guidance.strip().lower() not in GUIDANCE_MODES:
+            raise ValueError(f"model_roles.author.guidance must be one of {', '.join(GUIDANCE_MODES)}, got {guidance!r}")
+        guidance = guidance.strip().lower()
     if not isinstance(entry, dict) or not entry.get("model"):
         if role == "eval":
             return {**resolve_model_role(config, "validator"), "role": "eval"}
@@ -578,6 +585,8 @@ def resolve_model_role(config: Any, role: str) -> dict[str, Any]:
         resolved["thinking"] = thinking
     else:
         raise ValueError(f"Unsupported provider {provider!r} for model role {role!r} (use 'ollama' or 'anthropic')")
+    if guidance is not None:
+        resolved["guidance"] = guidance
     return resolved
 
 

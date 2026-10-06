@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable
 
 from ..settings import DEFAULTS
@@ -34,6 +34,26 @@ class HarnessLimits:
     max_report_bytes: int = DEFAULTS["max_report_bytes"]
     # Wall-clock budget for the whole run in seconds; None or <= 0 disables the deadline.
     max_run_seconds: float | None = DEFAULTS["max_run_seconds"]
+
+
+# Guided guidance multiplies the tool budgets (rounds, cycles, and the run deadline are unchanged).
+GUIDED_TOOL_LIMIT_FACTOR = 2
+
+
+def effective_limits(limits: HarnessLimits, guidance: str | None = "strict") -> HarnessLimits:
+    """The limits a run uses: the configured ones, with max_tool_calls and max_calls_per_tool doubled when guided."""
+    if guidance != "guided":
+        return limits
+    return replace(
+        limits,
+        max_tool_calls=limits.max_tool_calls * GUIDED_TOOL_LIMIT_FACTOR,
+        max_calls_per_tool=limits.max_calls_per_tool * GUIDED_TOOL_LIMIT_FACTOR,
+    )
+
+
+def limits_dict(limits: HarnessLimits) -> dict[str, Any]:
+    """HarnessLimits as a plain dict (for trace events and run metadata)."""
+    return asdict(limits)
 
 
 @dataclass

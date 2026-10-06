@@ -29,7 +29,8 @@ from .feedback import (
 )
 from .html_safety import sanitize_html
 from ..model_clients import ModelClient, OllamaClient
-from ..settings import DEFAULTS
+from ..settings import DEFAULTS, GUIDANCE_MODES
+from .feedback import MAX_REVISION_FINDINGS
 from .prompts import (
     MISSING_REPORT_HTML,
     PromptParts,
@@ -47,7 +48,7 @@ from .prompts import (
     validator_prompt_parts,
 )
 from .protocol import VALIDATOR_RESPONSE_SCHEMA, parse_author_response, parse_json_response
-from .trace import HarnessLimits, RunTrace, ToolSpec
+from .trace import HarnessLimits, RunTrace, ToolSpec, effective_limits, limits_dict
 from .transport import QueryFunctionClient, _response_meta
 
 
@@ -135,6 +136,7 @@ class ReportHarness:
         clock: Callable[[], float] = time.monotonic,
         author_client: ModelClient | None = None,
         validator_client: ModelClient | None = None,
+        guidance: str = "strict",
     ) -> None:
         """Create a bounded agent harness with a separate author and validator model.
 
@@ -148,9 +150,16 @@ class ReportHarness:
         **role_options)`` callable (tests inject fakes this way). timeout is the per-call maximum;
         with limits.max_run_seconds set, each call is also capped at the time left in the run.
         clock supplies the run-deadline time (injectable for tests).
+        guidance is "strict" (default: exact checklist wording, top-three minimal-edit revisions) or
+        "guided" (guided author/validator addenda and checklist, every error finding in revisions, and
+        doubled max_tool_calls/max_calls_per_tool); self.limits holds the effective limits.
         """
+        if guidance not in GUIDANCE_MODES:
+            raise ValueError(f"guidance must be one of {', '.join(GUIDANCE_MODES)}, got {guidance!r}")
+        self.guidance = guidance
         self.ollama_url = ollama_url
-        self.limits = limits or HarnessLimits()
+        self.configured_limits = limits or HarnessLimits()
+        self.limits = effective_limits(self.configured_limits, guidance)
         self.timeout = timeout
         self.query = query
         self.model_options = model_options or {}
@@ -609,14 +618,10 @@ class ReportHarness:
             validator_model=self.validator_model,
             author_provider=self._provider(self.author_client),
             validator_provider=self._provider(self.validator_client),
-            limits={
-                "max_agent_rounds": self.limits.max_agent_rounds,
-                "max_tool_calls": self.limits.max_tool_calls,
-                "max_calls_per_tool": self.limits.max_calls_per_tool,
-                "max_validation_cycles": self.limits.max_validation_cycles,
-                "max_report_bytes": self.limits.max_report_bytes,
-                "max_run_seconds": self.limits.max_run_seconds,
-            },
+            guidance=self.guidance,
+            # The effective limits (guided doubles the tool budgets); configured_limits are the settings values.
+            limits=limits_dict(self.limits),
+            **({"configured_limits": limits_dict(self.configured_limits)} if self.limits != self.configured_limits else {}),
             deadline_seconds=deadline_seconds,
             tool_names=sorted(tools),
         )
@@ -827,7 +832,8 @@ class ReportHarness:
         the deterministic fallback) is ever returned.
         """
         state = _AuthorState(base_prompt=author_base_prompt(
-            prompt_context, objective, json.dumps(snapshot.to_dict(), indent=2), report_requirements, self._tool_prompt(tools)
+            prompt_context, objective, json.dumps(snapshot.to_dict(), indent=2), report_requirements, self._tool_prompt(tools),
+            self.guidance,
         ))
         try:
             report = self._initial_draft(tools, state)
@@ -1047,6 +1053,7 @@ class ReportHarness:
             vstate.previous_validation,
             state.resolved_labels(),
             vstate.rebuttals,
+            self.guidance,
         )
 
     def _record_progress(
@@ -1136,10 +1143,14 @@ class ReportHarness:
         state: _AuthorState,
         vstate: _ValidationState,
     ) -> RunResult | None:
-        """Ask the author to fix the top findings; returns the run result when the run must stop."""
+        """Ask the author to fix the findings (top three when strict, all when guided); returns the run result when the run must stop."""
         # Replace (not append) the revision request so only the latest attempt is in context.
+        max_findings = None if self.guidance == "guided" else MAX_REVISION_FINDINGS
         state.revision_block = revision_block(
-            vstate.revision_html, focused_feedback(vstate.decision, snapshot), state.resolved_labels()
+            vstate.revision_html,
+            focused_feedback(vstate.decision, snapshot, max_findings),
+            state.resolved_labels(),
+            self.guidance,
         )
         try:
             vstate.report = self._author_loop("revision", tools, state)

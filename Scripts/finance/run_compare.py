@@ -71,6 +71,8 @@ Write a clear comparison in GitHub-flavored Markdown with these sections:
 
 Before attributing a difference in outcome to the models, compare the runs' code_version: runs on different commits, or with dirty=true, may differ because of code or prompt changes rather than the models, so say so and weigh model conclusions accordingly (a missing code_version is "not recorded").
 
+Also compare each run's guidance ("strict" or "guided"; "not recorded" for runs made before the setting existed, which behaved as strict). Guided runs let the author choose headings, wording, and structure and add an advisor alternative plan, give revisions every validator error instead of the top three, and double the tool budgets, so outcome differences between modes may come from the mode rather than the models.
+
 Rules: cite run ids and the numbers exactly as given in the data; never invent metrics, models, or events that are not in the data; say "not recorded" when something is missing. Keep it concise (about 600-1200 words). Do not reproduce the report text beyond short quotes. Output only the Markdown."""
 
 
@@ -243,6 +245,7 @@ def load_run(run_dir: Path) -> dict[str, Any]:
         None,
     )
     limits = started.get("limits") or manifest.get("harness_limits") or progress.get("harness_limits")
+    guidance = pick("guidance") or manifest.get("guidance")
 
     return {
         "run_id": run_dir.name,
@@ -250,6 +253,7 @@ def load_run(run_dir: Path) -> dict[str, Any]:
         "end": "running" if times["running"] else format_local(times["end"]),
         "duration_seconds": times["duration_seconds"],
         "code_version": code_version,
+        "guidance": guidance,
         "models": models,
         "options": options,
         "limits": limits,
@@ -331,6 +335,7 @@ def render_run(raw: dict[str, Any], level: int = 0) -> dict[str, Any]:
         "end": raw["end"],
         "duration_seconds": raw["duration_seconds"],
         "code_version": raw.get("code_version") or "not recorded",
+        "guidance": raw.get("guidance") or "not recorded",
         "models": raw["models"],
     }
     if raw["options"]:

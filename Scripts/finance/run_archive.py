@@ -41,17 +41,26 @@ def git_code_version(cwd: Path | None = None, runner: Callable[[list[str], Path]
 
 
 def collect_run_metadata(settings: Any, code_version: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Run-start metadata for run.json/progress.json: code version, author/validator role settings, limits.
+    """Run-start metadata for run.json/progress.json: code version, guidance, author/validator role settings, limits.
 
     settings is a finance.settings.ReportSettings. Role settings hold provider, model, options,
-    think, and timeouts only; server URLs and credentials are never included.
+    think, and timeouts only; server URLs and credentials are never included. guidance is the
+    effective mode; harness_limits are the configured values (guided runs double the tool budgets,
+    recorded as effective_harness_limits).
     """
-    return {
+    from .harness.trace import HarnessLimits, effective_limits, limits_dict  # lazy: keeps run_archive imports light
+
+    metadata = {
         "code_version": code_version if code_version is not None else git_code_version(),
+        "guidance": settings.guidance,
         "author_role": settings.public_role("author"),
         "validator_role": settings.public_role("validator"),
         "harness_limits": settings.limits(),
     }
+    effective = limits_dict(effective_limits(HarnessLimits(**settings.limits()), settings.guidance))
+    if effective != metadata["harness_limits"]:
+        metadata["effective_harness_limits"] = effective
+    return metadata
 
 
 def save_run(root: Path, run_id: str, manifest: dict[str, Any], trace: list[dict[str, Any]], report_html: str, report_text: str, metrics: dict[str, Any]) -> Path:
@@ -210,11 +219,14 @@ INDEX_STYLE = (
     " th{background:#f7dce8} a{color:#8d315b} button{margin:1rem 0;padding:.5rem .8rem}"
     " .panel{background:white;border:1px solid #e8ccd8;padding:1rem;margin-bottom:1rem}"
     " .muted{color:#7a6570} .nowrap{white-space:nowrap} tr.diff td{background:#fff1f5}"
+    " .table-scroll{overflow-x:auto;max-width:100%} .table-scroll table{width:auto;min-width:100%}"
+    " #comparison{overflow-x:auto} #comparison td,#comparison th{white-space:nowrap}"
+    " @media (max-width:700px){body{margin:1rem}}"
     " #compare-command{width:100%;font:13px ui-monospace,Consolas,monospace;padding:.4rem;box-sizing:border-box}"
 )
 
 INDEX_SCRIPT = r"""
-const keys = ['start','end','model','author_provider','validator_model','validator_provider','mode','status','validation','cost','runtime_seconds','agent_rounds','tool_calls','validation_cycles','validator_calls','author_format_retries','validator_format_retries','initial_validation_errors','final_validation_errors','validation_error_reduction','validation_cycles_improved','validation_cycles_regressed','report_bytes'];
+const keys = ['start','end','author model','validator model','guidance','mode','status','validation','cost','runtime_seconds','agent_rounds','tool_calls','validation_cycles','validator_calls','author_format_retries','validator_format_retries','initial_validation_errors','final_validation_errors','validation_error_reduction','validation_cycles_improved','validation_cycles_regressed','report_bytes'];
 function cell(tag, text) { const el = document.createElement(tag); el.textContent = text; return el; }
 function quoteArg(id) { return /^[A-Za-z0-9_.\-]+$/.test(id) ? id : '"' + id.replace(/"/g, '') + '"'; }
 function compareSelected() {
@@ -257,18 +269,137 @@ function copyCommand() {
 """
 
 
+# Display columns derived per run by update_index (also compared side by side in the page).
+AUTHOR_MODEL_COLUMN = "author model"
+VALIDATOR_MODEL_COLUMN = "validator model"
+GUIDANCE_COLUMN = "guidance"
+_TRACE_HEAD_LINES = 5
+_TRACE_HEAD_LINE_BYTES = 65536
+INDEX_HEADERS = [
+    "run_id", "start", "end", AUTHOR_MODEL_COLUMN, VALIDATOR_MODEL_COLUMN, GUIDANCE_COLUMN, "mode", "status",
+    "validation", "cost", "runtime_seconds", "agent_rounds", "tool_calls", "validation_cycles", "validator_calls",
+    "author_format_retries", "validator_format_retries", "initial_validation_errors", "final_validation_errors",
+    "validation_error_reduction", "validation_cycles_improved", "validation_cycles_regressed", "report_bytes",
+]
+_NOWRAP_COLUMNS = frozenset({"start", "end", AUTHOR_MODEL_COLUMN, VALIDATOR_MODEL_COLUMN, GUIDANCE_COLUMN})
+
+
+def _read_json_dict(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def trace_run_started(trace_path: Path) -> dict[str, Any] | None:
+    """The run_started event from the first few trace.jsonl lines (bounded read), or None."""
+    try:
+        with Path(trace_path).open("rb") as handle:
+            for _ in range(_TRACE_HEAD_LINES):
+                line = handle.readline(_TRACE_HEAD_LINE_BYTES)
+                if not line:
+                    break
+                if b"run_started" not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(event, dict) and event.get("event") == "run_started":
+                    return event
+    except OSError:
+        return None
+    return None
+
+
+def _text(value: Any) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def run_role_models(
+    run_dir: Path,
+    run_meta: dict[str, Any] | None = None,
+    progress: dict[str, Any] | None = None,
+    metrics: dict[str, Any] | None = None,
+) -> dict[str, dict[str, str]]:
+    """Provider and model of the author and validator roles of one run ("" when unknown).
+
+    Sources in order: author_role/validator_role recorded in run.json/progress.json; the flat
+    model/validator_model plus author_provider/validator_provider fields of metrics.json
+    (then progress.json); the run_started trace event of older runs (first lines only).
+    A missing provider is filled from a later source that names the same model.
+    """
+    flat_keys = {"author": ("model", "author_provider"), "validator": ("validator_model", "validator_provider")}
+    candidates: dict[str, list[tuple[str, str]]] = {"author": [], "validator": []}
+    for role in candidates:
+        for source in (run_meta, progress):
+            meta = source.get(f"{role}_role") if isinstance(source, dict) else None
+            if isinstance(meta, dict):
+                candidates[role].append((_text(meta.get("provider")), _text(meta.get("model"))))
+        model_key, provider_key = flat_keys[role]
+        for source in (metrics, progress):
+            if isinstance(source, dict):
+                candidates[role].append((_text(source.get(provider_key)), _text(source.get(model_key))))
+
+    def resolve(options: list[tuple[str, str]]) -> dict[str, str] | None:
+        for provider, model in options:
+            if model:
+                if not provider:
+                    provider = next((p for p, m in options if p and m == model), "")
+                return {"provider": provider, "model": model}
+        return None
+
+    resolved = {role: resolve(options) for role, options in candidates.items()}
+    if any(value is None or not value["provider"] for value in resolved.values()):
+        started = trace_run_started(Path(run_dir) / "trace.jsonl") or {}
+        for role in candidates:
+            candidates[role].append((_text(started.get(f"{role}_provider")), _text(started.get(f"{role}_model"))))
+            resolved[role] = resolve(candidates[role])
+    return {role: value or {"provider": "", "model": ""} for role, value in resolved.items()}
+
+
+def model_label(provider: str, model: str) -> str:
+    """"provider:model" (just the model when the provider was not recorded), or ""."""
+    if not model:
+        return ""
+    return f"{provider}:{model}" if provider else model
+
+
+def _guidance_label(*sources: dict[str, Any] | None) -> str:
+    """The run's guidance setting from run.json/progress.json/metrics.json, or "" when absent."""
+    for source in sources:
+        if not isinstance(source, dict) or source.get("guidance") is None:
+            continue
+        value = source["guidance"]
+        if isinstance(value, bool):
+            return "on" if value else "off"
+        if isinstance(value, dict):
+            for key in ("mode", "name", "level", "value"):
+                if value.get(key) not in (None, ""):
+                    return str(value[key])
+            return json.dumps(value, sort_keys=True, default=str)
+        if isinstance(value, (list, tuple)):
+            return ", ".join(str(part) for part in value)
+        return str(value)
+    return ""
+
+
 def update_index(root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
-    run_dirs = (path for path in root.iterdir() if path.is_dir() and path.name not in NON_RUN_DIRS)
+    titles: dict[tuple[int, str], str] = {}  # (row number, column) -> model cell tooltip
+    run_dirs =(path for path in root.iterdir() if path.is_dir() and path.name not in NON_RUN_DIRS)
     for run_dir in sorted(run_dirs, reverse=True):
         # Finished runs have metrics.json; in-progress runs only have progress.json.
         try:
             progress = None
+            metrics = None
             if (run_dir / "progress.json").exists():
                 progress = json.loads((run_dir / "progress.json").read_text(encoding="utf-8"))
             if (run_dir / "metrics.json").exists():
                 item = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+                metrics = item if isinstance(item, dict) else None
             elif isinstance(progress, dict):
                 item = {
                     "model": progress.get("model"),
@@ -289,10 +420,20 @@ def update_index(root: Path) -> Path:
                 cost = progress.get("anthropic_cost_usd")
             # Blank for runs without Claude calls.
             item["cost"] = f"${cost:.4f}" if isinstance(cost, (int, float)) else None
+            run_meta = _read_json_dict(run_dir / "run.json")
+            progress_dict = progress if isinstance(progress, dict) else None
+            roles = run_role_models(run_dir, run_meta, progress_dict, metrics)
+            for role, column in (("author", AUTHOR_MODEL_COLUMN), ("validator", VALIDATOR_MODEL_COLUMN)):
+                item[column] = model_label(**roles[role])
+                if item[column]:
+                    # Tooltip: role plus full provider:model, or a note when the provider is unknown.
+                    suffix = "" if roles[role]["provider"] else " (provider not recorded)"
+                    titles[(len(rows) + 1, column)] = f"{role}: {item[column]}{suffix}"
+            item[GUIDANCE_COLUMN] = _guidance_label(run_meta, progress_dict, metrics)
             rows.append(item)
         except (OSError, json.JSONDecodeError):
             continue
-    headers = ["run_id", "start", "end", "model", "mode", "status", "validation", "cost", "runtime_seconds", "agent_rounds", "tool_calls", "validation_cycles", "validator_calls", "author_format_retries", "validator_format_retries", "initial_validation_errors", "final_validation_errors", "validation_error_reduction", "validation_cycles_improved", "validation_cycles_regressed", "report_bytes"]
+    headers = INDEX_HEADERS
     table_rows = []
     for number, item in enumerate(rows, start=1):
         run_id = html.escape(str(item.get("run_id", "")))
@@ -302,7 +443,9 @@ def update_index(root: Path) -> Path:
             value = html.escape("" if raw is None else str(raw))
             if header == "run_id":
                 value = f'<a href="{run_id}/final_report.html">{value}</a>'
-            css = ' class="nowrap"' if header in {"start", "end"} else ""
+            css = ' class="nowrap"' if header in _NOWRAP_COLUMNS else ""
+            if header in (AUTHOR_MODEL_COLUMN, VALIDATOR_MODEL_COLUMN) and value:
+                css += f' title="{html.escape(titles.get((number, header), ""), quote=True)}"'
             cells.append(f"<td{css}>{value}</td>")
         cells.append(f'<td><a href="{run_id}/trace.jsonl">trace</a></td>')
         table_rows.append("<tr>" + "".join(cells) + "</tr>")
@@ -351,7 +494,7 @@ def update_index(root: Path) -> Path:
 <style>{INDEX_STYLE}</style></head>
 <body><h1>Finance Agent Runs</h1><p>Generated {html.escape(generated)}. Start and end are local times. Select reports to inspect or compare objective run metrics.</p>
 <button onclick="compareSelected()">Compare selected runs</button>
-<table><thead><tr><th>No.</th><th>compare</th>{''.join(f'<th>{html.escape(header)}</th>' for header in headers)}<th>trace</th></tr></thead><tbody>{''.join(table_rows)}</tbody></table>
+<div class="table-scroll"><table><thead><tr><th>No.</th><th>compare</th>{''.join(f'<th>{html.escape(header)}</th>' for header in headers)}<th>trace</th></tr></thead><tbody>{''.join(table_rows)}</tbody></table></div>
 <h2>Comparison</h2>
 <div id="comparison" class="panel">Select two or more runs and choose Compare selected runs.</div>
 <div id="command-panel" class="panel" hidden>

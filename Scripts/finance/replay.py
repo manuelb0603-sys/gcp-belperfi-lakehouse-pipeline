@@ -4,7 +4,7 @@ load_validator_calls() reads a run's trace.jsonl and returns the first validator
 of each validation cycle (format retries are skipped). The traced prompt is split back into
 the validator instructions (system) and the cycle's review content (user) on
 ``VALIDATOR_REPORT_MARKER``; ``current_prompt`` swaps today's agent/prompts/validator.system.md
-in as the system part. replay_validator() sends it to the configured validator role, or to a
+in as the system part (plus today's guided addendum when the traced run was guided). replay_validator() sends it to the configured validator role, or to a
 provider:model given on the command line, with VALIDATOR_RESPONSE_SCHEMA, prints the verdict,
 and saves each result as agent/runs/replays/<stamp>_<run_id>_<model>.json.
 ``Scripts/replay_validator.py`` is the CLI. Nothing here changes the archived run.
@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
-from .harness.prompts import VALIDATOR_REPORT_MARKER, PromptParts
+from .harness.prompts import GUIDED_VALIDATOR_HEADER, VALIDATOR_REPORT_MARKER, PromptParts, validator_system
 from .harness.protocol import VALIDATOR_RESPONSE_SCHEMA, parse_json_response
 from .model_clients import ModelClient, build_model_client, resolve_model_role
 from .run_archive import NON_RUN_DIRS, REPLAYS_DIR, update_index
@@ -149,7 +149,8 @@ def build_replay_prompt(
     call = select_call(calls, cycle)
     parts = split_validator_prompt(call.prompt)
     if current_prompt:
-        parts = PromptParts(current_validator_system(prompt_dir), parts.user)
+        guidance = "guided" if f"\n\n{GUIDED_VALIDATOR_HEADER}" in parts.system else "strict"
+        parts = PromptParts(validator_system(current_validator_system(prompt_dir), guidance), parts.user)
     return call, parts, decisions.get(call.cycle)
 
 

@@ -22,6 +22,9 @@ DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.json"
 # Code defaults for omitted config keys (the only place they are defined).
 DEFAULTS: dict[str, Any] = {
     "report_mode": "legacy",
+    # Report guidance: "strict" (exact headings/wording, minimal-edit revisions) or "guided"
+    # (facts stay exact; wording, structure, and an optional alternative plan are freer).
+    "guidance": "strict",
     "dry_run": False,
     "ollama_stream": False,
     "ollama_timeout": 600,
@@ -47,6 +50,7 @@ DEFAULTS: dict[str, Any] = {
 }
 
 REPORT_MODES = ("legacy", "agent")
+GUIDANCE_MODES = ("strict", "guided")
 LIMIT_KEYS = ("max_agent_rounds", "max_tool_calls", "max_calls_per_tool", "max_validation_cycles", "max_report_bytes")
 # Fallbacks used only by the Finance Summary and QA app when the keys are missing.
 APP_FALLBACK_MODEL_SERVER_URL = "http://localhost:11434/api/generate"
@@ -54,6 +58,7 @@ APP_FALLBACK_MODEL_NAME = "gemma4:e4b"
 # Role fields that are safe to record in run metadata (no URLs or credentials).
 PUBLIC_ROLE_KEYS = (
     "role", "provider", "model", "options", "think", "timeout", "max_tokens", "effort", "cache_system", "stream", "thinking",
+    "guidance",
 )
 
 _SCHEMA_PATTERN = re.compile(r"[A-Za-z0-9_]+")
@@ -133,6 +138,13 @@ def _int(key: str, value: Any, *, minimum: int) -> int:
     return value
 
 
+def validate_guidance(key: str, value: Any) -> str:
+    """A guidance mode ("strict" or "guided", case-insensitive); anything else raises SettingsError naming key."""
+    if isinstance(value, str) and value.strip().lower() in GUIDANCE_MODES:
+        return value.strip().lower()
+    raise SettingsError(f"{key} must be one of {', '.join(GUIDANCE_MODES)}, got {value!r}")
+
+
 def _optional_money(value: Any) -> float | None:
     """Parsed amount, or None when missing or unparseable (checked where it is required)."""
     if value is None or isinstance(value, bool):
@@ -183,6 +195,8 @@ class ReportSettings:
 
     # Workflow
     report_mode: str
+    # Effective report guidance: model_roles.author.guidance, else top-level guidance (default "strict").
+    guidance: str
     dry_run: bool
     project_name: str | None
     days_back: int
@@ -292,13 +306,21 @@ class ReportSettings:
         for key in ("model_roles", "ollama_options"):
             if config.get(key) is not None and not isinstance(config.get(key), dict):
                 raise SettingsError(f"{key} must be an object")
+        raw_guidance = config.get("guidance")
+        guidance = validate_guidance("guidance", DEFAULTS["guidance"] if raw_guidance is None else raw_guidance)
+        for role_name, entry in (config.get("model_roles") or {}).items():
+            if role_name != "author" and isinstance(entry, dict) and "guidance" in entry:
+                raise SettingsError(f"model_roles.{role_name}.guidance is not supported; set model_roles.author.guidance or top-level guidance")
         try:
             roles = {role: resolve_model_role(config, role) for role in ("author", "validator", "eval")}
         except (TypeError, ValueError) as exc:
             raise SettingsError(f"model_roles: {exc}") from exc
+        if "guidance" in roles["author"]:
+            guidance = roles["author"]["guidance"]  # the author role's override wins
 
         return cls(
             report_mode=report_mode,
+            guidance=guidance,
             dry_run=bool(_get(config, "dry_run")),
             project_name=_optional_text(config.get("project_name")),
             days_back=_int("days_back", _get(config, "days_back"), minimum=1),

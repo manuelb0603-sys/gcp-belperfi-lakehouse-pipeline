@@ -45,6 +45,77 @@ VALIDATOR_CHECKLIST_INSTRUCTION = (
     "the report verbatim (or names the section searched when it is missing) and cites the checklist item."
 )
 
+# ----- guided guidance (settings "guidance": "guided"; strict prompts never contain these) -----
+
+GUIDED_AUTHOR_ADDENDUM = (
+    "GUIDED MODE (these freedoms override any conflicting instruction above about exact headings, exact wording, "
+    "or minimal edits; everything else still applies):\n"
+    "- Facts stay authoritative. Every snapshot value you state (totals, month-over-month change, disposable cash, "
+    "savings target, shortfall, eligible discretionary total, remaining gap, and each category's current and "
+    "previous spend) must match the AUTHORITATIVE SNAPSHOT. Write values exactly; round one only where the text "
+    "clearly labels it approximate. Never recompute or invent figures.\n"
+    "- Wording and structure are yours. The checklist lists required sections and required facts, not required "
+    "sentences: you may use alternative section headings if each required section stays clearly recognizable and "
+    "in the required order, and you may state every disclosure in your own words.\n"
+    "- Keep the code-computed plan. The Top 3 Discretionary Categories table still shows the snapshot's caps "
+    "(configured goals or advisor-suggested caps) and percents exactly as supplied; it is the baseline plan.\n"
+    "- Optional \"Mogumogu's alternative plan\" section, after the Top 3 table: you may propose a smarter savings "
+    "strategy, for example different category caps, focusing on the categories that grew the most, or flagging "
+    "Needs categories worth reviewing. If you include it, label it clearly as Mogumogu's advisor suggestion, never "
+    "as a configured goal or target; show its arithmetic (each proposed cut and their sum); and make it reconcile "
+    "with the snapshot: the proposed cuts add up to the savings you claim, and any remaining gap you claim equals "
+    "snapshot.savings_shortfall minus those cuts. Base it only on snapshot values and tool evidence; flagging a "
+    "Needs category is a suggestion to review it, not a discretionary cap.\n"
+    "- Merchant, habit, or behavior claims still need get_transaction_detail evidence, and the design, safety, and "
+    "HTML requirements are unchanged."
+)
+
+# First line of the guided validator addendum; finance/replay.py looks for it in traced prompts.
+GUIDED_VALIDATOR_HEADER = "GUIDED MODE REVIEW"
+GUIDED_VALIDATOR_ADDENDUM = (
+    f"{GUIDED_VALIDATOR_HEADER} (this run uses guided guidance; these rules override any conflicting instruction "
+    "above about exact headings or wording):\n"
+    "- Allow alternative section headings, wording, sentence structure, and plans, provided each required section "
+    "is clearly recognizable and in the required order and each required checklist fact is present in some "
+    "wording. Do not fail a report for a renamed heading, a paraphrased disclosure, or a different arrangement of "
+    "a section's prose.\n"
+    "- The report may add an optional \"Mogumogu's alternative plan\" (an advisor-suggested savings strategy) next "
+    "to the code-computed Top 3 table. Allow it when it is clearly labeled as an advisor suggestion, shows its "
+    "arithmetic, and reconciles with the snapshot: its proposed cuts sum to the savings it claims, and any "
+    "remaining gap it claims equals snapshot.savings_shortfall minus those cuts. Recompute these sums yourself.\n"
+    "- Fail (error) only for: a wrong or unsupported fact (a stated snapshot value that does not match, or a rounded "
+    "value not labeled approximate); a missing required section or required checklist fact; an alternative plan "
+    "whose arithmetic does not reconcile or that is presented as a configured goal or target; unsupported "
+    "merchant or behavior claims; and the HTML, safety, and visual-design hard requirements, which are unchanged.\n"
+    "- The evidence rule is unchanged: every error finding quotes the report verbatim and cites the conflicting "
+    "snapshot field or the missing checklist item."
+)
+GUIDED_VALIDATOR_CHECKLIST_INSTRUCTION = (
+    "Check every checklist item above against the report. The items are required sections and required facts, not "
+    "required wording: accept any heading or phrasing that clearly gives the section or fact with the correct "
+    "value. List each missing section, missing fact, or wrong value as an error finding whose evidence quotes the "
+    "report verbatim (or names the section searched when it is missing) and cites the checklist item."
+)
+GUIDED_REVISION_INSTRUCTION = (
+    "Fix every listed issue; you may restructure sections if that produces a better report, keeping all required "
+    "facts. Use the exact authoritative values given and do not reintroduce a fixed issue in another section. "
+)
+STRICT_REVISION_INSTRUCTION = (
+    "Fix only the listed issues with minimal edits to the previous HTML and keep everything else unchanged; "
+    "use the exact authoritative values given and do not reintroduce a fixed issue in another section. "
+)
+
+
+def is_guided(guidance: str | None) -> bool:
+    """True for guided guidance; anything else (None, "strict") keeps the strict prompts."""
+    return guidance == "guided"
+
+
+def validator_system(validator_context: str, guidance: str | None = "strict") -> str:
+    """The validator instructions (system part): validator.system.md, plus the guided addendum in guided mode."""
+    return f"{validator_context}\n\n{GUIDED_VALIDATOR_ADDENDUM}" if is_guided(guidance) else validator_context
+
+
 # Opens the per-cycle (user) part of every validator prompt; finance/replay.py splits traced
 # validator prompts back into system/user parts on it.
 VALIDATOR_REPORT_MARKER = "\n\nVALIDATE THIS REPORT:\n"
@@ -74,21 +145,30 @@ def as_prompt_parts(prompt: "str | PromptParts") -> PromptParts:
 MISSING_REPORT_HTML = "<html><body><p>Missing report_html in author output.</p></body></html>"
 
 
-def requirements_block(requirements: list[str] | None, for_validator: bool = False) -> str:
+def requirements_block(requirements: list[str] | None, for_validator: bool = False, guidance: str | None = "strict") -> str:
     """Render the checklist prompt block, or an empty string when no requirements were supplied."""
     if not requirements:
         return ""
     block = f"{REQUIREMENTS_HEADER}:\n" + "\n".join(f"- {line}" for line in requirements) + "\n\n"
     if for_validator:
-        block += f"{VALIDATOR_CHECKLIST_INSTRUCTION}\n\n"
+        instruction = GUIDED_VALIDATOR_CHECKLIST_INSTRUCTION if is_guided(guidance) else VALIDATOR_CHECKLIST_INSTRUCTION
+        block += f"{instruction}\n\n"
     return block
 
 
 def author_base_prompt(
-    prompt_context: str, objective: str, snapshot_json: str, requirements: list[str] | None, tool_prompt: str
+    prompt_context: str,
+    objective: str,
+    snapshot_json: str,
+    requirements: list[str] | None,
+    tool_prompt: str,
+    guidance: str | None = "strict",
 ) -> str:
-    """The fixed opening of every author prompt: context, objective, snapshot, checklist, tools, protocol."""
-    return (
+    """The fixed opening of every author prompt: context, objective, snapshot, checklist, tools, protocol.
+
+    Guided guidance appends GUIDED_AUTHOR_ADDENDUM; strict prompts are unchanged.
+    """
+    base = (
         f"{prompt_context}\n\nOBJECTIVE:\n{objective}\n\n"
         f"AUTHORITATIVE SNAPSHOT:\n{snapshot_json}\n\n"
         f"{requirements_block(requirements)}"
@@ -97,6 +177,7 @@ def author_base_prompt(
         "If tool evidence contains an error, use its message to correct the arguments and retry if useful; "
         "the complete conversation and earlier evidence remain in context. Do not repeat the identical failing call."
     )
+    return f"{base}\n\n{GUIDED_AUTHOR_ADDENDUM}" if is_guided(guidance) else base
 
 
 def new_evidence_section(phase: str, round_number: int, results: list[dict[str, Any]]) -> str:
@@ -222,10 +303,12 @@ def validator_prompt(
     previous_validation: dict[str, Any] | None,
     resolved_labels: list[str],
     rebuttals: list[dict[str, str]],
+    guidance: str | None = "strict",
 ) -> str:
     """The full validator prompt for one review cycle."""
     return validator_prompt_parts(
-        validator_context, safe_html, snapshot_json, requirements, evidence, previous_validation, resolved_labels, rebuttals
+        validator_context, safe_html, snapshot_json, requirements, evidence, previous_validation, resolved_labels, rebuttals,
+        guidance,
     ).text
 
 
@@ -238,12 +321,16 @@ def validator_prompt_parts(
     previous_validation: dict[str, Any] | None,
     resolved_labels: list[str],
     rebuttals: list[dict[str, str]],
+    guidance: str | None = "strict",
 ) -> PromptParts:
-    """Validator prompt split into the stable validator instructions (system) and this cycle's review content."""
-    return PromptParts(validator_context, (
+    """Validator prompt split into the stable validator instructions (system) and this cycle's review content.
+
+    Guided guidance appends GUIDED_VALIDATOR_ADDENDUM to the system part and uses the guided checklist instruction.
+    """
+    return PromptParts(validator_system(validator_context, guidance), (
         f"{VALIDATOR_REPORT_MARKER}{safe_html}\n\n"
         f"AUTHORITATIVE SNAPSHOT:\n{snapshot_json}\n\n"
-        f"{requirements_block(requirements, for_validator=True)}"
+        f"{requirements_block(requirements, for_validator=True, guidance=guidance)}"
         f"TOOL EVIDENCE:\n{json.dumps(evidence, indent=2, default=str)}\n\n"
         f"{_prior_validation_text(previous_validation, resolved_labels, rebuttals)}"
         "If the report HTML is missing, return fail with a revision instruction telling the author to return "
@@ -251,8 +338,14 @@ def validator_prompt_parts(
     ))
 
 
-def revision_block(revision_html: str, feedback: dict[str, Any], resolved_labels: list[str]) -> str:
-    """The revision request that replaces (never appends to) the previous one in the author prompt."""
+def revision_block(
+    revision_html: str, feedback: dict[str, Any], resolved_labels: list[str], guidance: str | None = "strict"
+) -> str:
+    """The revision request that replaces (never appends to) the previous one in the author prompt.
+
+    Strict asks for minimal edits to the top findings; guided lists every error finding and allows restructuring.
+    """
+    guided = is_guided(guidance)
     already_fixed = (
         "ALREADY FIXED IN EARLIER CYCLES (do not reintroduce):\n"
         + "\n".join(f"- {label}" for label in resolved_labels)
@@ -262,10 +355,10 @@ def revision_block(revision_html: str, feedback: dict[str, Any], resolved_labels
     return (
         "\n\nPREVIOUS REPORT HTML (edit this document; it failed review):\n"
         f"----- BEGIN PREVIOUS REPORT -----\n{revision_html}\n----- END PREVIOUS REPORT -----\n\n"
-        f"PRIORITY FIXES FROM THE REVIEW:\n{json.dumps(feedback, indent=2, ensure_ascii=False)}\n"
+        f"{'FIXES FROM THE REVIEW (every error finding, highest priority first)' if guided else 'PRIORITY FIXES FROM THE REVIEW'}:\n"
+        f"{json.dumps(feedback, indent=2, ensure_ascii=False)}\n"
         f"{already_fixed}"
-        "Fix only the listed issues with minimal edits to the previous HTML and keep everything else unchanged; "
-        "use the exact authoritative values given and do not reintroduce a fixed issue in another section. "
+        f"{GUIDED_REVISION_INSTRUCTION if guided else STRICT_REVISION_INSTRUCTION}"
         "Then return the complete revised report between "
         f"{REPORT_START_MARKER} and {REPORT_END_MARKER}. "
         "You may request additional evidence with tool_calls before returning the report.\n\n"

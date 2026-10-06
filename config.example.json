@@ -8,6 +8,8 @@
     "_note": "model_roles is the primary per-role setup; any role may use provider 'ollama' or 'anthropic'. eval is optional (defaults to the validator); a local alternative is {\"provider\": \"ollama\", \"model\": \"gemma4:12b\", \"think\": false}. Anthropic roles need the anthropic package and credentials from the ANTHROPIC_API_KEY environment variable or `ant auth login`, never this file; their prompts (report data and evidence) leave this machine. Claude roles take max_tokens (up to 64000; thinking counts toward it, so a Claude author needs about 32000), effort, optional stream (default: automatic above 16000 max_tokens) and thinking (only \"adaptive\").model_server_url is the shared Ollama server; model_name is still used by legacy mode, fact extraction, and the Finance Summary and QA app."
   },
   "report_mode": "agent",
+  "guidance": "strict",
+  "_guidance_note": "strict (default) suits small local authors; guided (for strong authors such as Claude Opus) keeps every snapshot fact exact but allows free wording/structure and an optional labeled alternative savings plan, sends all validator errors to revisions, and doubles max_tool_calls/max_calls_per_tool. model_roles.author.guidance overrides this key.",
   "dry_run": true,
   "max_agent_rounds": 6,
   "max_tool_calls": 12,
