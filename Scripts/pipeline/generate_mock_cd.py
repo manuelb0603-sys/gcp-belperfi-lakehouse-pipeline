@@ -8,11 +8,18 @@ Output columns and formats match the real issuer exports.
 
 Run from any folder; the CSVs are written to the current directory:
     ..\\.venv\\Scripts\\python.exe Scripts\\pipeline\\generate_mock_cd.py [--records N] [--seed S]
+
+By default the files cover the last 365 days. To add a new period to data that already
+exists (for example October after a September load) without regenerating it, pass
+``--month YYYY-MM`` (or ``--start``/``--end``): only that window is generated, at the same
+density as the full year unless ``--records`` is given, into files named after the period
+(``mock_chase_transactions_2026-10.csv``). A month still in progress ends today.
 """
 
 from __future__ import annotations
 
 import argparse
+import calendar
 import random
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -159,13 +166,16 @@ CITIES = [('SAN FRANCISCO', 'CA'), ('OAKLAND', 'CA'), ('SEATTLE', 'WA'), ('PORTL
 class MockGenerator:
     """Deterministic (seeded) mock transaction generator."""
 
-    def __init__(self, seed: int | None = None, today: date | None = None):
+    def __init__(self, seed: int | None = None, today: date | None = None, start: date | None = None):
+        """Dates fall in [start, today]; start defaults to 365 days before today."""
         self.rng = random.Random(seed)
         self.fake = Faker()
         if seed is not None:
             self.fake.seed_instance(seed)
         self.today = today or date.today()
-        self.start = self.today - timedelta(days=365)
+        self.start = start or self.today - timedelta(days=365)
+        if self.start > self.today:
+            raise ValueError(f'start {self.start} is after end {self.today}')
         self._locations: dict[tuple[str, int], dict] = {}
 
     # ----- shared helpers -----
@@ -186,9 +196,11 @@ class MockGenerator:
         return self._locations[key]
 
     def pick_date(self, weekdays: tuple[float, ...]) -> date:
-        """A date in the last year, weighted by weekday (rejection sampling)."""
+        """A date in [start, today], weighted by weekday (rejection sampling)."""
         top = max(weekdays)
         span = (self.today - self.start).days
+        if span < 6:  # too few days to cover every weekday: pick uniformly
+            return self.start + timedelta(days=self.rng.randint(0, span))
         while True:
             day = self.start + timedelta(days=self.rng.randint(0, span))
             if self.rng.random() * top <= weekdays[day.weekday()]:
@@ -307,28 +319,66 @@ class MockGenerator:
         return pd.DataFrame(records, columns=AMEX_COLUMNS)
 
 
-def generate_chase_transactions(num_records, seed=None, today=None):
+def generate_chase_transactions(num_records, seed=None, today=None, start=None):
     """Mock Chase export (sales negative, returns and payments positive)."""
-    return MockGenerator(seed, today).chase(num_records)
+    return MockGenerator(seed, today, start).chase(num_records)
 
 
-def generate_amex_transactions(num_records, seed=None, today=None):
+def generate_amex_transactions(num_records, seed=None, today=None, start=None):
     """Mock Amex export (purchases positive, credits and payments negative)."""
-    return MockGenerator(seed, today).amex(num_records)
+    return MockGenerator(seed, today, start).amex(num_records)
 
 
 # About 50 combined card transactions per month across both issuers.
 MOCK_RECORDS_PER_ISSUER = 300
+MOCK_DAYS = 365  # the default window the records above are spread over
 
 
-def main(argv=None):
+def period_records(start: date, end: date) -> int:
+    """Rows per issuer for [start, end] at the same density as the default year."""
+    return max(1, round(MOCK_RECORDS_PER_ISSUER * ((end - start).days + 1) / MOCK_DAYS))
+
+
+def month_period(text: str, today: date) -> tuple[date, date]:
+    """'YYYY-MM' -> (first day, last day or today when the month is still in progress)."""
+    try:
+        year, month = (int(part) for part in text.split('-'))
+        start = date(year, month, 1)
+    except ValueError:
+        raise ValueError(f'--month must look like YYYY-MM, got {text!r}') from None
+    if start > today:
+        raise ValueError(f'--month {text} has not started yet (today is {today})')
+    return start, min(date(year, month, calendar.monthrange(year, month)[1]), today)
+
+
+def main(argv=None, today=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument('--records', type=int, default=MOCK_RECORDS_PER_ISSUER, help='rows per issuer')
+    parser.add_argument('--records', type=int, default=None,
+                        help=f'rows per issuer (default {MOCK_RECORDS_PER_ISSUER} for a year, scaled for a shorter period)')
     parser.add_argument('--seed', type=int, default=None, help='random seed for reproducible output')
+    parser.add_argument('--month', help='generate only this month (YYYY-MM), e.g. 2026-10')
+    parser.add_argument('--start', type=date.fromisoformat, help='generate only from this date (YYYY-MM-DD)')
+    parser.add_argument('--end', type=date.fromisoformat, help='last date to generate (YYYY-MM-DD; default today)')
     args = parser.parse_args(argv)
-    generator = MockGenerator(args.seed)
-    generator.chase(args.records).to_csv('mock_chase_transactions.csv', index=False)
-    generator.amex(args.records).to_csv('mock_amex_transactions.csv', index=False)
+    today = today or date.today()
+    if args.month and (args.start or args.end):
+        parser.error('use --month or --start/--end, not both')
+    try:
+        if args.month:
+            start, end = month_period(args.month, today)
+            suffix = f'_{args.month}'
+        elif args.start or args.end:
+            end = args.end or today
+            start = args.start or end - timedelta(days=MOCK_DAYS)
+            suffix = f'_{start.isoformat()}_{end.isoformat()}'
+        else:
+            start, end, suffix = None, today, ''
+        generator = MockGenerator(args.seed, end, start)
+    except ValueError as exc:
+        parser.error(str(exc))
+    records = args.records or (period_records(start, end) if start else MOCK_RECORDS_PER_ISSUER)
+    generator.chase(records).to_csv(f'mock_chase_transactions{suffix}.csv', index=False)
+    generator.amex(records).to_csv(f'mock_amex_transactions{suffix}.csv', index=False)
 
 
 if __name__ == '__main__':

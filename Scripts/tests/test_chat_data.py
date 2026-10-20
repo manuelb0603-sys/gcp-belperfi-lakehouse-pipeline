@@ -168,6 +168,47 @@ class TestMockGenerator(unittest.TestCase):
         b = generate_mock_cd.generate_amex_transactions(20, seed=11, today=TODAY)
         pd.testing.assert_frame_equal(a, b)
 
+    def test_start_limits_dates_to_the_period(self):
+        start, end = date(2026, 10, 1), date(2026, 10, 20)
+        chase = generate_mock_cd.generate_chase_transactions(40, seed=5, today=end, start=start)
+        amex = generate_mock_cd.generate_amex_transactions(40, seed=5, today=end, start=start)
+        for dates in (pd.to_datetime(chase["Transaction Date"], format="%m/%d/%Y"),
+                      pd.to_datetime(amex["Date"], format="%m/%d/%Y")):
+            self.assertTrue(((dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))).all())
+        with self.assertRaises(ValueError):
+            generate_mock_cd.MockGenerator(1, today=date(2026, 9, 30), start=date(2026, 10, 1))
+
+    def test_month_period_ends_today_while_in_progress(self):
+        today = date(2026, 10, 20)
+        self.assertEqual(generate_mock_cd.month_period("2026-10", today), (date(2026, 10, 1), today))
+        self.assertEqual(generate_mock_cd.month_period("2026-09", today), (date(2026, 9, 1), date(2026, 9, 30)))
+        for bad in ("2026-11", "October", "2026-13"):
+            with self.assertRaises(ValueError):
+                generate_mock_cd.month_period(bad, today)
+
+    def test_period_records_keep_the_yearly_density(self):
+        self.assertEqual(generate_mock_cd.period_records(date(2026, 9, 1), date(2026, 9, 30)), 25)
+        self.assertEqual(generate_mock_cd.period_records(date(2026, 10, 1), date(2026, 10, 20)), 16)
+
+    def test_month_option_writes_period_named_files(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as folder:
+            cwd = os.getcwd()
+            os.chdir(folder)
+            try:
+                generate_mock_cd.main(["--month", "2026-10", "--seed", "2"], today=date(2026, 10, 20))
+                chase = pd.read_csv("mock_chase_transactions_2026-10.csv")
+                amex = pd.read_csv("mock_amex_transactions_2026-10.csv")
+                self.assertEqual(sorted(os.listdir(folder)),
+                                 ["mock_amex_transactions_2026-10.csv", "mock_chase_transactions_2026-10.csv"])
+            finally:
+                os.chdir(cwd)
+        self.assertEqual((len(chase), len(amex)), (16, 16))
+        months = pd.to_datetime(chase["Transaction Date"], format="%m/%d/%Y").dt.month
+        self.assertTrue((months == 10).all())
+
 
 if __name__ == "__main__":
     unittest.main()
