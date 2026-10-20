@@ -309,8 +309,12 @@ class PromptInvitationTests(unittest.TestCase):
         ui = self.read("ui.system.md")
         self.assertIn("The snapshot lists notable_changes", ui)
         self.assertIn('a spike is a notable_changes entry with direction "increase"', ui)
-        self.assertIn("call explain_category_change(category) with the entry's parent_group", ui)
-        self.assertIn("call get_daily_spending or get_weekly_spending with that category", ui)
+        self.assertIn("drill down from week to day to transaction", ui)
+        weekly, daily, detail = (ui.index(f"call {name}") for name in
+                                 ("get_weekly_spending", "get_daily_spending", "get_transaction_detail"))
+        self.assertLess(weekly, daily)
+        self.assertLess(daily, detail)
+        self.assertIn("Call explain_category_change(category) with the entry's parent_group", ui)
         self.assertIn("Attribute causes only to evidence the tools return.", ui)
         self.assertIn("say plainly that the spike is not yet explained instead of guessing", ui)
         self.assertIn("Never invent habits or merchants.", ui)
@@ -318,6 +322,13 @@ class PromptInvitationTests(unittest.TestCase):
     def test_validator_requires_tool_evidence_for_change_drivers(self):
         validator = self.read("validator.system.md")
         self.assertIn("must be supported by explain_category_change or get_transaction_detail results in TOOL EVIDENCE", validator)
+
+    def test_validator_checks_every_spike_cause_including_hedged_ones(self):
+        validator = self.read("validator.system.md")
+        self.assertIn('Check every spike, meaning each snapshot notable_changes entry with direction "increase"', validator)
+        self.assertIn("get_weekly_spending, get_daily_spending, get_transaction_detail, or explain_category_change", validator)
+        self.assertIn("Hedged wording does not make a cause acceptable", validator)
+        self.assertIn("A spike without evidence must be described as not yet explained", validator)
 
     def test_notable_changes_are_not_checklist_items(self):
         from finance.report_requirements import build_report_requirements
