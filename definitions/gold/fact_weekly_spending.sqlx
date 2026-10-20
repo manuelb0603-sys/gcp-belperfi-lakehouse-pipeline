@@ -1,0 +1,53 @@
+config {
+    type: "table",
+    schema: "gold",
+    name: "fact_weekly_spending",
+    description: "Aggregated weekly (Monday to Sunday) financial metrics per category for week-level spending analysis.",
+    tags: ["gold", "analytics"]
+}
+
+SELECT
+  week_start,
+  DATE_ADD(week_start, INTERVAL 6 DAY) AS week_end,
+  -- ISO week label and ISO year as text (for example '2026-W35' and '2026')
+  FORMAT_DATE('%G-W%V', week_start) AS iso_week,
+  FORMAT_DATE('%G', week_start) AS year,
+  category,
+  parent_group,
+  -- Same metrics and filter as fact_monthly_spending, one row per week
+  SUM(CASE
+    WHEN amount < 0 THEN -amount
+    ELSE 0
+END
+  ) AS gross_spending,
+  SUM(CASE
+    WHEN amount > 0 THEN amount
+    ELSE 0
+END
+  ) AS total_refunds_and_credits,
+  SUM(-amount) AS net_real_expense,
+  COUNT(transaction_date) AS total_transaction_count,
+  ROUND(AVG(-amount), 2) AS average_transaction_amount
+FROM (
+  SELECT
+    DATE_TRUNC(transaction_date, WEEK(MONDAY)) AS week_start,
+    transaction_date,
+    amount,
+    category,
+    parent_group
+  FROM
+    ${ref("fact_transactions")}
+  WHERE
+    transaction_type IN ('Return',
+      'Sale',
+      'Adjustment'))
+GROUP BY
+  1,
+  2,
+  3,
+  4,
+  5,
+  6
+ORDER BY
+  week_start DESC,
+  gross_spending ASC

@@ -1,0 +1,48 @@
+config {
+    type: "table",
+    schema: "gold",
+    name: "fact_daily_spending",
+    description: "Aggregated daily financial metrics per category for day-level spending analysis.",
+    tags: ["gold", "analytics"]
+}
+
+SELECT
+  transaction_date,
+  -- Weekday, month name and year as text (for example 'Monday', 'August' and '2026')
+  FORMAT_DATE('%A', transaction_date) AS day_of_week,
+  FORMAT_DATE('%B', transaction_date) AS month,
+  FORMAT_DATE('%Y', transaction_date) AS year,
+  transaction_month,
+  category,
+  parent_group,
+  -- Same metrics and filter as fact_monthly_spending, one row per day
+  SUM(CASE
+    WHEN amount < 0 THEN -amount
+    ELSE 0
+END
+  ) AS gross_spending,
+  SUM(CASE
+    WHEN amount > 0 THEN amount
+    ELSE 0
+END
+  ) AS total_refunds_and_credits,
+  SUM(-amount) AS net_real_expense,
+  COUNT(transaction_date) AS total_transaction_count,
+  ROUND(AVG(-amount), 2) AS average_transaction_amount
+FROM
+  ${ref("fact_transactions")}
+WHERE
+  transaction_type IN ('Return',
+    'Sale',
+    'Adjustment')
+GROUP BY
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7
+ORDER BY
+  transaction_date DESC,
+  gross_spending ASC

@@ -19,5 +19,9 @@ agent/runs/
 # Ignore VS Code settings and launch profiles
 .vscode/
 
+# Ignore personal Claude Code settings and its worktrees
+.claude/settings.local.json
+.claude/worktrees/
+
 # Ignore local-only experiments and standalone apps
 /Scripts/local_experiments/

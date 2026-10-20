@@ -78,6 +78,98 @@ class TestPeriodAwareBigQueryHelpers(unittest.TestCase):
             bigquery_tools.get_report_period_spending("project", year=2026)
 
 
+class FakeScalarBigQuery(FakeBigQuery):
+    class ScalarQueryParameter:
+        def __init__(self, name, type_, value):
+            self.name = name
+            self.type_ = type_
+            self.value = value
+
+
+class TestDailyAndWeeklySpendingTools(unittest.TestCase):
+    def run_query(self, fetch, *args):
+        client = FakeBigQueryClient([[{"transaction_date": date(2026, 2, 3), "net_real_expense": 12.5}]])
+        with patch.object(bigquery_tools, "_client", return_value=(client, FakeScalarBigQuery)):
+            result = fetch("project", *args)
+        query, config = client.queries[0]
+        return result, query, {param.name: param for param in config.query_parameters}
+
+    def assert_read_only(self, query):
+        statement = query.strip().upper()
+        self.assertTrue(statement.startswith("SELECT"))
+        for forbidden in ("INSERT", "UPDATE", "DELETE", "MERGE", "DROP", "CREATE", "ALTER", "TRUNCATE"):
+            self.assertNotIn(forbidden, statement)
+
+    def test_daily_spending_reads_one_month_end_with_parameterized_filters(self):
+        result, query, params = self.run_query(
+            bigquery_tools.get_daily_spending, "2024-02-01", "Groceries'; DROP TABLE x --", "Needs"
+        )
+        self.assert_read_only(query)
+        self.assertIn("`project.gold.fact_daily_spending`", query)
+        self.assertIn("AND category = @category AND parent_group = @parent_group", query)
+        self.assertNotIn("Groceries", query)
+        self.assertEqual(params["month"].value, date(2024, 2, 29))
+        self.assertEqual(params["category"].value, "Groceries'; DROP TABLE x --")
+        self.assertEqual(params["parent_group"].value, "Needs")
+        self.assertEqual(result["source"], "gold.fact_daily_spending")
+        self.assertEqual(result["month"], "2024-02-01")
+        self.assertEqual(result["rows"][0]["transaction_date"], "2026-02-03")
+
+    def test_daily_spending_without_filters_sums_all_categories(self):
+        result, query, params = self.run_query(bigquery_tools.get_daily_spending, "2026-09-01")
+        self.assertNotIn("@category", query)
+        self.assertNotIn("@parent_group", query)
+        self.assertIn("GROUP BY transaction_date, day_of_week, month, year", query)
+        self.assertEqual(set(params), {"month"})
+        self.assertIsNone(result["category"])
+
+    def test_weekly_spending_selects_weeks_overlapping_the_month(self):
+        result, query, params = self.run_query(bigquery_tools.get_weekly_spending, "2026-02-01", "Shopping")
+        self.assert_read_only(query)
+        self.assertIn("`project.gold.fact_weekly_spending`", query)
+        self.assertIn("WHERE week_end >= @month_start AND week_start <= @month_end", query)
+        self.assertEqual((params["month_start"].value, params["month_end"].value), (date(2026, 2, 1), date(2026, 2, 28)))
+        self.assertEqual(params["category"].value, "Shopping")
+        self.assertNotIn("parent_group", params)
+        self.assertIn("do not add up to the monthly total", result["note"])
+
+    def test_argument_checks_happen_before_any_query(self):
+        client = FakeBigQueryClient([])
+        with patch.object(bigquery_tools, "_client", return_value=(client, FakeScalarBigQuery)):
+            for fetch in (bigquery_tools.get_daily_spending, bigquery_tools.get_weekly_spending):
+                with self.assertRaises(ValueError):
+                    fetch("project", "2026-02")
+                with self.assertRaises(ValueError):
+                    fetch("project", "2026-02-01", "x" * 121)
+        self.assertEqual(client.queries, [])
+
+    def tools(self):
+        snapshot = SimpleNamespace(latest_month="2026-02-01", previous_month="2026-01-01")
+        return reporting._build_tools(
+            config={}, project_name="project", snapshot=snapshot, rows=[], memory_module=None,
+            thread_key="finance:test", ollama_url="http://ollama/api/generate", model_name="model",
+        )
+
+    def test_tools_default_to_report_month_and_pass_filters(self):
+        tools = self.tools()
+        with patch.object(reporting, "get_daily_spending", return_value={"rows": []}) as daily:
+            tools["get_daily_spending"].function({})
+        daily.assert_called_once_with("project", "2026-02-01", None, None)
+        with patch.object(reporting, "get_weekly_spending", return_value={"rows": []}) as weekly:
+            tools["get_weekly_spending"].function({"month": "2026-01-01", "category": "Shopping", "parent_group": "Wants"})
+        weekly.assert_called_once_with("project", "2026-01-01", "Shopping", "Wants")
+
+    def test_tools_are_restricted_to_the_report_period(self):
+        tools = self.tools()
+        for name in ("get_daily_spending", "get_weekly_spending"):
+            with self.assertRaisesRegex(ValueError, "restricted to the selected report month"):
+                tools[name].function({"month": "2025-12-01"})
+            schema = tools[name].parameters
+            self.assertEqual(schema["properties"]["month"]["enum"], ["2026-02-01", "2026-01-01"])
+            self.assertEqual(set(schema["properties"]), {"month", "category", "parent_group"})
+            self.assertNotIn("required", schema)
+
+
 class TestSharedFinanceReportService(unittest.TestCase):
     def test_semantic_memory_empty_query_returns_actionable_error(self):
         snapshot = SimpleNamespace(latest_month="2026-02-01", previous_month="2026-01-01")

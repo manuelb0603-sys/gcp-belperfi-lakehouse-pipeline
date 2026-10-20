@@ -305,11 +305,15 @@ class PromptInvitationTests(unittest.TestCase):
     def read(self, name):
         return (PROJECT_ROOT / "agent" / "prompts" / name).read_text(encoding="utf-8")
 
-    def test_author_prompt_invites_but_does_not_require_the_tool(self):
+    def test_author_prompt_requires_investigating_spikes(self):
         ui = self.read("ui.system.md")
         self.assertIn("The snapshot lists notable_changes", ui)
-        self.assertIn("you may call explain_category_change(category)", ui)
-        self.assertIn("attributing causes only to evidence the tool returns. Never invent habits or merchants.", ui)
+        self.assertIn('a spike is a notable_changes entry with direction "increase"', ui)
+        self.assertIn("call explain_category_change(category) with the entry's parent_group", ui)
+        self.assertIn("call get_daily_spending or get_weekly_spending with that category", ui)
+        self.assertIn("Attribute causes only to evidence the tools return.", ui)
+        self.assertIn("say plainly that the spike is not yet explained instead of guessing", ui)
+        self.assertIn("Never invent habits or merchants.", ui)
 
     def test_validator_requires_tool_evidence_for_change_drivers(self):
         validator = self.read("validator.system.md")
