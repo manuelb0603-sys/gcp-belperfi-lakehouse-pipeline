@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import re
 import time
 from dataclasses import dataclass
@@ -9,17 +10,21 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from . import bigquery_tools
 from .harness import HarnessLimits, ReportHarness, ToolSpec
 from .bigquery_tools import (
     explain_category_change,
     get_category_detail,
+    get_daily_spending,
     get_report_period_spending,
     get_transaction_detail,
+    get_weekly_spending,
 )
 from .report_metrics import calculate_report_snapshot
 from .report_requirements import build_report_requirements
 from .html_text import html_to_text
 from .log import get_logger
+from .mcp_client import McpToolClient
 from .memory_search import search_long_facts
 from .budget import LedgerUnavailableError, anthropic_cost_from_events
 from .model_clients import build_model_client
@@ -97,11 +102,23 @@ def _build_tools(
     thread_key: str,
     ollama_url: str,
     model_name: str,
+    call_tool: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, ToolSpec]:
-    """The author's tools; memory_module is a MemoryStore (or any object with its methods) or None."""
+    """The author's tools; memory_module is a MemoryStore (or any object with its methods) or None.
+
+    call_tool (for example McpToolClient.call_tool) runs the BigQuery data tools by name with
+    keyword arguments; without it they run in-process through finance.bigquery_tools.
+    """
     settings = ReportSettings.coerce(config)
     selected_month = snapshot.latest_month
     previous_month = snapshot.previous_month
+
+    def fetch(name: str, *args: Any) -> dict[str, Any]:
+        # Resolved at call time (tests patch these module names).
+        if call_tool is None:
+            return globals()[name](project_name, *args)
+        bound = inspect.signature(getattr(bigquery_tools, name)).bind(project_name, *args)
+        return call_tool(name, {key: value for key, value in bound.arguments.items() if key != "project_name"})
 
     def spending_summary(_: dict[str, Any]) -> dict[str, Any]:
         return {"source": "selected_report_period", "rows": rows}
@@ -112,19 +129,35 @@ def _build_tools(
         if requested_month not in {selected_month, previous_month}:
             raise ValueError("Category detail is restricted to the selected report month and its predecessor")
         previous = previous_month if requested_month == selected_month else None
-        return get_category_detail(project_name, category, requested_month, previous)
+        return fetch("get_category_detail", category, requested_month, previous)
 
     def transaction_detail(arguments: dict[str, Any]) -> dict[str, Any]:
         requested_month = str(arguments.get("month", selected_month))[:10]
         if requested_month not in {selected_month, previous_month}:
             raise ValueError("Transaction detail is restricted to the selected report month and its predecessor")
         category = arguments.get("category")
-        return get_transaction_detail(
-            project_name,
+        return fetch(
+            "get_transaction_detail",
             requested_month,
             str(category) if category else None,
             int(arguments.get("limit", 25)),
         )
+
+    def period_spending(name: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
+        def run(arguments: dict[str, Any]) -> dict[str, Any]:
+            requested_month = str(arguments.get("month", selected_month))[:10]
+            if requested_month not in {selected_month, previous_month}:
+                raise ValueError(f"{name} is restricted to the selected report month and its predecessor")
+            category = arguments.get("category")
+            parent_group = arguments.get("parent_group")
+            return fetch(
+                name,
+                requested_month,
+                str(category) if category else None,
+                str(parent_group) if parent_group else None,
+            )
+
+        return run
 
     def category_change(arguments: dict[str, Any]) -> dict[str, Any]:
         category = str(arguments.get("category") or "").strip()
@@ -149,9 +182,7 @@ def _build_tools(
             )
         elif parent_group is not None and groups and parent_group not in groups:
             raise ValueError(f"Category {category!r} has parent_group {', '.join(groups)} in the snapshot, not {parent_group!r}")
-        return explain_category_change(
-            project_name, category, requested_month, int(arguments.get("top_n", 5)), parent_group
-        )
+        return fetch("explain_category_change", category, requested_month, int(arguments.get("top_n", 5)), parent_group)
 
     def semantic_memory(arguments: dict[str, Any]) -> dict[str, Any]:
         if memory_module is None:
@@ -208,6 +239,22 @@ def _build_tools(
             transaction_detail,
             schemas["get_transaction_detail"],
         ),
+        "get_daily_spending": ToolSpec(
+            "get_daily_spending",
+            "Get per-day spending totals (date, weekday, gross spend, refunds, net spend, transaction count, average) "
+            "for the selected report month or its predecessor from gold.fact_daily_spending. Totals cover all "
+            "categories unless filtered. Arguments: optional month/category/parent_group.",
+            period_spending("get_daily_spending"),
+            schemas["get_daily_spending"],
+        ),
+        "get_weekly_spending": ToolSpec(
+            "get_weekly_spending",
+            "Get per-week (Monday-Sunday) spending totals for the weeks overlapping the selected report month or its "
+            "predecessor from gold.fact_weekly_spending. Edge weeks can include days outside the month, so weekly "
+            "totals do not add up to the monthly total. Arguments: optional month/category/parent_group.",
+            period_spending("get_weekly_spending"),
+            schemas["get_weekly_spending"],
+        ),
         "explain_category_change": ToolSpec(
             "explain_category_change",
             "Explain what drove a category's change from the previous month to the report month: per-month "
@@ -254,6 +301,14 @@ def tool_parameter_schemas(selected_month: str, previous_month: str | None) -> d
     }
     category = {"type": "string", "minLength": 1, "description": "Category name as shown in the snapshot."}
     no_arguments = {"type": "object", "properties": {}}
+    period_spending = {
+        "type": "object",
+        "properties": {
+            "month": month,
+            "category": {**category, "description": "Optional category filter, as shown in the snapshot."},
+            "parent_group": {"type": "string", "minLength": 1, "description": "Optional parent group filter, as shown in the snapshot."},
+        },
+    }
     return {
         "get_spending_summary": no_arguments,
         "get_category_detail": {
@@ -269,6 +324,8 @@ def tool_parameter_schemas(selected_month: str, previous_month: str | None) -> d
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Rows to return (1-100); default 25."},
             },
         },
+        "get_daily_spending": period_spending,
+        "get_weekly_spending": period_spending,
         "explain_category_change": {
             "type": "object",
             "properties": {
@@ -388,7 +445,13 @@ def generate_finance_report(
     author_files = ["personality.system.md", "ui.system.md", "financial-settings.md"]
     prompt_context = "\n\n".join((prompt_dir / filename).read_text(encoding="utf-8") for filename in author_files)
     validator_context = (prompt_dir / "validator.system.md").read_text(encoding="utf-8")
-    tools = _build_tools(settings, project_name, snapshot, rows, memory_module, thread_key, ollama_url, model_name)
+    # The BigQuery data tools run through the local stdio MCP server unless tool_transport is "direct";
+    # the server starts only when the author first calls one of them.
+    mcp_client = McpToolClient(project_name) if settings.tool_transport == "mcp" else None
+    tools = _build_tools(
+        settings, project_name, snapshot, rows, memory_module, thread_key, ollama_url, model_name,
+        call_tool=mcp_client.call_tool if mcp_client else None,
+    )
     selected_label = date.fromisoformat(snapshot.latest_month).strftime("%B %Y")
     started = time.perf_counter()
     trace = harness.trace
@@ -410,6 +473,9 @@ def generate_finance_report(
             pass
         logger.error(f"Finance report generation failed: {exc}")
         raise
+    finally:
+        if mcp_client is not None:
+            mcp_client.close()
 
     report_html = str(report.get("report_html", ""))
     plain_text = str(report.get("plain_text", ""))

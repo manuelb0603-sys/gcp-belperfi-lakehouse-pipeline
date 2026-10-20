@@ -54,10 +54,14 @@ DEFAULTS: dict[str, Any] = {
     # snapshot.notable_changes thresholds: |MoM %| at least this, or |dollar change| at least this.
     "notable_change_pct": 50.0,
     "notable_change_usd": 250.0,
+    # How the report author's BigQuery tools run: "mcp" (local stdio MCP server, finance/mcp_server.py)
+    # or "direct" (in-process calls to finance/bigquery_tools.py).
+    "tool_transport": "mcp",
 }
 
 REPORT_MODES = ("legacy", "agent")
 GUIDANCE_MODES = ("strict", "guided")
+TOOL_TRANSPORTS = ("mcp", "direct")
 LIMIT_KEYS = ("max_agent_rounds", "max_tool_calls", "max_calls_per_tool", "max_validation_cycles", "max_report_bytes")
 # Fallbacks used only by the finance app (Scripts/apps/finance_app.py) when the keys are missing.
 APP_FALLBACK_MODEL_SERVER_URL = "http://localhost:11434/api/generate"
@@ -156,6 +160,13 @@ def _positive_number(key: str, value: Any) -> float:
     if number != number or number <= 0:
         raise SettingsError(f"{key} must be a positive number, got {value!r}")
     return number
+
+
+def _tool_transport(value: Any) -> str:
+    """The author tool transport ("mcp" or "direct", case-insensitive); anything else raises SettingsError."""
+    if isinstance(value, str) and value.strip().lower() in TOOL_TRANSPORTS:
+        return value.strip().lower()
+    raise SettingsError(f"tool_transport must be one of {', '.join(TOOL_TRANSPORTS)}, got {value!r}")
 
 
 def validate_guidance(key: str, value: Any) -> str:
@@ -272,6 +283,8 @@ class ReportSettings:
     # snapshot.notable_changes thresholds (report_metrics.notable_changes)
     notable_change_pct: float = DEFAULTS["notable_change_pct"]
     notable_change_usd: float = DEFAULTS["notable_change_usd"]
+    # Author BigQuery tool transport: "mcp" (stdio MCP server) or "direct" (in-process)
+    tool_transport: str = DEFAULTS["tool_transport"]
     # The source mapping (for role re-resolution with caller overrides); never shown in repr.
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
@@ -390,6 +403,7 @@ class ReportSettings:
             )),
             notable_change_pct=_positive_number("notable_change_pct", _get(config, "notable_change_pct")),
             notable_change_usd=_positive_number("notable_change_usd", _get(config, "notable_change_usd")),
+            tool_transport=_tool_transport(_get(config, "tool_transport")),
             raw=config,
             **limits,
         )

@@ -107,7 +107,7 @@ def get_spending_summary(project_name: str, days_back: int = 90) -> dict[str, An
         raise ValueError("days_back must be between 1 and 730")
     client, bigquery = _client(project_name)
     query = f"""
-        SELECT transaction_month, category, parent_group, gross_spending,
+        SELECT transaction_month, month, year, category, parent_group, gross_spending,
                total_refunds_and_credits, net_real_expense,
                total_transaction_count, average_transaction_amount
         FROM `{project_name}.gold.fact_monthly_spending`
@@ -125,7 +125,7 @@ def get_category_detail(project_name: str, category: str, month: str, previous_m
         raise ValueError("month must be an ISO date")
     client, bigquery = _client(project_name)
     query = f"""
-        SELECT transaction_month, category, parent_group, gross_spending,
+        SELECT transaction_month, month, year, category, parent_group, gross_spending,
                total_refunds_and_credits, net_real_expense,
                total_transaction_count, average_transaction_amount
         FROM `{project_name}.gold.fact_monthly_spending`
@@ -163,6 +163,103 @@ def get_transaction_detail(project_name: str, month: str, category: str | None =
         parameters.append(bigquery.ScalarQueryParameter("category", "STRING", category))
     config = bigquery.QueryJobConfig(query_parameters=parameters)
     return {"source": "gold.fact_transactions", "month": month, "category": category, "rows": _rows(client.query(query, job_config=config).result())}
+
+
+def _period_filters(category: str | None, parent_group: str | None) -> tuple[str | None, str | None, str]:
+    """Validate optional category/parent_group filters; return them with their SQL condition."""
+    category = str(category).strip() if category else None
+    parent_group = str(parent_group).strip() if parent_group else None
+    for name, value in (("category", category), ("parent_group", parent_group)):
+        if value is not None and len(value) > 120:
+            raise ValueError(f"{name} must be at most 120 characters")
+    conditions = [f"AND {name} = @{name}" for name, value in (("category", category), ("parent_group", parent_group)) if value]
+    return category, parent_group, " ".join(conditions)
+
+
+def _filter_parameters(bigquery: Any, category: str | None, parent_group: str | None) -> list[Any]:
+    return [
+        bigquery.ScalarQueryParameter(name, "STRING", value)
+        for name, value in (("category", category), ("parent_group", parent_group)) if value
+    ]
+
+
+# Per-period totals summed over the matching category rows (average = net spend per transaction).
+_PERIOD_METRICS = """
+               ROUND(SUM(gross_spending), 2) AS gross_spending,
+               ROUND(SUM(total_refunds_and_credits), 2) AS total_refunds_and_credits,
+               ROUND(SUM(net_real_expense), 2) AS net_real_expense,
+               SUM(total_transaction_count) AS total_transaction_count,
+               ROUND(SAFE_DIVIDE(SUM(net_real_expense), SUM(total_transaction_count)), 2) AS average_transaction_amount"""
+
+
+def get_daily_spending(
+    project_name: str, month: str, category: str | None = None, parent_group: str | None = None
+) -> dict[str, Any]:
+    """Per-day spending totals for one month from gold.fact_daily_spending (read-only, parameterized).
+
+    Sums every category (or only the optional category/parent_group) into one row per day.
+    """
+    if len(month) != 10:
+        raise ValueError("month must be an ISO date")
+    start = date.fromisoformat(month).replace(day=1)
+    category, parent_group, conditions = _period_filters(category, parent_group)
+    client, bigquery = _client(project_name)
+    query = f"""
+        SELECT transaction_date, day_of_week, month, year,{_PERIOD_METRICS}
+        FROM `{project_name}.gold.fact_daily_spending`
+        WHERE transaction_month = @month {conditions}
+        GROUP BY transaction_date, day_of_week, month, year
+        ORDER BY transaction_date
+    """
+    config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("month", "DATE", _month_end(start)),
+        *_filter_parameters(bigquery, category, parent_group),
+    ])
+    return {
+        "source": "gold.fact_daily_spending",
+        "month": start.isoformat(),
+        "category": category,
+        "parent_group": parent_group,
+        "rows": _rows(client.query(query, job_config=config).result()),
+    }
+
+
+def get_weekly_spending(
+    project_name: str, month: str, category: str | None = None, parent_group: str | None = None
+) -> dict[str, Any]:
+    """Per-week (Monday-Sunday) spending totals for the weeks overlapping one month, from
+    gold.fact_weekly_spending (read-only, parameterized).
+
+    Weeks are whole weeks, so the first and last can include days of the neighboring months and
+    the weekly totals need not add up to the monthly total.
+    """
+    if len(month) != 10:
+        raise ValueError("month must be an ISO date")
+    start = date.fromisoformat(month).replace(day=1)
+    category, parent_group, conditions = _period_filters(category, parent_group)
+    client, bigquery = _client(project_name)
+    query = f"""
+        SELECT week_start, week_end, iso_week, year,{_PERIOD_METRICS}
+        FROM `{project_name}.gold.fact_weekly_spending`
+        WHERE week_end >= @month_start AND week_start <= @month_end {conditions}
+        GROUP BY week_start, week_end, iso_week, year
+        ORDER BY week_start
+    """
+    config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("month_start", "DATE", start),
+        bigquery.ScalarQueryParameter("month_end", "DATE", _month_end(start)),
+        *_filter_parameters(bigquery, category, parent_group),
+    ])
+    return {
+        "source": "gold.fact_weekly_spending",
+        "month": start.isoformat(),
+        "category": category,
+        "parent_group": parent_group,
+        "note": "Weeks run Monday to Sunday; the first and last weeks can include days outside the month, "
+        "so weekly totals do not add up to the monthly total.",
+        "rows": _rows(client.query(query, job_config=config).result()),
+    }
+
 
 def _previous_month_start(value: date) -> date:
     return date(value.year - (value.month == 1), 12 if value.month == 1 else value.month - 1, 1)
