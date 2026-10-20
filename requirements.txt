@@ -1,0 +1,14 @@
+# Direct dependencies of Scripts/ (pinned to the versions in the workspace venv, ..\.venv).
+# Install: ..\.venv\Scripts\python.exe -m pip install -r requirements.txt
+anthropic==1.11.0
+Faker==40.36.0
+google-api-core==2.32.0
+google-cloud-bigquery==3.42.3
+google-cloud-storage==3.13.0
+gradio==6.29.0
+mcp==2.3.0
+numpy==2.5.1
+pandas==3.0.3
+plotly==7.1.0
+pydantic==2.13.5
+requests==2.34.2

@@ -8,6 +8,9 @@ config {
 
 SELECT
   transaction_month,
+  -- Month name and year as text (for example 'August' and '2026')
+  FORMAT_DATE('%B', transaction_month) AS month,
+  FORMAT_DATE('%Y', transaction_month) AS year,
   category,
   parent_group,
   -- 1. Gross Purchase Volume (Only the pure spending)
@@ -35,7 +38,9 @@ WHERE
 GROUP BY
   1,
   2,
-  3
+  3,
+  4,
+  5
 ORDER BY
   transaction_month DESC,
   gross_spending ASC
